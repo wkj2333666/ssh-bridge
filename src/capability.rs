@@ -48,6 +48,14 @@ has_tool() {
     fi
 }
 
+has_gnu_timeout() {
+    if timeout --signal=TERM --kill-after=1s 1.000s sh -c 'exit 0' >/dev/null 2>&1; then
+        printf 1
+    else
+        printf 0
+    fi
+}
+
 shell_kind=sh
 bash_version=
 if command -v bash >/dev/null 2>&1; then
@@ -93,7 +101,7 @@ emit_record TOOL_stat "$(has_tool stat)"
 emit_record TOOL_find "$(has_tool find)"
 emit_record TOOL_grep "$(has_tool grep)"
 emit_record TOOL_rg "$(has_tool rg)"
-emit_record TOOL_timeout "$(has_tool timeout)"
+emit_record TOOL_timeout "$(has_gnu_timeout)"
 emit_record TOOL_ln "$(has_tool ln)"
 emit_record TOOL_mv "$(has_tool mv)"
 "#;

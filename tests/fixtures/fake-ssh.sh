@@ -155,6 +155,32 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
         fi
         exit 0
         ;;
+    orphan-stdin)
+        exec 3<&0
+        (
+            trap '' TERM HUP
+            exec 0<&3 3<&-
+            exec >/dev/null 2>/dev/null
+            if [ -n "${FAKE_SSH_CHILD_READY_FILE:-}" ]; then
+                printf '%s\n' ready >"$FAKE_SSH_CHILD_READY_FILE"
+            fi
+            sleep "${FAKE_SSH_SLEEP_SECONDS:-10}"
+        ) &
+        orphan_pid=$!
+        exec 3<&-
+        if [ -n "${FAKE_SSH_CHILD_PID_FILE:-}" ]; then
+            printf '%s\n' "$orphan_pid" >"$FAKE_SSH_CHILD_PID_FILE"
+        fi
+        if [ -n "${FAKE_SSH_CHILD_READY_FILE:-}" ]; then
+            while [ ! -f "$FAKE_SSH_CHILD_READY_FILE" ]; do
+                sleep 0.005
+            done
+        fi
+        if [ -n "${FAKE_SSH_PARENT_EXIT_FILE:-}" ]; then
+            printf '%s\n' exited >"$FAKE_SSH_PARENT_EXIT_FILE"
+        fi
+        exit 0
+        ;;
     error)
         case "${FAKE_SSH_ERROR:-remote}" in
             host-key)
