@@ -18,6 +18,7 @@ pub enum ErrorCode {
     RequestTooLarge,
     ProtocolError,
     Cancelled,
+    CommandTimeout,
     RemoteExit,
     InvalidConfig,
     InvalidArgument,
@@ -38,6 +39,10 @@ pub struct ErrorDetails {
     pub exit_status: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_process_may_continue: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

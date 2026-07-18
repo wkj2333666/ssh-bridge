@@ -10,16 +10,23 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use codex_ssh_bridge::capability::{
     CAPABILITY_PROBE_SCRIPT, Capability, CapabilityCache, ShellKind, ShellRequest,
     parse_probe_output, select_shell,
 };
+use codex_ssh_bridge::config::{Config, HostProfile, Limits};
 use codex_ssh_bridge::error::{BridgeError, ErrorCode};
+use codex_ssh_bridge::output::{CaptureLimits, OutputReference, OutputStore, StreamKind};
 use codex_ssh_bridge::path::RemotePath;
-use codex_ssh_bridge::ssh::{RuntimePaths, SshPolicy, build_ssh_argv};
+use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshPolicy, SshRunner, build_ssh_argv};
+use codex_ssh_bridge::{MAX_OUTPUT_BYTES, MAX_READ_BYTES};
 use tempfile::TempDir;
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 use support::{config_with_host, fake_ssh_path};
 
@@ -761,4 +768,952 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
         ]
     );
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+struct RunnerFixture {
+    _base: TempDir,
+    runtime: RuntimePaths,
+    store: Arc<OutputStore>,
+    runner: Arc<SshRunner>,
+}
+
+fn task3_config(hosts: &[&str], limits: Limits) -> Arc<Config> {
+    let hosts = hosts
+        .iter()
+        .map(|alias| {
+            (
+                (*alias).to_owned(),
+                HostProfile {
+                    root: "/srv/project".to_owned(),
+                    description: None,
+                    read_only: false,
+                    limits: Default::default(),
+                },
+            )
+        })
+        .collect();
+    Arc::new(Config {
+        limits,
+        hosts,
+        ..Config::default()
+    })
+}
+
+fn task3_runner(
+    hosts: &[&str],
+    limits: Limits,
+    ttl: Duration,
+    environment: &[(&str, String)],
+) -> RunnerFixture {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = Arc::new(OutputStore::with_ttl(&runtime, ttl).unwrap());
+    let environment = environment
+        .iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect();
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            task3_config(hosts, limits),
+            runtime.clone(),
+            Arc::clone(&store),
+            fake_ssh_path(),
+            environment,
+        )
+        .unwrap(),
+    );
+    RunnerFixture {
+        _base: base,
+        runtime,
+        store,
+        runner,
+    }
+}
+
+fn request(host: &str, shell: ShellRequest, timeout: Duration) -> RunRequest {
+    RunRequest {
+        host: host.to_owned(),
+        command: "printf safe".to_owned(),
+        shell,
+        stdin: None,
+        timeout,
+    }
+}
+
+fn preview_bytes(preview: &codex_ssh_bridge::output::OutputPreview) -> Vec<u8> {
+    let mut bytes = preview.head.clone();
+    bytes.extend_from_slice(&preview.tail);
+    bytes
+}
+
+async fn wait_for_log_marker(path: &std::path::Path, marker: &str) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line == marker)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fake SSH marker");
+}
+
+async fn wait_for_file(path: &std::path::Path) {
+    timeout(Duration::from_secs(2), async {
+        while !path.exists() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fake SSH file");
+}
+
+async fn wait_for_process_exit(pid: u32) {
+    let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+    timeout(Duration::from_millis(200), async {
+        while process.exists() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fake SSH child survived process-group cancellation");
+}
+
+#[tokio::test]
+async fn runner_resolves_once_probes_once_and_uses_hardened_ssh_g() {
+    let log_dir = TempDir::new().unwrap();
+    let log = log_dir.path().join("calls.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+
+    for _ in 0..2 {
+        fixture
+            .runner
+            .execute(
+                request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let calls = fs::read_to_string(log).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
+    for option in [
+        "BatchMode=yes",
+        "StrictHostKeyChecking=yes",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "ClearAllForwardings=yes",
+        "PermitLocalCommand=no",
+        "RequestTTY=no",
+        "ControlPersist=300",
+    ] {
+        assert!(calls.contains(&format!("arg={option}")), "{calls}");
+    }
+    let config_call = calls.split("END\n").next().unwrap();
+    assert!(!config_call.contains("ControlMaster="));
+    assert!(!config_call.contains("ControlPath="));
+    assert!(config_call.contains("arg=--\narg=dev\n"));
+}
+
+#[tokio::test]
+async fn ssh_g_identity_accepts_non_utf8_bytes_without_exposing_raw_config() {
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_G_NON_UTF8", "1".to_owned()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, 0);
+    assert!(!preview_bytes(&result.output.stdout).contains(&0xff));
+}
+
+#[tokio::test]
+async fn ssh_g_enforces_independent_stdout_and_stderr_bounds() {
+    for (name, environment) in [
+        (
+            "stdout",
+            vec![("FAKE_SSH_G_STDOUT_BYTES", (1024 * 1024 + 1).to_string())],
+        ),
+        (
+            "stderr",
+            vec![("FAKE_SSH_G_STDERR_BYTES", (64 * 1024 + 1).to_string())],
+        ),
+    ] {
+        let fixture = task3_runner(
+            &["dev"],
+            Limits::default(),
+            Duration::from_secs(600),
+            &environment,
+        );
+        let error = fixture
+            .runner
+            .execute(
+                request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolError, "{name}");
+        assert!(!error.message.contains("fake.internal"));
+        assert!(private_spool_files(&fixture.runtime).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn command_stdin_is_streamed_and_oversized_input_is_rejected_before_ssh() {
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[("FAKE_SSH_MODE", "stdin".to_owned())],
+    );
+    let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(2));
+    run.stdin = Some(b"stdin\0bytes\n".to_vec());
+    let result = fixture
+        .runner
+        .execute(run, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(preview_bytes(&result.output.stdout), b"stdin\0bytes\n");
+
+    let mut oversized = request("dev", ShellRequest::Auto, Duration::from_secs(2));
+    oversized.stdin = Some(vec![0; codex_ssh_bridge::MAX_WRITE_BYTES + 1]);
+    let error = fixture
+        .runner
+        .execute(oversized, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RequestTooLarge);
+}
+
+#[tokio::test]
+async fn selected_shell_and_remote_gnu_timeout_are_reported_and_rendered_exactly() {
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_HAS_TIMEOUT", "1".to_owned()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_millis(123)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, 0);
+    assert_eq!(result.shell.shell, ShellKind::PosixSh);
+    assert!(result.shell.fallback);
+    assert!(!result.remote_process_may_continue);
+    assert_eq!(
+        preview_bytes(&result.output.stdout),
+        b"exec timeout --signal=TERM --kill-after=1s 123ms sh -c 'printf safe'"
+    );
+}
+
+#[tokio::test]
+async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_HAS_TIMEOUT", "1".to_owned()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Login, Duration::from_millis(123)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.shell.shell, ShellKind::Login);
+    assert_eq!(preview_bytes(&result.output.stdout), b"printf safe");
+}
+
+#[tokio::test]
+async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
+    let cases = [
+        ("host-key", ErrorCode::HostKeyUnknown, false),
+        ("auth", ErrorCode::AuthRequired, false),
+        ("connect-timeout", ErrorCode::ConnectTimeout, true),
+        ("remote", ErrorCode::RemoteExit, false),
+    ];
+    for (kind, code, retryable) in cases {
+        let fixture = task3_runner(
+            &["dev"],
+            Limits::default(),
+            Duration::from_secs(600),
+            &[
+                ("FAKE_SSH_MODE", "error".to_owned()),
+                ("FAKE_SSH_ERROR", kind.to_owned()),
+            ],
+        );
+        let error = fixture
+            .runner
+            .execute(
+                request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, code, "{kind}");
+        assert_eq!(error.retryable, retryable, "{kind}");
+        assert!(!error.message.contains("VERY_SECRET"), "{error:?}");
+        if kind == "remote" {
+            assert_eq!(error.details.exit_status, Some(7));
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_requested_shell_is_a_capability_error() {
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[("FAKE_SSH_MODE", "echo-command".to_owned())],
+    );
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Bash, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+}
+
+#[tokio::test]
+async fn local_deadline_and_gnu_timeout_status_are_command_timeouts() {
+    let local = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "2".to_owned()),
+        ],
+    );
+    let error = local
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_millis(80)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::CommandTimeout);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+
+    let remote = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "error".to_owned()),
+            ("FAKE_SSH_ERROR", "remote".to_owned()),
+            ("FAKE_SSH_EXIT_STATUS", "124".to_owned()),
+            ("FAKE_SSH_HAS_TIMEOUT", "1".to_owned()),
+        ],
+    );
+    let error = remote
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(1)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::CommandTimeout);
+}
+
+#[tokio::test]
+async fn five_commands_are_not_head_of_line_blocked() {
+    let hosts = ["one", "two", "three", "four", "five"];
+    let fixture = task3_runner(
+        &hosts,
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "1".to_owned()),
+        ],
+    );
+    let started = Instant::now();
+    let mut tasks = JoinSet::new();
+    for host in hosts {
+        let runner = Arc::clone(&fixture.runner);
+        tasks.spawn(async move {
+            runner
+                .execute(
+                    request(host, ShellRequest::Auto, Duration::from_secs(3)),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap().unwrap();
+    }
+    assert!(started.elapsed() < Duration::from_millis(1_500));
+}
+
+#[tokio::test]
+async fn cancellation_kills_the_child_group_quickly() {
+    let log_dir = TempDir::new().unwrap();
+    let log = log_dir.path().join("calls.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_IGNORE_TERM", "1".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    let cancel = CancellationToken::new();
+    let task = {
+        let runner = Arc::clone(&fixture.runner);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    cancel,
+                )
+                .await
+        })
+    };
+    wait_for_log_marker(&log, "C").await;
+    let started = Instant::now();
+    cancel.cancel();
+    let error = timeout(Duration::from_millis(250), task)
+        .await
+        .expect("cancellation exceeded 250 ms")
+        .unwrap()
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+}
+
+#[tokio::test]
+async fn cancellation_during_ssh_g_kills_its_group_without_remote_detach_warning() {
+    let files = TempDir::new().unwrap();
+    let log = files.path().join("calls.log");
+    let pid_file = files.path().join("child.pid");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_G_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_IGNORE_TERM", "1".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+            ("FAKE_SSH_CHILD_PID_FILE", pid_file.display().to_string()),
+        ],
+    );
+    let cancel = CancellationToken::new();
+    let task = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    wait_for_log_marker(&log, "G").await;
+    wait_for_file(&pid_file).await;
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    cancel.cancel();
+    let error = timeout(Duration::from_millis(250), task)
+        .await
+        .expect("ssh -G cancellation exceeded 250 ms")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
+    wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_follower_waiting_for_first_host_initialization() {
+    let files = TempDir::new().unwrap();
+    let log = files.path().join("calls.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_G_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    let first_cancel = CancellationToken::new();
+    let first = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = first_cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    wait_for_log_marker(&log, "G").await;
+
+    let follower_cancel = CancellationToken::new();
+    let mut follower = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = follower_cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    sleep(Duration::from_millis(20)).await;
+    follower_cancel.cancel();
+    let follower_result = timeout(Duration::from_millis(250), &mut follower).await;
+    first_cancel.cancel();
+    first.await.unwrap().unwrap_err();
+    let error = match follower_result {
+        Ok(result) => result.unwrap().unwrap_err(),
+        Err(_) => {
+            follower.abort();
+            let _ = follower.await;
+            panic!("cancelled identity-cache follower remained blocked")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
+}
+
+#[tokio::test]
+async fn cancellation_during_capability_probe_is_remote_best_effort_and_kills_the_group() {
+    let files = TempDir::new().unwrap();
+    let log = files.path().join("calls.log");
+    let pid_file = files.path().join("child.pid");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_PROBE_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_IGNORE_TERM", "1".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+            ("FAKE_SSH_CHILD_PID_FILE", pid_file.display().to_string()),
+        ],
+    );
+    let cancel = CancellationToken::new();
+    let task = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    wait_for_log_marker(&log, "P").await;
+    wait_for_file(&pid_file).await;
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    cancel.cancel();
+    let error = timeout(Duration::from_millis(250), task)
+        .await
+        .expect("probe cancellation exceeded 250 ms")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
+async fn queued_cancellation_never_claims_a_remote_process_may_continue() {
+    let limits = Limits {
+        per_host_concurrency: 1,
+        ..Limits::default()
+    };
+    let log_dir = TempDir::new().unwrap();
+    let log = log_dir.path().join("calls.log");
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    let first_cancel = CancellationToken::new();
+    let first = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = first_cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    wait_for_log_marker(&log, "C").await;
+
+    let queued_cancel = CancellationToken::new();
+    let queued = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = queued_cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    sleep(Duration::from_millis(20)).await;
+    queued_cancel.cancel();
+    let error = queued.await.unwrap().unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
+
+    first_cancel.cancel();
+    first.await.unwrap().unwrap_err();
+}
+
+#[tokio::test]
+async fn stdout_and_stderr_are_drained_concurrently_with_aggregate_previews() {
+    let limits = Limits {
+        preview_bytes: 16,
+        ..Limits::default()
+    };
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "streams".to_owned()),
+            ("FAKE_SSH_STDOUT", "ABCDEFGHIJK".to_owned()),
+            ("FAKE_SSH_STDERR", "abcdefghijklmnop".to_owned()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.output.stdout.head, b"ABCD");
+    assert_eq!(result.output.stdout.tail, b"HIJK");
+    assert_eq!(result.output.stderr.head, b"abcd");
+    assert_eq!(result.output.stderr.tail, b"mnop");
+    assert_eq!(result.output.aggregate_bytes, 27);
+    assert!(result.output.stdout.truncated);
+    assert!(result.output.stderr.truncated);
+    assert!(result.output.reference.is_none());
+}
+
+fn private_spool_files(runtime: &RuntimePaths) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for directory in fs::read_dir(runtime.directory()).unwrap() {
+        let directory = directory.unwrap().path();
+        if directory.is_dir() {
+            assert_eq!(
+                fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for file in fs::read_dir(directory).unwrap() {
+                let file = file.unwrap().path();
+                assert_eq!(
+                    fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                files.push(file);
+            }
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn exact_64_mib_spills_privately_pages_both_streams_and_expires() {
+    let limits = Limits {
+        preview_bytes: 16,
+        max_output_bytes: MAX_OUTPUT_BYTES,
+        ..Limits::default()
+    };
+    let half = MAX_OUTPUT_BYTES / 2;
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_millis(300),
+        &[
+            ("FAKE_SSH_MODE", "bytes".to_owned()),
+            ("FAKE_SSH_STDOUT_BYTES", half.to_string()),
+            ("FAKE_SSH_STDERR_BYTES", half.to_string()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(30)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.output.aggregate_bytes, MAX_OUTPUT_BYTES);
+    assert_eq!(
+        result.output.stdout.head.len() + result.output.stdout.tail.len(),
+        8
+    );
+    assert_eq!(
+        result.output.stderr.head.len() + result.output.stderr.tail.len(),
+        8
+    );
+    let reference = result
+        .output
+        .reference
+        .as_ref()
+        .expect("spilled output reference");
+    assert_eq!(reference.as_str().len(), 32);
+    assert!(
+        reference
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert!(!reference.as_str().contains('/'));
+    assert_eq!(private_spool_files(&fixture.runtime).len(), 2);
+
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+        let page = fixture.store.read(reference, stream, 0, 17).await.unwrap();
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.next_offset, 17);
+        assert_eq!(page.bytes, vec![0; 17]);
+        assert!(!page.eof);
+        let end = fixture
+            .store
+            .read(reference, stream, half, 17)
+            .await
+            .unwrap();
+        assert!(end.bytes.is_empty());
+        assert!(end.eof);
+        let past_end = fixture
+            .store
+            .read(reference, stream, half + 1, 17)
+            .await
+            .unwrap_err();
+        assert_eq!(past_end.code, ErrorCode::InvalidArgument);
+    }
+    assert_eq!(
+        fixture
+            .store
+            .read(reference, StreamKind::Stdout, 0, 0)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read(reference, StreamKind::Stdout, 0, MAX_READ_BYTES + 1)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidArgument
+    );
+
+    sleep(Duration::from_millis(350)).await;
+    let expired = fixture
+        .store
+        .read(reference, StreamKind::Stdout, 0, 1)
+        .await
+        .unwrap_err();
+    assert_eq!(expired.code, ErrorCode::InvalidArgument);
+    assert_eq!(expired.message, "output reference is unknown or expired");
+    assert!(private_spool_files(&fixture.runtime).is_empty());
+
+    let unknown = OutputReference::parse("00000000000000000000000000000000").unwrap();
+    let unknown = fixture
+        .store
+        .read(&unknown, StreamKind::Stdout, 0, 1)
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.message, "output reference is unknown or expired");
+}
+
+#[tokio::test]
+async fn first_byte_over_limit_kills_the_group_and_cleans_spool_files() {
+    let limits = Limits {
+        preview_bytes: 16,
+        max_output_bytes: 300 * 1024,
+        ..Limits::default()
+    };
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "bytes".to_owned()),
+            ("FAKE_SSH_STDOUT_BYTES", (300 * 1024 + 1).to_string()),
+        ],
+    );
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(5)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::OutputLimit);
+    assert_eq!(error.details.bytes_seen, Some(300 * 1024 + 1));
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert!(private_spool_files(&fixture.runtime).is_empty());
+}
+
+#[tokio::test]
+async fn expired_spool_files_are_removed_without_a_read_trigger() {
+    let limits = Limits {
+        preview_bytes: 16,
+        max_output_bytes: 300 * 1024,
+        ..Limits::default()
+    };
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_millis(20),
+        &[
+            ("FAKE_SSH_MODE", "bytes".to_owned()),
+            ("FAKE_SSH_STDOUT_BYTES", (300 * 1024).to_string()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(5)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(result.output.reference.is_some());
+    assert_eq!(private_spool_files(&fixture.runtime).len(), 2);
+    sleep(Duration::from_millis(50)).await;
+    assert!(private_spool_files(&fixture.runtime).is_empty());
+}
+
+#[tokio::test]
+async fn output_store_rejects_a_limit_above_the_compiled_hard_ceiling() {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = OutputStore::new(&runtime).unwrap();
+    let error = store
+        .capture(
+            tokio::io::empty(),
+            tokio::io::empty(),
+            CaptureLimits {
+                preview_bytes: 16,
+                max_output_bytes: MAX_OUTPUT_BYTES + 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+}
+
+#[tokio::test]
+async fn output_store_rejects_a_ttl_above_ten_minutes() {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let ttl_error = OutputStore::with_ttl(&runtime, Duration::from_secs(601)).unwrap_err();
+    assert_eq!(ttl_error.code, ErrorCode::InvalidArgument);
+}
+
+#[tokio::test]
+async fn output_store_rejects_an_unbounded_preview_budget() {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = OutputStore::new(&runtime).unwrap();
+    let preview_error = store
+        .capture(
+            tokio::io::empty(),
+            tokio::io::empty(),
+            CaptureLimits {
+                preview_bytes: usize::MAX,
+                max_output_bytes: 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(preview_error.code, ErrorCode::InvalidArgument);
 }
