@@ -457,6 +457,11 @@ fn validate_parsed_arguments(
             validate_paths(&arguments.paths, 32)?;
             validate_optional_minimum(arguments.start_line, 1)?;
             validate_optional_range(arguments.max_lines, 1, 100_000)?;
+            let start_line = arguments.start_line.unwrap_or(1);
+            let max_lines = arguments.max_lines.unwrap_or(2_000);
+            if start_line.checked_add(max_lines - 1).is_none() {
+                return Err(Constraint);
+            }
             validate_optional_range(arguments.max_bytes, 1, 1_048_576)
         }
         ParsedToolArguments::OutputRead(arguments) => {
@@ -795,6 +800,7 @@ mod tests {
             json!({"host":"dev", "paths":[]}),
             json!({"host":"dev", "paths":vec!["a"; 33]}),
             json!({"host":"dev", "paths":["a"], "start_line":0}),
+            json!({"host":"dev", "paths":["a"], "start_line":u64::MAX, "max_lines":2}),
             json!({"host":"dev", "paths":["a"], "max_lines":0}),
             json!({"host":"dev", "paths":["a"], "max_lines":100_001}),
             json!({"host":"dev", "paths":["a"], "max_bytes":0}),
