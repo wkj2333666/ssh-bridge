@@ -13,7 +13,7 @@ use super::protocol::{
 };
 use super::{
     EntryError, EntryErrorCode, ReadEntry, ReadResult, RemoteBridge, ResolvedRead,
-    attach_fixed_result_context,
+    attach_fixed_result_context, attach_remote_context,
 };
 
 const READ_SCRIPT: &str = r#"
@@ -94,11 +94,7 @@ pub(super) async fn read(
     let mut operation_context = None;
     for path in request.paths {
         if cancel.is_cancelled() {
-            return Err(crate::error::BridgeError::new(
-                crate::error::ErrorCode::Cancelled,
-                "remote read was cancelled",
-                false,
-            ));
+            return Err(read_cancelled_error(operation_context.as_ref()));
         }
         let owner = InternalSpoolOwner::new();
         let result = bridge
@@ -227,9 +223,46 @@ pub(super) async fn read(
     })
 }
 
+fn read_cancelled_error(operation_context: Option<&super::RemoteContext>) -> crate::BridgeError {
+    let error = crate::error::BridgeError::new(
+        crate::error::ErrorCode::Cancelled,
+        "remote read was cancelled",
+        false,
+    );
+    match operation_context {
+        Some(context) => attach_remote_context(error, context),
+        None => error,
+    }
+}
+
 fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{RemoteContext, ShellMetadata, ShellName};
+    use crate::ErrorCode;
+
+    #[test]
+    fn task78_read_local_cancel_after_known_context_retains_remote_metadata() {
+        let context = RemoteContext {
+            remote: true,
+            host: "dev".to_owned(),
+            physical_root: "/srv/app".to_owned(),
+            shell: ShellMetadata {
+                kind: ShellName::Sh,
+                version: None,
+                fallback: false,
+            },
+        };
+        let error = super::read_cancelled_error(Some(&context));
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.details.host.as_deref(), Some("dev"));
+        assert_eq!(error.details.physical_root.as_deref(), Some("/srv/app"));
+        assert_eq!(error.details.shell.unwrap().kind, "sh");
+    }
 }

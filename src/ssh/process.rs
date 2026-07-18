@@ -202,7 +202,6 @@ impl SshRunner {
             );
             error
         })?;
-        let shell_context = error_shell_metadata(&shell);
         let timeout_ms = u64::try_from(request.timeout.as_millis())
             .map_err(|_| BridgeError::invalid_argument("command timeout is too large"))?;
         let remote_timeout = !matches!(shell.shell, ShellKind::Login)
@@ -237,24 +236,12 @@ impl SshRunner {
                 &request.host,
             )
             .await
-            .map_err(|mut error| {
-                attach_available_remote_context(
-                    &mut error,
-                    Some(&request.host),
-                    Some(&capability.physical_root),
-                    Some(&shell_context),
-                );
-                error
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
 
-        let output = outcome.output.into_public().map_err(|mut error| {
-            attach_available_remote_context(
-                &mut error,
-                Some(&request.host),
-                Some(&capability.physical_root),
-                Some(&shell_context),
-            );
-            error
+        let output = outcome.output.into_public().map_err(|error| {
+            attach_selected_context(error, &request.host, &capability.physical_root, &shell)
         })?;
         self.output_store
             .set_provenance(
@@ -374,21 +361,18 @@ impl SshRunner {
             shell: ShellKind::PosixSh,
             fallback: false,
         };
-        let shell_context = error_shell_metadata(&shell);
         for key in request.required_capabilities {
             if capability.tools.get(*key) != Some(&true) {
-                let mut error = BridgeError::new(
-                    ErrorCode::RemoteCapabilityMissing,
-                    "remote host lacks a required capability",
-                    false,
-                );
-                attach_available_remote_context(
-                    &mut error,
-                    Some(&request.host),
-                    Some(&capability.physical_root),
-                    Some(&shell_context),
-                );
-                return Err(error);
+                return Err(attach_selected_context(
+                    BridgeError::new(
+                        ErrorCode::RemoteCapabilityMissing,
+                        "remote host lacks a required capability",
+                        false,
+                    ),
+                    &request.host,
+                    &capability.physical_root,
+                    &shell,
+                ));
             }
         }
         let outcome = self
@@ -408,41 +392,27 @@ impl SshRunner {
                 &request.host,
             )
             .await
-            .map_err(|mut error| {
-                attach_available_remote_context(
-                    &mut error,
-                    Some(&request.host),
-                    Some(&capability.physical_root),
-                    Some(&shell_context),
-                );
-                error
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
         let output = outcome
             .output
             .into_internal()
             .map_err(|error| request.kind.after_spawn_error(error))
-            .map_err(|mut error| {
-                attach_available_remote_context(
-                    &mut error,
-                    Some(&request.host),
-                    Some(&capability.physical_root),
-                    Some(&shell_context),
-                );
-                error
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
         if output.stdout_len > request.stdout_limit || output.stderr_len > request.stderr_limit {
-            let mut error = request.kind.after_spawn_error(BridgeError::new(
-                ErrorCode::OutputLimit,
-                "fixed output exceeded its stream limit",
-                false,
+            return Err(attach_selected_context(
+                request.kind.after_spawn_error(BridgeError::new(
+                    ErrorCode::OutputLimit,
+                    "fixed output exceeded its stream limit",
+                    false,
+                )),
+                &request.host,
+                &capability.physical_root,
+                &shell,
             ));
-            attach_available_remote_context(
-                &mut error,
-                Some(&request.host),
-                Some(&capability.physical_root),
-                Some(&shell_context),
-            );
-            return Err(error);
         }
         Ok(FixedRunResult {
             capability,
@@ -919,6 +889,17 @@ fn error_shell_metadata(shell: &ShellSelection) -> ErrorShellMetadata {
         version,
         fallback: shell.fallback,
     }
+}
+
+fn attach_selected_context(
+    mut error: BridgeError,
+    host: &str,
+    physical_root: &str,
+    shell: &ShellSelection,
+) -> BridgeError {
+    let shell = error_shell_metadata(shell);
+    attach_available_remote_context(&mut error, Some(host), Some(physical_root), Some(&shell));
+    error
 }
 
 impl FixedOperationKind {

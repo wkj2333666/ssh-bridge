@@ -12,7 +12,7 @@ use super::protocol::{
 };
 use super::{
     ListEntry, ListResult, RemoteBridge, RemoteFileKind, RemoteMetadata, ResolvedList,
-    ResolvedStat, StatEntry, StatResult,
+    ResolvedStat, StatEntry, StatResult, attach_fixed_result_context,
 };
 
 const LIST_SCRIPT: &str = r#"
@@ -183,51 +183,68 @@ pub(super) async fn list(
             cancel,
         )
         .await?;
-    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
+    let attach = |error| attach_fixed_result_context(error, &request.host, &result);
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024)
+        .await
+        .map_err(&attach)?;
     let capped = stderr == b"CAPPED\0";
     if !stderr.is_empty() && !capped {
-        return match stderr.as_slice() {
-            b"NOT_FOUND\0" => Err(BridgeError::not_found()),
-            b"PERMISSION_DENIED\0" => Err(BridgeError::permission_denied()),
-            b"NOT_DIRECTORY\0" => Err(BridgeError::not_directory()),
-            _ => Err(protocol_error("list control record is invalid")),
+        let error = match stderr.as_slice() {
+            b"NOT_FOUND\0" => BridgeError::not_found(),
+            b"PERMISSION_DENIED\0" => BridgeError::permission_denied(),
+            b"NOT_DIRECTORY\0" => BridgeError::not_directory(),
+            _ => protocol_error("list control record is invalid"),
         };
+        return Err(attach(error));
     }
     let root = request.path.absolute().as_bytes();
     let mut cursor = SpoolCursor::new(
         &result.output,
         StreamKind::Stdout,
         limits.max_frame_bytes + 1,
-    )?;
+    )
+    .map_err(&attach)?;
     let mut entries = Vec::with_capacity(request.max_entries.saturating_add(1));
     let mut qualifying = 0usize;
     let mut completed_records = 0usize;
     'records: loop {
         let first = if capped {
-            cursor.next_field_capped(limits.max_frame_bytes).await?
+            cursor
+                .next_field_capped(limits.max_frame_bytes)
+                .await
+                .map_err(&attach)?
         } else {
-            cursor.next_field(limits.max_frame_bytes).await?
+            cursor
+                .next_field(limits.max_frame_bytes)
+                .await
+                .map_err(&attach)?
         };
         let Some(actual) = first else { break };
         let mut record = Vec::with_capacity(5);
         record.push(actual);
         for _ in 1..5 {
             let field = if capped {
-                cursor.next_field_capped(limits.max_frame_bytes).await?
+                cursor
+                    .next_field_capped(limits.max_frame_bytes)
+                    .await
+                    .map_err(&attach)?
             } else {
-                cursor.next_field(limits.max_frame_bytes).await?
+                cursor
+                    .next_field(limits.max_frame_bytes)
+                    .await
+                    .map_err(&attach)?
             };
             let Some(field) = field else {
                 if capped {
                     break 'records;
                 }
-                return Err(protocol_error("list field count is invalid"));
+                return Err(attach(protocol_error("list field count is invalid")));
             };
             record.push(field);
         }
         let discovered = record[0].as_slice();
         if discovered.is_empty() || discovered.starts_with(b"/") {
-            return Err(protocol_error("list relative path is invalid"));
+            return Err(attach(protocol_error("list relative path is invalid")));
         }
         let actual = join_raw(root, discovered);
         let relative = join_raw(request.path.relative().as_bytes(), discovered);
@@ -237,20 +254,23 @@ pub(super) async fn list(
                 .split(|byte| *byte == b'/')
                 .any(|part| part.first() == Some(&b'.'))
         {
-            return Err(protocol_error("list returned a hidden path after pruning"));
+            return Err(attach(protocol_error(
+                "list returned a hidden path after pruning",
+            )));
         }
         qualifying = qualifying
             .checked_add(1)
-            .ok_or_else(|| protocol_error("list entry count overflowed"))?;
-        let (mtime_seconds, mtime_nanoseconds) = parse_mtime(&record[4])?;
+            .ok_or_else(|| protocol_error("list entry count overflowed"))
+            .map_err(&attach)?;
+        let (mtime_seconds, mtime_nanoseconds) = parse_mtime(&record[4]).map_err(&attach)?;
         if entries.len() < request.max_entries.saturating_add(1) {
             entries.push(ListEntry {
                 actual_path: encode_bytes(&actual),
                 relative_path: encode_bytes(&relative),
                 metadata: RemoteMetadata {
-                    kind: kind(&record[1])?,
-                    size: parse_u64(&record[2])?,
-                    mode: parse_mode(&record[3])?,
+                    kind: kind(&record[1]).map_err(&attach)?,
+                    size: parse_u64(&record[2]).map_err(&attach)?,
+                    mode: parse_mode(&record[3]).map_err(&attach)?,
                     mtime_seconds,
                     mtime_nanoseconds,
                 },
@@ -258,7 +278,7 @@ pub(super) async fn list(
         }
     }
     if capped && cursor.discarded_incomplete() && completed_records == 0 {
-        return Err(protocol_error("list record is oversized"));
+        return Err(attach(protocol_error("list record is oversized")));
     }
     entries.sort_by(|left, right| {
         decoded_sort_key(&left.relative_path).cmp(&decoded_sort_key(&right.relative_path))
@@ -308,48 +328,63 @@ pub(super) async fn stat(
             cancel,
         )
         .await?;
-    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
+    let attach = |error| attach_fixed_result_context(error, &request.host, &result);
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024)
+        .await
+        .map_err(&attach)?;
     if !stderr.is_empty() {
-        return Err(protocol_error("stat control record is invalid"));
+        return Err(attach(protocol_error("stat control record is invalid")));
     }
-    let mut cursor = SpoolCursor::new(&result.output, StreamKind::Stdout, limits.max_frame_bytes)?;
+    let mut cursor = SpoolCursor::new(&result.output, StreamKind::Stdout, limits.max_frame_bytes)
+        .map_err(&attach)?;
     let mut entries = Vec::with_capacity(request.paths.len());
     for requested in &request.paths {
         let actual = cursor
             .next_field(limits.max_frame_bytes)
-            .await?
-            .ok_or_else(|| protocol_error("stat response is incomplete"))?;
+            .await
+            .map_err(&attach)?
+            .ok_or_else(|| protocol_error("stat response is incomplete"))
+            .map_err(&attach)?;
         let status = cursor
             .next_field(64)
-            .await?
-            .ok_or_else(|| protocol_error("stat response is incomplete"))?;
+            .await
+            .map_err(&attach)?
+            .ok_or_else(|| protocol_error("stat response is incomplete"))
+            .map_err(&attach)?;
         if actual != requested.absolute().as_bytes() {
-            return Err(protocol_error("stat response order is invalid"));
+            return Err(attach(protocol_error("stat response order is invalid")));
         }
         let actual_path = encode_bytes(&actual);
         let relative_path = encode_bytes(requested.relative().as_bytes());
         if status == b"OK" {
             let mode = cursor
                 .next_field(64)
-                .await?
-                .ok_or_else(|| protocol_error("stat response is incomplete"))?;
+                .await
+                .map_err(&attach)?
+                .ok_or_else(|| protocol_error("stat response is incomplete"))
+                .map_err(&attach)?;
             let size = cursor
                 .next_field(64)
-                .await?
-                .ok_or_else(|| protocol_error("stat response is incomplete"))?;
+                .await
+                .map_err(&attach)?
+                .ok_or_else(|| protocol_error("stat response is incomplete"))
+                .map_err(&attach)?;
             let mtime = cursor
                 .next_field(128)
-                .await?
-                .ok_or_else(|| protocol_error("stat response is incomplete"))?;
-            let raw_mode = u32::from_str_radix(utf8(&mode)?, 16)
-                .map_err(|_| protocol_error("stat mode is invalid"))?;
-            let (mtime_seconds, mtime_nanoseconds) = parse_mtime(&mtime)?;
+                .await
+                .map_err(&attach)?
+                .ok_or_else(|| protocol_error("stat response is incomplete"))
+                .map_err(&attach)?;
+            let raw_mode = u32::from_str_radix(utf8(&mode).map_err(&attach)?, 16)
+                .map_err(|_| protocol_error("stat mode is invalid"))
+                .map_err(&attach)?;
+            let (mtime_seconds, mtime_nanoseconds) = parse_mtime(&mtime).map_err(&attach)?;
             entries.push(StatEntry::Success {
                 actual_path,
                 relative_path,
                 metadata: RemoteMetadata {
                     kind: kind_from_mode(raw_mode),
-                    size: parse_u64(&size)?,
+                    size: parse_u64(&size).map_err(&attach)?,
                     mode: raw_mode & 0o7777,
                     mtime_seconds,
                     mtime_nanoseconds,
@@ -359,12 +394,17 @@ pub(super) async fn stat(
             entries.push(StatEntry::Error {
                 actual_path,
                 relative_path,
-                error: entry_error(&status)?,
+                error: entry_error(&status).map_err(&attach)?,
             });
         }
     }
-    if cursor.next_field(limits.max_frame_bytes).await?.is_some() {
-        return Err(protocol_error("stat response has trailing fields"));
+    if cursor
+        .next_field(limits.max_frame_bytes)
+        .await
+        .map_err(&attach)?
+        .is_some()
+    {
+        return Err(attach(protocol_error("stat response has trailing fields")));
     }
     Ok(StatResult {
         context: context(
