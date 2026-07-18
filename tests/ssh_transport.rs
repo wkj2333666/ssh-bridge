@@ -762,12 +762,14 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
             "find_nul",
             "grep",
             "grep_nul",
+            "guarded_delete",
             "ln",
             "mktemp",
             "mv",
             "read_slice",
             "rg",
             "rg_json",
+            "safe_write",
             "search_bound",
             "sha256sum",
             "stat",
@@ -784,6 +786,8 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
         "grep_nul",
         "xargs_nul",
         "search_bound",
+        "safe_write",
+        "guarded_delete",
     ] {
         assert_eq!(
             capability.tools.get(key),
@@ -791,6 +795,32 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
             "functional probe {key}"
         );
     }
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn task5_full_probe_reports_functional_mutation_flags() {
+    let root = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let requested = RemotePath::resolve(root.path().to_str().unwrap(), ".").unwrap();
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            CAPABILITY_PROBE_SCRIPT,
+            "probe",
+            root.path().to_str().unwrap(),
+        ])
+        .env("TMPDIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "probe stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let capability = parse_probe_output(&output.stdout, &requested).unwrap();
+    assert_eq!(capability.tools.get("safe_write"), Some(&true));
+    assert_eq!(capability.tools.get("guarded_delete"), Some(&true));
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
@@ -861,6 +891,81 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
             "rm",
             "case \" $* \" in *codex-probe-bound.*) exit 0;; esac\nexec /usr/bin/rm \"$@\"\n",
         ),
+        (
+            "safe_write",
+            "stat",
+            "case \" $* \" in *\" -L \"*codex-probe-safe-write/followed-parent-link*) exit 64;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "mktemp",
+            "case \" $* \" in *--tmpdir=*codex-probe-safe-write*.codex-ssh-bridge.*) exit 64;; esac\nexec /usr/bin/mktemp \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "dd",
+            "case \" $* \" in *codex-probe-safe-write*bs=262144*oflag=nofollow*) exit 64;; esac\nexec /usr/bin/dd \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "dd",
+            "case \" $* \" in *codex-probe-safe-write*bs=262144*iflag=nofollow*) /usr/bin/dd \"$@\"; exit 7;; esac\nexec /usr/bin/dd \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "stat",
+            "case \" $* \" in *codex-probe-safe-write/.codex-ssh-bridge.*) printf '81a4:0:600:7:1:2:1:extra\\n'; exit 0;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "stat",
+            "case \" $* \" in *codex-probe-safe-write/.codex-ssh-bridge.*) printf '81a4:0:600:7:1:*:1\\n'; exit 0;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "id",
+            "case \" $* \" in *\" -u \"*) exit 64;; esac\nexec /usr/bin/id \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "chmod",
+            "case \" $* \" in *codex-probe-safe-write*chmod-link*) exit 64;; esac\nexec /usr/bin/chmod \"$@\"\n",
+        ),
+        (
+            "guarded_delete",
+            "stat",
+            "case \" $* \" in *\" -L \"*codex-probe-guarded-delete*) exit 64;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "guarded_delete",
+            "stat",
+            "case \" $* \" in *codex-probe-guarded-delete*target:*) marker=${TMPDIR:-/tmp}/task5-delete-stat-count; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); if [ \"$count\" -eq 2 ]; then /usr/bin/rm -f \"$marker\"; printf 'a1ff:0:777:7:1:2:1\\n'; exit 0; fi; printf %s \"$count\" >\"$marker\";; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "guarded_delete",
+            "dd",
+            "case \" $* \" in *codex-probe-guarded-delete*bs=262144*iflag=nofollow*) marker=${TMPDIR:-/tmp}/task5-guarded-hash-count; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); if [ \"$count\" -eq 2 ]; then /usr/bin/rm -f \"$marker\"; exit 64; fi; printf %s \"$count\" >\"$marker\";; esac\nexec /usr/bin/dd \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "ln",
+            "case \" $* \" in *codex-probe-safe-write*created*) exit 0;; esac\nexec /usr/bin/ln \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "mv",
+            "case \" $* \" in *codex-probe-safe-write*replaced*) exit 0;; esac\nexec /usr/bin/mv \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "rm",
+            "case \" $* \" in *\" -f -- \"*codex-probe-safe-write*created*) exit 0;; esac\nexec /usr/bin/rm \"$@\"\n",
+        ),
+        (
+            "guarded_delete",
+            "rm",
+            "case \" $* \" in *codex-probe-guarded-delete*target:*) exit 0;; esac\nexec /usr/bin/rm \"$@\"\n",
+        ),
     ];
 
     for (expected_false, tool, body) in cases {
@@ -894,6 +999,8 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
             "grep_nul",
             "xargs_nul",
             "search_bound",
+            "safe_write",
+            "guarded_delete",
         ] {
             assert_eq!(
                 capability.tools.get(key),
@@ -903,6 +1010,92 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
         }
         assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
     }
+}
+
+#[test]
+fn task5_mutation_hash_probe_is_closed_and_restores_shell_state() {
+    let root = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let shim = TempDir::new().unwrap();
+    let count_path = shim.path().join("sha-count");
+    let executable = shim.path().join("sha256sum");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nmarker={}\ncount=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0)\ncount=$((count + 1))\nprintf %s \"$count\" >\"$marker\"\nif [ \"$count\" -eq 2 ]; then printf 'CODEX_DD_STATUS=0\\nMALFORMED\\n'; fi\nexec /usr/bin/sha256sum \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(count_path.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            CAPABILITY_PROBE_SCRIPT,
+            "probe",
+            root.path().to_str().unwrap(),
+        ])
+        .env(
+            "PATH",
+            format!("{}:/usr/local/bin:/usr/bin:/bin", shim.path().display()),
+        )
+        .env("TMPDIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "probe stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_root = RemotePath::resolve(root.path().to_str().unwrap(), ".").unwrap();
+    let capability = parse_probe_output(&output.stdout, &expected_root).unwrap();
+    assert_eq!(capability.tools.get("safe_write"), Some(&true));
+    assert_eq!(capability.tools.get("guarded_delete"), Some(&true));
+    assert_eq!(fs::read_to_string(count_path).unwrap(), "5");
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn task5_shared_hash_failure_closes_only_mutation_capabilities() {
+    let root = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let shim = TempDir::new().unwrap();
+    let executable = shim.path().join("sha256sum");
+    fs::write(&executable, "#!/bin/sh\nexit 64\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            CAPABILITY_PROBE_SCRIPT,
+            "probe",
+            root.path().to_str().unwrap(),
+        ])
+        .env(
+            "PATH",
+            format!("{}:/usr/local/bin:/usr/bin:/bin", shim.path().display()),
+        )
+        .env("TMPDIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let expected_root = RemotePath::resolve(root.path().to_str().unwrap(), ".").unwrap();
+    let capability = parse_probe_output(&output.stdout, &expected_root).unwrap();
+    assert_eq!(capability.tools.get("safe_write"), Some(&false));
+    assert_eq!(capability.tools.get("guarded_delete"), Some(&false));
+    for key in [
+        "read_slice",
+        "find_nul",
+        "stat_printf",
+        "rg_json",
+        "grep_nul",
+        "xargs_nul",
+        "search_bound",
+    ] {
+        assert_eq!(capability.tools.get(key), Some(&true), "key={key}");
+    }
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
 #[test]

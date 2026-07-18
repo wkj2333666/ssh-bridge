@@ -18,6 +18,7 @@ pub enum ErrorCode {
     NotFound,
     PermissionDenied,
     NotDirectory,
+    MutationOutcomeUnknown,
     OutputLimit,
     RequestTooLarge,
     ProtocolError,
@@ -47,6 +48,8 @@ pub struct ErrorDetails {
     pub remote_process_may_continue: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_seen: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_may_have_applied: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -106,6 +109,16 @@ impl BridgeError {
             false,
         )
     }
+
+    pub(crate) fn mutation_outcome_unknown() -> Self {
+        let mut error = Self::new(
+            ErrorCode::MutationOutcomeUnknown,
+            "remote mutation outcome could not be confirmed",
+            false,
+        );
+        error.details.mutation_may_have_applied = Some(true);
+        error
+    }
 }
 
 impl fmt::Display for BridgeError {
@@ -119,5 +132,22 @@ impl std::error::Error for BridgeError {}
 impl From<std::io::Error> for BridgeError {
     fn from(error: std::io::Error) -> Self {
         Self::io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BridgeError, ErrorCode};
+
+    #[test]
+    fn mutation_outcome_unknown_constructor_is_closed_and_non_retryable() {
+        let error = BridgeError::mutation_outcome_unknown();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(
+            error.message,
+            "remote mutation outcome could not be confirmed"
+        );
+        assert!(!error.retryable);
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
     }
 }

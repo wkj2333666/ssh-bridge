@@ -30,13 +30,15 @@ const TOOL_NAMES: &[&str] = &[
     "grep_nul",
     "xargs_nul",
     "search_bound",
+    "safe_write",
+    "guarded_delete",
 ];
 
 pub const CAPABILITY_PROBE_SCRIPT: &str = r#"
 set -u
 
 requested_root=$1
-cd -- "$requested_root" || exit 1
+cd "$requested_root" || exit 1
 physical_plus=$(pwd -P && printf x) || exit 1
 physical_with_delimiter=${physical_plus%x}
 newline='
@@ -82,7 +84,13 @@ cleanup_probe_tmp() {
         probe_tmp=
     fi
 }
-trap cleanup_probe_tmp EXIT HUP INT TERM
+on_probe_signal() {
+    trap - 0 HUP INT TERM
+    cleanup_probe_tmp
+    exit 1
+}
+trap cleanup_probe_tmp 0
+trap on_probe_signal HUP INT TERM
 
 if [ "$tool_mktemp" = 1 ]; then
     probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/codex-ssh-bridge.XXXXXX") || {
@@ -91,7 +99,7 @@ if [ "$tool_mktemp" = 1 ]; then
     }
 fi
 if [ -n "$probe_tmp" ] && command -v dd >/dev/null 2>&1; then
-    if dd if=/dev/null of="$probe_tmp/dd-output" oflag=nofollow >/dev/null 2>&1; then
+    if dd if=/dev/null of="$probe_tmp/dd-output" bs=262144 oflag=nofollow >/dev/null 2>&1; then
         tool_dd_nofollow=1
     fi
 fi
@@ -103,6 +111,8 @@ tool_rg_json=0
 tool_grep_nul=0
 tool_xargs_nul=0
 tool_search_bound=0
+tool_safe_write=0
+tool_guarded_delete=0
 if [ -n "$probe_tmp" ]; then
     read_file=$probe_tmp/codex-probe-read
     read_tail=$probe_tmp/read-tail
@@ -140,7 +150,7 @@ name'
     touch -d '@7.25' -- "$find_actual/visible/$newline_name"
     touch -h -d '@8.5' -- "$find_actual/descendant-link"
     find_link_size=${#find_link_target}
-    if (cd -- "$probe_tmp" &&
+    if (cd "$probe_tmp" &&
         find -H codex-probe-find-link -mindepth 1 -maxdepth 2 \
         \( -path '*/.*' -prune -o -type f -printf '%P\000%y\000%s\000%m\000%T@\000' \) &&
         find -H codex-probe-find-link -mindepth 1 -maxdepth 2 \
@@ -232,7 +242,13 @@ name'
         bound_dir=$(mktemp -d "$probe_tmp/codex-probe-bound.XXXXXX" 2>/dev/null) || bound_dir=
         if [ -n "$bound_dir" ] && (
             cleanup_bound() { rm -rf -- "$bound_dir"; }
-            trap cleanup_bound EXIT HUP INT TERM
+            on_bound_signal() {
+                trap - 0 HUP INT TERM
+                cleanup_bound
+                exit 1
+            }
+            trap cleanup_bound 0
+            trap on_bound_signal HUP INT TERM
             bound_fifo=$bound_dir/success-fifo
             bound_status=$bound_dir/success-status
             bound_out=$bound_dir/success-output
@@ -285,6 +301,262 @@ name'
             rm -rf -- "$bound_dir"
         fi
     fi
+
+    codex_mutation_stat() {
+        stat --printf='%f:%u:%a:%s:%d:%i:%h\n' -- "$1" 2>/dev/null
+    }
+
+    codex_mutation_parent_stat_follow() {
+        stat -L --printf='%f:%u:%a:%s:%d:%i:%h\n' -- "$1" 2>/dev/null
+    }
+
+    codex_mutation_mktemp() {
+        mktemp --tmpdir="$1" .codex-ssh-bridge.XXXXXXXXXX
+    }
+
+    codex_mutation_stage() (
+        on_codex_mutation_stage_signal() {
+            trap - HUP INT TERM
+            exit 125
+        }
+        trap on_codex_mutation_stage_signal HUP INT TERM
+        dd of="$1" bs=262144 status=none conv=notrunc oflag=nofollow
+    )
+
+    codex_mutation_link() {
+        ln -- "$1" "$2"
+    }
+
+    codex_mutation_replace() {
+        mv -T -- "$1" "$2"
+    }
+
+    codex_mutation_mode() {
+        chmod -h "$1" -- "$2"
+    }
+
+    codex_mutation_remove() {
+        rm -f -- "$1"
+    }
+
+    codex_mutation_stat_parse() {
+        codex_stat_line=$1
+        case "$codex_stat_line" in ''|*[!0-9a-f:]*) return 1 ;; esac
+        codex_stat_old_ifs=$IFS
+        IFS=:
+        set -- $codex_stat_line
+        IFS=$codex_stat_old_ifs
+        [ "$#" -eq 7 ] || return 1
+        case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+        case "$2:$4:$5:$6:$7" in *[!0-9:]*) return 1 ;; esac
+        case "$3" in ''|*[!0-7]*) return 1 ;; esac
+        CODEX_STAT_TYPE=$1
+        CODEX_STAT_UID=$2
+        CODEX_STAT_MODE=$3
+        CODEX_STAT_SIZE=$4
+        CODEX_STAT_DEVICE=$5
+        CODEX_STAT_INODE=$6
+        CODEX_STAT_LINKS=$7
+    }
+
+    codex_mutation_stat_valid() {
+        codex_stat_line=$(codex_mutation_stat "$1") || return 9
+        codex_mutation_stat_parse "$codex_stat_line"
+    }
+
+    codex_mutation_parent_stat_follow_valid() {
+        codex_stat_line=$(codex_mutation_parent_stat_follow "$1") || return 9
+        codex_mutation_stat_parse "$codex_stat_line"
+    }
+
+    codex_mutation_hash() (
+        codex_hash_capture=$(
+            {
+                {
+                    dd if="$1" bs=262144 status=none iflag=nofollow 2>/dev/null
+                    printf 'CODEX_DD_STATUS=%s\n' "$?" >&2
+                } | sha256sum 2>/dev/null
+                printf 'CODEX_SHA_STATUS=%s\n' "$?" >&2
+            } 2>&1
+        )
+        codex_hash_dd=
+        codex_hash_sha=
+        codex_hash_digest=
+        codex_hash_dd_seen=0
+        codex_hash_sha_seen=0
+        codex_hash_digest_seen=0
+        codex_hash_valid=1
+        set -f
+        IFS="$newline"
+        for codex_hash_line in $codex_hash_capture; do
+            case "$codex_hash_line" in
+                CODEX_DD_STATUS=*)
+                    if [ "$codex_hash_dd_seen" -ne 0 ]; then
+                        codex_hash_valid=0
+                        break
+                    fi
+                    codex_hash_dd_seen=1
+                    codex_hash_dd=${codex_hash_line#CODEX_DD_STATUS=}
+                    ;;
+                CODEX_SHA_STATUS=*)
+                    if [ "$codex_hash_sha_seen" -ne 0 ]; then
+                        codex_hash_valid=0
+                        break
+                    fi
+                    codex_hash_sha_seen=1
+                    codex_hash_sha=${codex_hash_line#CODEX_SHA_STATUS=}
+                    ;;
+                *'  -')
+                    if [ "$codex_hash_digest_seen" -ne 0 ]; then
+                        codex_hash_valid=0
+                        break
+                    fi
+                    codex_hash_digest_seen=1
+                    codex_hash_digest=${codex_hash_line%  -}
+                    ;;
+                *)
+                    codex_hash_valid=0
+                    break
+                    ;;
+            esac
+        done
+        if [ "$codex_hash_dd_seen" -ne 1 ] || [ "$codex_hash_sha_seen" -ne 1 ]; then
+            codex_hash_valid=0
+        fi
+        if [ "$codex_hash_valid" -ne 1 ]; then
+            codex_hash_status=1
+        elif [ "$codex_hash_dd" != 0 ] || [ "$codex_hash_sha" != 0 ]; then
+            codex_hash_status=9
+        elif [ "$codex_hash_digest_seen" -ne 1 ] || [ "${#codex_hash_digest}" -ne 64 ]; then
+            codex_hash_status=1
+        else
+            case "$codex_hash_digest" in *[!0-9a-f]*) codex_hash_valid=0 ;; esac
+            if [ "$codex_hash_valid" -eq 1 ]; then
+                printf '%s\n' "$codex_hash_digest"
+                codex_hash_status=0
+            else
+                codex_hash_status=1
+            fi
+        fi
+        exit "$codex_hash_status"
+    )
+
+    safe_dir=$probe_tmp/codex-probe-safe-write
+    if (
+        umask 077
+        mkdir -m 700 -- "$safe_dir" || exit 9
+        cleanup_safe_write() { rm -rf -- "$safe_dir"; }
+        on_safe_write_signal() {
+            trap - 0 HUP INT TERM
+            cleanup_safe_write
+            exit 1
+        }
+        trap cleanup_safe_write 0
+        trap on_safe_write_signal HUP INT TERM
+        safe_hostile=$safe_dir/"hostile:
+name' value"
+        safe_parent_actual=$safe_dir/followed-parent
+        safe_parent_link=$safe_dir/followed-parent-link
+        mkdir -m 700 -- "$safe_parent_actual" || exit 9
+        ln -s "$safe_parent_actual" "$safe_parent_link" || exit 9
+        codex_mutation_parent_stat_follow_valid "$safe_parent_actual" || exit 1
+        safe_follow_device=$CODEX_STAT_DEVICE
+        safe_follow_inode=$CODEX_STAT_INODE
+        codex_mutation_parent_stat_follow_valid "$safe_parent_link" || exit 1
+        [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$safe_follow_device:$safe_follow_inode" ] || exit 1
+        case "$CODEX_STAT_TYPE" in 4???) ;; *) exit 1 ;; esac
+
+        codex_mutation_parent_stat_follow_valid "$safe_dir" || exit 1
+        safe_parent_device=$CODEX_STAT_DEVICE
+        safe_tmp=$(codex_mutation_mktemp "$safe_dir") || exit 1
+        printf payload | codex_mutation_stage "$safe_tmp" || exit 1
+        codex_mutation_stat_valid "$safe_tmp" || exit 1
+        safe_uid=$(id -u) || exit 1
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 1 ;; esac
+        [ "$CODEX_STAT_UID" = "$safe_uid" ] &&
+        [ "$CODEX_STAT_MODE" = 600 ] &&
+        [ "$CODEX_STAT_SIZE" = 7 ] &&
+        [ "$CODEX_STAT_DEVICE" = "$safe_parent_device" ] &&
+        [ "$CODEX_STAT_LINKS" = 1 ] || exit 1
+        CODEX_HASH_DIGEST=$(codex_mutation_hash "$safe_tmp") || exit 1
+        [ "$CODEX_HASH_DIGEST" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
+
+        printf OUTSIDE >"$safe_hostile" || exit 9
+        ln -s "$safe_hostile" "$safe_dir/dd-link" || exit 9
+        if printf CHANGED | codex_mutation_stage "$safe_dir/dd-link" 2>/dev/null; then exit 1; fi
+        [ "$(cat "$safe_hostile")" = OUTSIDE ] || exit 1
+        if CODEX_HASH_DIGEST=$(codex_mutation_hash "$safe_dir/dd-link"); then exit 1; fi
+
+        safe_created=$safe_dir/created
+        codex_mutation_link "$safe_tmp" "$safe_created" || exit 1
+        if codex_mutation_link "$safe_tmp" "$safe_created" 2>/dev/null; then exit 1; fi
+        codex_mutation_remove "$safe_created" || exit 1
+        [ ! -e "$safe_created" ] && [ ! -L "$safe_created" ] || exit 1
+        safe_replaced=$safe_dir/replaced
+        printf old >"$safe_replaced" || exit 9
+        codex_mutation_replace "$safe_tmp" "$safe_replaced" || exit 1
+        [ ! -e "$safe_tmp" ] && [ ! -L "$safe_tmp" ] || exit 1
+        codex_mutation_mode 0640 "$safe_replaced" || exit 1
+        codex_mutation_stat_valid "$safe_replaced" || exit 1
+        [ "$CODEX_STAT_MODE" = 640 ] || exit 1
+        CODEX_HASH_DIGEST=$(codex_mutation_hash "$safe_replaced") || exit 1
+        [ "$CODEX_HASH_DIGEST" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
+
+        safe_referent=$safe_dir/chmod-referent
+        safe_link=$safe_dir/chmod-link
+        printf referent >"$safe_referent" || exit 9
+        chmod 0600 -- "$safe_referent" || exit 9
+        ln -s "$safe_referent" "$safe_link" || exit 9
+        codex_mutation_mode 0640 "$safe_link" || exit 1
+        [ "$(stat --printf='%a' -- "$safe_referent")" = 600 ] || exit 1
+        [ "$(cat "$safe_referent")" = referent ] || exit 1
+    ); then
+        if [ ! -e "$safe_dir" ]; then tool_safe_write=1; fi
+    else
+        rm -rf -- "$safe_dir"
+    fi
+
+    delete_dir=$probe_tmp/codex-probe-guarded-delete
+    if (
+        umask 077
+        mkdir -m 700 -- "$delete_dir" || exit 9
+        cleanup_guarded_delete() { rm -rf -- "$delete_dir"; }
+        on_guarded_delete_signal() {
+            trap - 0 HUP INT TERM
+            cleanup_guarded_delete
+            exit 1
+        }
+        trap cleanup_guarded_delete 0
+        trap on_guarded_delete_signal HUP INT TERM
+        delete_target=$delete_dir/"target:
+name' value"
+        codex_mutation_parent_stat_follow_valid "$delete_dir" || exit 1
+        case "$CODEX_STAT_TYPE" in 4???) ;; *) exit 1 ;; esac
+        printf guarded >"$delete_target" || exit 9
+        codex_mutation_stat_valid "$delete_target" || exit 1
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 1 ;; esac
+        delete_device=$CODEX_STAT_DEVICE
+        delete_inode=$CODEX_STAT_INODE
+        CODEX_HASH_DIGEST=$(codex_mutation_hash "$delete_target") || exit 1
+        [ "$CODEX_HASH_DIGEST" = e7da2135b6d3a82d5242bbb5d7b8534e5841356c6973e1d479ce41e41dd6215b ] || exit 1
+        codex_mutation_stat_valid "$delete_target" || exit 1
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 1 ;; esac
+        [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$delete_device:$delete_inode" ] || exit 1
+        CODEX_HASH_DIGEST=$(codex_mutation_hash "$delete_target") || exit 1
+        [ "$CODEX_HASH_DIGEST" = e7da2135b6d3a82d5242bbb5d7b8534e5841356c6973e1d479ce41e41dd6215b ] || exit 1
+        codex_mutation_remove "$delete_target" || exit 1
+        [ ! -e "$delete_target" ] && [ ! -L "$delete_target" ] || exit 1
+
+        printf keep >"$delete_dir/referent" || exit 9
+        ln -s "$delete_dir/referent" "$delete_dir/link" || exit 9
+        codex_mutation_stat_valid "$delete_dir/link" || exit 1
+        case "$CODEX_STAT_TYPE" in a???) ;; *) exit 1 ;; esac
+        [ "$(cat "$delete_dir/referent")" = keep ] || exit 1
+    ); then
+        if [ ! -e "$delete_dir" ]; then tool_guarded_delete=1; fi
+    else
+        rm -rf -- "$delete_dir"
+    fi
 fi
 
 emit_record CODEX_SSH_PROBE 1
@@ -309,6 +581,8 @@ emit_record TOOL_rg_json "$tool_rg_json"
 emit_record TOOL_grep_nul "$tool_grep_nul"
 emit_record TOOL_xargs_nul "$tool_xargs_nul"
 emit_record TOOL_search_bound "$tool_search_bound"
+emit_record TOOL_safe_write "$tool_safe_write"
+emit_record TOOL_guarded_delete "$tool_guarded_delete"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

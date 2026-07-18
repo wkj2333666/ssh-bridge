@@ -18,6 +18,7 @@ mod metadata;
 mod protocol;
 mod read;
 mod search;
+mod write;
 
 const MAX_INPUT_PATH_BYTES: usize = 64 * 1024;
 const MAX_STAT_PATHS: usize = 256;
@@ -101,6 +102,23 @@ impl RemoteBridge {
         search::search(self, resolved, cancel).await
     }
 
+    pub async fn write(
+        &self,
+        request: WriteRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<WriteResult> {
+        write::write(self, request, cancel).await
+    }
+
+    #[allow(dead_code, reason = "reserved for the internal Task 6 patch workflow")]
+    pub(crate) async fn guarded_delete(
+        &self,
+        request: GuardedDeleteRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<GuardedDeleteResult> {
+        write::guarded_delete(self, request, cancel).await
+    }
+
     pub async fn output_read(
         &self,
         request: OutputReadRequest,
@@ -134,13 +152,16 @@ impl RemoteBridge {
     ) -> BridgeResult<FixedRunResult> {
         let first = self
             .runner
-            .execute_fixed(request.clone(), cancel.clone())
+            .execute_fixed_once(request.clone(), cancel.clone())
             .await?;
         match protocol::capability_mismatch(&first, request.required_capabilities).await? {
             None => Ok(first),
             Some(_) => {
                 self.runner.invalidate_capability(&request.host).await;
-                let second = self.runner.execute_fixed(request.clone(), cancel).await?;
+                let second = self
+                    .runner
+                    .execute_fixed_once(request.clone(), cancel)
+                    .await?;
                 match protocol::capability_mismatch(&second, request.required_capabilities).await? {
                     None => Ok(second),
                     Some(_) => Err(BridgeError::new(
@@ -426,6 +447,34 @@ pub struct SearchRequest {
     pub binary: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteMode {
+    Create,
+    Replace { expected_sha256: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRequest {
+    pub host: String,
+    pub path: String,
+    pub content: String,
+    pub encoding: WriteEncoding,
+    pub mode: WriteMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardedDeleteRequest {
+    pub host: String,
+    pub path: String,
+    pub expected_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputReadRequest {
     pub output_ref: String,
@@ -624,6 +673,34 @@ pub struct OutputReadResult {
     pub next_offset: u64,
     pub eof: bool,
     pub data: EncodedValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteOperation {
+    Create,
+    Replace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WriteResult {
+    #[serde(flatten)]
+    pub context: RemoteContext,
+    pub actual_path: EncodedValue,
+    pub relative_path: EncodedValue,
+    pub operation: WriteOperation,
+    pub raw_bytes: u64,
+    pub sha256: String,
+    pub mode: u32,
+    pub temporary_cleanup_confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardedDeleteResult {
+    pub actual_path: EncodedValue,
+    pub relative_path: EncodedValue,
+    pub deleted_sha256: String,
+    pub absence_confirmed: bool,
 }
 
 #[cfg(test)]

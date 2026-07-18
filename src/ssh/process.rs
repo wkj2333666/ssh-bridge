@@ -69,8 +69,15 @@ pub struct RunResult {
     pub remote_process_may_continue: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixedOperationKind {
+    ReadOnly,
+    Mutation,
+}
+
 #[derive(Clone)]
 pub(crate) struct FixedRunRequest {
+    pub kind: FixedOperationKind,
     pub host: String,
     pub script: &'static str,
     pub args: Vec<String>,
@@ -270,7 +277,7 @@ impl SshRunner {
         self.output_store.provenance(reference).await
     }
 
-    pub(crate) async fn execute_fixed(
+    pub(crate) async fn execute_fixed_once(
         &self,
         request: FixedRunRequest,
         cancel: CancellationToken,
@@ -337,7 +344,7 @@ impl SshRunner {
             if capability.tools.get(*key) != Some(&true) {
                 return Err(BridgeError::new(
                     ErrorCode::RemoteCapabilityMissing,
-                    "remote host lacks a required read capability",
+                    "remote host lacks a required capability",
                     false,
                 ));
             }
@@ -356,22 +363,23 @@ impl SshRunner {
                         max_output_bytes: capture_limit,
                     },
                     deadline: request.timeout,
-                    phase: Phase::Command {
-                        remote_timeout_wrapped: false,
-                    },
+                    phase: Phase::Fixed { kind: request.kind },
                     internal_registration: Some(request.cleanup),
                 },
                 &cancel,
                 &request.host,
             )
             .await?;
-        let output = outcome.output.into_internal()?;
+        let output = outcome
+            .output
+            .into_internal()
+            .map_err(|error| request.kind.after_spawn_error(error))?;
         if output.stdout_len > request.stdout_limit || output.stderr_len > request.stderr_limit {
-            return Err(BridgeError::new(
+            return Err(request.kind.after_spawn_error(BridgeError::new(
                 ErrorCode::OutputLimit,
                 "fixed output exceeded its stream limit",
                 false,
-            ));
+            )));
         }
         Ok(FixedRunResult {
             capability,
@@ -594,20 +602,30 @@ impl SshRunner {
             });
         }
         let mut child = command.spawn().map_err(BridgeError::io)?;
+        // From this point the mutation outcome is ambiguous. These setup
+        // checks run before any internal spool exists; on an early return the
+        // still-owned child is killed by `kill_on_drop`.
         let process_group = child
             .id()
-            .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH child has no process id", false))?
+            .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH child has no process id", false))
+            .map_err(|error| spec.phase.after_spawn_error(error))?
             as i32;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH stdout pipe is missing", false))?;
+            .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH stdout pipe is missing", false))
+            .map_err(|error| spec.phase.after_spawn_error(error))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH stderr pipe is missing", false))?;
+            .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH stderr pipe is missing", false))
+            .map_err(|error| spec.phase.after_spawn_error(error))?;
         let child_stdin = child.stdin.take();
-        let mut stdin_task = tokio::spawn(write_stdin(child_stdin, spec.stdin));
+        let mut stdin_task = tokio::spawn(write_stdin(
+            child_stdin,
+            spec.stdin,
+            spec.phase.accepts_early_stdin_close(),
+        ));
         let output_limit = CancellationToken::new();
         let mut capture_task = {
             let store = Arc::clone(&self.output_store);
@@ -751,7 +769,7 @@ impl SshRunner {
                     error.details.bytes_seen = Some(bytes_seen);
                     error.details.remote_process_may_continue = Some(spec.phase.remote_started());
                 }
-                Err(error)
+                Err(spec.phase.after_spawn_error(error))
             }
         }
     }
@@ -797,7 +815,7 @@ impl SshRunner {
         if let ChildCaptured::Public(output) = &output {
             self.output_store.discard(output).await;
         }
-        Err(error)
+        Err(phase.after_spawn_error(error))
     }
 }
 
@@ -813,6 +831,25 @@ struct ChildOutcome {
 enum ChildCaptured {
     Public(CapturedOutput),
     Internal(InternalCapturedOutput),
+}
+
+fn mutation_unknown(mut source: BridgeError) -> BridgeError {
+    let mut error = BridgeError::mutation_outcome_unknown();
+    error.details.host = source.details.host.take();
+    error.details.elapsed_ms = source.details.elapsed_ms;
+    error.details.exit_status = source.details.exit_status;
+    error.details.bytes_seen = source.details.bytes_seen;
+    error.details.remote_process_may_continue = source.details.remote_process_may_continue;
+    error
+}
+
+impl FixedOperationKind {
+    fn after_spawn_error(self, error: BridgeError) -> BridgeError {
+        match self {
+            Self::ReadOnly => error,
+            Self::Mutation => mutation_unknown(error),
+        }
+    }
 }
 
 impl ChildCaptured {
@@ -864,6 +901,7 @@ enum Phase {
     Resolve,
     Probe,
     Command { remote_timeout_wrapped: bool },
+    Fixed { kind: FixedOperationKind },
 }
 
 impl Phase {
@@ -880,8 +918,24 @@ impl Phase {
         )
     }
 
+    fn after_spawn_error(self, error: BridgeError) -> BridgeError {
+        match self {
+            Self::Fixed { kind } => kind.after_spawn_error(error),
+            Self::Resolve | Self::Probe | Self::Command { .. } => error,
+        }
+    }
+
     fn allows_transport_classification(self) -> bool {
         matches!(self, Self::Resolve | Self::Probe)
+    }
+
+    fn accepts_early_stdin_close(self) -> bool {
+        matches!(
+            self,
+            Self::Fixed {
+                kind: FixedOperationKind::Mutation
+            }
+        )
     }
 
     fn timeout_error(self, bytes_seen: u64) -> BridgeError {
@@ -896,7 +950,9 @@ impl Phase {
                 "SSH capability probe timed out",
                 true,
             ),
-            Self::Command { .. } => (ErrorCode::CommandTimeout, "remote command timed out", false),
+            Self::Command { .. } | Self::Fixed { .. } => {
+                (ErrorCode::CommandTimeout, "remote command timed out", false)
+            }
         };
         let mut error = BridgeError::new(code, message, retryable);
         error.details.remote_process_may_continue = Some(self.remote_started());
@@ -1014,15 +1070,23 @@ fn capability_probe_command(root: &str) -> BridgeResult<String> {
 async fn write_stdin(
     mut stdin: Option<tokio::process::ChildStdin>,
     bytes: Option<Vec<u8>>,
+    accepts_early_close: bool,
 ) -> std::io::Result<()> {
     if let Some(mut stdin) = stdin.take() {
         if let Some(bytes) = bytes
             && let Err(error) = stdin.write_all(&bytes).await
-            && error.kind() != std::io::ErrorKind::BrokenPipe
         {
+            if accepts_early_close && error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
             return Err(error);
         }
-        stdin.shutdown().await?;
+        if let Err(error) = stdin.shutdown().await {
+            if accepts_early_close && error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -1142,10 +1206,23 @@ fn elapsed_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_probe_command, render_fixed_command, render_remote_command};
+    use super::{
+        ChildSpec, FixedOperationKind, Phase, SshRunner, capability_probe_command,
+        mutation_unknown, render_fixed_command, render_remote_command,
+    };
     use crate::capability::{ShellKind, parse_probe_output};
-    use crate::error::ErrorCode;
+    use crate::config::{Config, HostProfile};
+    use crate::error::{BridgeError, ErrorCode};
+    use crate::output::{CaptureLimits, InternalSpoolOwner, OutputStore};
     use crate::path::RemotePath;
+    use crate::ssh::RuntimePaths;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::{Instant, sleep};
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn capability_probe_command_binds_hostile_root_as_positional_one() {
@@ -1225,5 +1302,510 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"quote'\0line\n$()`\0-x\0");
+    }
+
+    #[test]
+    fn task5_mutation_unknown_is_closed_non_retryable_and_preserves_safe_context() {
+        let mut source = BridgeError::new(ErrorCode::RemoteExit, "untrusted detail", true);
+        source.details.host = Some("dev".to_owned());
+        source.details.elapsed_ms = Some(17);
+        source.details.exit_status = Some(255);
+        source.details.bytes_seen = Some(23);
+        source.details.remote_process_may_continue = Some(true);
+
+        let error = mutation_unknown(source);
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(
+            error.message,
+            "remote mutation outcome could not be confirmed"
+        );
+        assert!(!error.retryable);
+        assert_eq!(error.details.host.as_deref(), Some("dev"));
+        assert_eq!(error.details.elapsed_ms, Some(17));
+        assert_eq!(error.details.exit_status, Some(255));
+        assert_eq!(error.details.bytes_seen, Some(23));
+        assert_eq!(error.details.remote_process_may_continue, Some(true));
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+    }
+
+    fn task5_test_runner(executable: &str) -> (tempfile::TempDir, SshRunner) {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let output = Arc::new(OutputStore::new(&runtime).unwrap());
+        let runner = SshRunner::with_executable(
+            Arc::new(Config::default()),
+            runtime,
+            output,
+            PathBuf::from(executable),
+            BTreeMap::<OsString, OsString>::new(),
+        )
+        .unwrap();
+        (base, runner)
+    }
+
+    struct Task5FixedFixture {
+        _base: tempfile::TempDir,
+        runtime: RuntimePaths,
+        runner: Arc<SshRunner>,
+    }
+
+    fn task5_fixed_fixture(environment: &[(&str, String)]) -> Task5FixedFixture {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let output = Arc::new(OutputStore::new(&runtime).unwrap());
+        let mut config = Config::default();
+        config.hosts.insert(
+            "dev".to_owned(),
+            HostProfile {
+                root: "/srv/project".to_owned(),
+                description: None,
+                read_only: false,
+                limits: Default::default(),
+            },
+        );
+        let environment = environment
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect();
+        let executable =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ssh.sh");
+        let runner = Arc::new(
+            SshRunner::with_executable(
+                Arc::new(config),
+                runtime.clone(),
+                output,
+                executable,
+                environment,
+            )
+            .unwrap(),
+        );
+        Task5FixedFixture {
+            _base: base,
+            runtime,
+            runner,
+        }
+    }
+
+    fn task5_fixed_request(
+        kind: FixedOperationKind,
+        timeout: Duration,
+        cleanup: crate::output::InternalSpoolRegistration,
+        stdout_limit: u64,
+        stderr_limit: u64,
+    ) -> super::FixedRunRequest {
+        super::FixedRunRequest {
+            kind,
+            host: "dev".to_owned(),
+            script: "exit 0",
+            args: Vec::new(),
+            stdin: None,
+            required_capabilities: &["safe_write"],
+            stdout_limit,
+            stderr_limit,
+            timeout,
+            cleanup,
+        }
+    }
+
+    fn task5_call_count(log: &std::path::Path, marker: &str) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == marker)
+            .count()
+    }
+
+    async fn task5_wait_for_call(log: &std::path::Path, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while task5_call_count(log, marker) == 0 {
+            assert!(Instant::now() < deadline, "missing {marker} call");
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn task5_internal_spool_file_count(runtime: &RuntimePaths) -> usize {
+        std::fs::read_dir(runtime.directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .flat_map(|entry| {
+                std::fs::read_dir(entry.path())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+            })
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .count()
+    }
+
+    fn task5_child(script: &str, kind: FixedOperationKind, deadline: Duration) -> ChildSpec {
+        ChildSpec {
+            argv: vec![OsString::from("-c"), OsString::from(script)],
+            stdin: None,
+            capture_limits: CaptureLimits {
+                preview_bytes: 1,
+                max_output_bytes: 1024,
+            },
+            deadline,
+            phase: Phase::Fixed { kind },
+            internal_registration: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_mutation_phase_marks_only_post_spawn_ambiguity() {
+        let (_base, runner) = task5_test_runner("/bin/sh");
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = runner
+            .run_child(
+                task5_child(
+                    "exit 0",
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                ),
+                &cancelled,
+                "dev",
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+
+        let error = runner
+            .run_child(
+                task5_child(
+                    "exit 7",
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                ),
+                &CancellationToken::new(),
+                "dev",
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(error.details.exit_status, Some(7));
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+
+        let error = runner
+            .run_child(
+                task5_child(
+                    "sleep 1",
+                    FixedOperationKind::Mutation,
+                    Duration::from_millis(10),
+                ),
+                &CancellationToken::new(),
+                "dev",
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+
+        let error = runner
+            .run_child(
+                task5_child(
+                    "exit 7",
+                    FixedOperationKind::ReadOnly,
+                    Duration::from_secs(1),
+                ),
+                &CancellationToken::new(),
+                "dev",
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::RemoteExit);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+
+        let mut ordinary = task5_child(
+            "exit 0",
+            FixedOperationKind::ReadOnly,
+            Duration::from_secs(1),
+        );
+        ordinary.phase = Phase::Command {
+            remote_timeout_wrapped: false,
+        };
+        ordinary.stdin = Some(vec![b'x'; 4 * 1024 * 1024]);
+        let error = runner
+            .run_child(ordinary, &CancellationToken::new(), "dev")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+
+        let mut readonly = task5_child(
+            "exit 0",
+            FixedOperationKind::ReadOnly,
+            Duration::from_secs(1),
+        );
+        readonly.stdin = Some(vec![b'x'; 4 * 1024 * 1024]);
+        let error = runner
+            .run_child(readonly, &CancellationToken::new(), "dev")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+
+        let (_missing_base, missing_runner) = task5_test_runner("/no/such/task5-ssh");
+        let error = missing_runner
+            .run_child(
+                task5_child(
+                    "exit 0",
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                ),
+                &CancellationToken::new(),
+                "dev",
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+    }
+
+    #[tokio::test]
+    async fn task5_execute_fixed_once_maps_only_spawned_mutations_and_never_retries() {
+        let logs = tempfile::TempDir::new().unwrap();
+
+        let cached_false_log = logs.path().join("cached-false.log");
+        let fixture = task5_fixed_fixture(&[
+            ("FAKE_SSH_LOG", cached_false_log.display().to_string()),
+            ("FAKE_SSH_HAS_SAFE_WRITE", "0".to_owned()),
+        ]);
+        let owner = InternalSpoolOwner::new();
+        let error = fixture
+            .runner
+            .execute_fixed_once(
+                task5_fixed_request(
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                    owner.registration(),
+                    16,
+                    16,
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+        assert_eq!(task5_call_count(&cached_false_log, "C"), 0);
+        drop(owner);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+
+        let pre_cancel_log = logs.path().join("pre-cancel.log");
+        let fixture =
+            task5_fixed_fixture(&[("FAKE_SSH_LOG", pre_cancel_log.display().to_string())]);
+        let owner = InternalSpoolOwner::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = fixture
+            .runner
+            .execute_fixed_once(
+                task5_fixed_request(
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                    owner.registration(),
+                    16,
+                    16,
+                ),
+                cancel,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+        assert_eq!(task5_call_count(&pre_cancel_log, "C"), 0);
+        drop(owner);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+
+        let probe_cancel_log = logs.path().join("probe-cancel.log");
+        let fixture = task5_fixed_fixture(&[
+            ("FAKE_SSH_LOG", probe_cancel_log.display().to_string()),
+            ("FAKE_SSH_PROBE_SLEEP_SECONDS", "5".to_owned()),
+        ]);
+        let owner = InternalSpoolOwner::new();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let runner = Arc::clone(&fixture.runner);
+            let cancel = cancel.clone();
+            let request = task5_fixed_request(
+                FixedOperationKind::Mutation,
+                Duration::from_secs(1),
+                owner.registration(),
+                16,
+                16,
+            );
+            async move { runner.execute_fixed_once(request, cancel).await }
+        });
+        task5_wait_for_call(&probe_cancel_log, "P").await;
+        cancel.cancel();
+        let error = task.await.unwrap().err().unwrap();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.details.mutation_may_have_applied, None);
+        assert_eq!(task5_call_count(&probe_cancel_log, "C"), 0);
+        drop(owner);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+
+        for (name, exit_status) in [("exit7", 7), ("status255", 255)] {
+            let log = logs.path().join(format!("{name}.log"));
+            let fixture = task5_fixed_fixture(&[
+                ("FAKE_SSH_LOG", log.display().to_string()),
+                ("FAKE_SSH_MODE", "error".to_owned()),
+                ("FAKE_SSH_ERROR", "remote".to_owned()),
+                ("FAKE_SSH_EXIT_STATUS", exit_status.to_string()),
+            ]);
+            let owner = InternalSpoolOwner::new();
+            let error = fixture
+                .runner
+                .execute_fixed_once(
+                    task5_fixed_request(
+                        FixedOperationKind::Mutation,
+                        Duration::from_secs(1),
+                        owner.registration(),
+                        16,
+                        64,
+                    ),
+                    CancellationToken::new(),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown, "{name}");
+            assert_eq!(error.details.exit_status, Some(exit_status), "{name}");
+            assert_eq!(error.details.mutation_may_have_applied, Some(true));
+            assert_eq!(task5_call_count(&log, "C"), 1, "{name}");
+            drop(owner);
+            assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+        }
+
+        let timeout_log = logs.path().join("timeout.log");
+        let fixture = task5_fixed_fixture(&[
+            ("FAKE_SSH_LOG", timeout_log.display().to_string()),
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "5".to_owned()),
+        ]);
+        let owner = InternalSpoolOwner::new();
+        let error = fixture
+            .runner
+            .execute_fixed_once(
+                task5_fixed_request(
+                    FixedOperationKind::Mutation,
+                    Duration::from_millis(20),
+                    owner.registration(),
+                    16,
+                    16,
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+        assert_eq!(task5_call_count(&timeout_log, "C"), 1);
+        drop(owner);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+
+        let cancel_log = logs.path().join("spawn-cancel.log");
+        let fixture = task5_fixed_fixture(&[
+            ("FAKE_SSH_LOG", cancel_log.display().to_string()),
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "5".to_owned()),
+        ]);
+        let owner = InternalSpoolOwner::new();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let runner = Arc::clone(&fixture.runner);
+            let cancel = cancel.clone();
+            let request = task5_fixed_request(
+                FixedOperationKind::Mutation,
+                Duration::from_secs(5),
+                owner.registration(),
+                16,
+                16,
+            );
+            async move { runner.execute_fixed_once(request, cancel).await }
+        });
+        task5_wait_for_call(&cancel_log, "C").await;
+        cancel.cancel();
+        let error = task.await.unwrap().err().unwrap();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+        assert_eq!(task5_call_count(&cancel_log, "C"), 1);
+        drop(owner);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+
+        let overflow_log = logs.path().join("overflow.log");
+        let fixture = task5_fixed_fixture(&[
+            ("FAKE_SSH_LOG", overflow_log.display().to_string()),
+            ("FAKE_SSH_MODE", "bytes".to_owned()),
+            ("FAKE_SSH_STDOUT_BYTES", "64".to_owned()),
+        ]);
+        let owner = InternalSpoolOwner::new();
+        let error = fixture
+            .runner
+            .execute_fixed_once(
+                task5_fixed_request(
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                    owner.registration(),
+                    16,
+                    16,
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+        assert_eq!(task5_call_count(&overflow_log, "C"), 1);
+        drop(owner);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
+
+        // A closed registration forces internal capture setup to fail after
+        // local spawn but before the fixture reaches its remote-command log.
+        // The pending spool is armed and unlinked on drop, and the configured
+        // child remains kill-on-drop if any post-spawn pid/pipe invariant ever
+        // fails before the wait task takes ownership.
+        let setup_log = logs.path().join("capture-setup.log");
+        let fixture = task5_fixed_fixture(&[
+            ("FAKE_SSH_LOG", setup_log.display().to_string()),
+            ("FAKE_SSH_MODE", "streams".to_owned()),
+        ]);
+        let owner = InternalSpoolOwner::new();
+        let registration = owner.registration();
+        drop(owner);
+        let error = fixture
+            .runner
+            .execute_fixed_once(
+                task5_fixed_request(
+                    FixedOperationKind::Mutation,
+                    Duration::from_secs(1),
+                    registration,
+                    16,
+                    16,
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+        assert_eq!(error.details.mutation_may_have_applied, Some(true));
+        assert_eq!(task5_call_count(&setup_log, "C"), 0);
+        assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
     }
 }
