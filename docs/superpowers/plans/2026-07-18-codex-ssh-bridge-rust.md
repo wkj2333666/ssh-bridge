@@ -176,22 +176,17 @@ git commit -m "feat: add Rust bridge core primitives"
 - Produces: `SshPolicy::for_host(&Config, ResolvedHost<'_>, &RuntimePaths, resolved_connection_identity: &str) -> BridgeResult<SshPolicy>`. The later runner obtains `resolved_connection_identity` from system `ssh -G`; Task 2 uses a stable fixture string and does not reimplement OpenSSH config parsing.
 - Produces: `build_ssh_argv(&SshPolicy, host: &str, remote_command: &str) -> Vec<OsString>`.
 - Produces: `Capability { physical_root, shell: ShellKind, bash_version, tools }`.
-- Produces: `CapabilityCache::get_or_probe(host, probe_fn)` and `invalidate(host)`.
+- Produces: async `CapabilityCache::get_or_probe(host, probe_fn)` backed by a per-host Tokio `OnceCell`, so concurrent callers share one probe future, plus async `invalidate(host)`.
+- Produces: `parse_probe_output(output: &[u8], expected_requested_root: &RemotePath) -> BridgeResult<Capability>` for strict NUL-delimited `key=value` records.
 
 - [ ] **Step 1: Write failing argv and probe tests**
 
 Assert the generated SSH argv contains, as distinct values, `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, `PermitLocalCommand=no`, `RequestTTY=no`, `ControlMaster=auto`, `ControlPersist=300`, and a ControlPath below an owned mode-`0700` runtime directory. Assert no host text beginning with `-` can enter argv.
 
-Feed the probe parser fixed output for Bash and sh-only hosts:
+Feed the probe parser fixed NUL-delimited output for Bash and sh-only hosts (the notation below uses `\0` for each NUL byte):
 
 ```text
-CODEX_SSH_PROBE=1
-ROOT=/srv/project
-SHELL_KIND=bash
-BASH_VERSION=5.2.15
-TOOL_rg=1
-TOOL_dd_nofollow=1
-TOOL_timeout=1
+CODEX_SSH_PROBE=1\0REQUESTED_ROOT=/srv/project\0ROOT=/srv/project\0SHELL_KIND=bash\0BASH_VERSION=5.2.15\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=1\0
 ```
 
 Assert malformed, duplicated, unknown-version, and root-mismatch output fails closed. Assert a capability failure invalidates exactly one host cache entry.
@@ -206,7 +201,7 @@ Expected: compilation fails for missing `ssh` and `capability` modules.
 
 Create runtime paths below `XDG_RUNTIME_DIR/codex-ssh-bridge` or `/tmp/codex-ssh-bridge-<uid>`. Refuse symlinks, wrong ownership, or permissions other than `0700`. Hash the alias and resolved connection identity into a short ControlPath filename without exposing it to the Agent.
 
-Build a compile-time probe script that performs `cd -- "$1"`, emits `pwd -P`, checks `command -v` for required tools, tests `dd oflag=nofollow` in a private temporary directory, and removes that directory with a trap. Parse only the versioned keys the bridge defines; do not use `eval`.
+Build a compile-time probe script that performs `cd -- "$1"`, emits both the exact requested root and `pwd -P`, checks `command -v` for required tools, tests `dd oflag=nofollow` in a private temporary directory, and removes that directory with a trap. Emit strict NUL-delimited `key=value` records so roots containing newlines remain representable. Parse only the versioned keys the bridge defines; do not use `eval`. Require `REQUESTED_ROOT` to equal the expected normalized configured root; require physical `ROOT` to be normalized and absolute but allow it to differ when the configured root traverses symlinks.
 
 Represent shell selection exactly as:
 
