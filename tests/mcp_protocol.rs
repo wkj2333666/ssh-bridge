@@ -1101,6 +1101,124 @@ async fn task7_lifecycle_duplicate_and_notification_shapes_have_zero_service_eff
 }
 
 #[tokio::test]
+async fn task7_lifecycle_complete_validation_and_zero_service_effect_matrix() {
+    timeout(Duration::from_secs(5), async {
+        let tools = Arc::new(StubTools::new());
+        let server = McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 32).unwrap();
+        let frames = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"x","version":"1"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"x","version":"1"}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"1"},"_meta":false}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo","arguments":{"text":"before initialize"}}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"unknown/request","params":{}}),
+            json!({"jsonrpc":"2.0","method":"unknown/notification","params":{}}),
+            initialize(json!(7), "2025-11-25"),
+            json!({"jsonrpc":"2.0","id":8,"method":"ping","params":{}}),
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"echo","arguments":{"text":"before initialized"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":false}}),
+            json!({"jsonrpc":"2.0","id":10,"method":"tools/list","params":{}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            json!({"jsonrpc":"2.0","id":11,"method":"ping","params":{"_meta":false}}),
+            json!({"jsonrpc":"2.0","id":12,"method":"tools/list","params":{"_meta":false}}),
+            json!({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"echo","arguments":{"text":"bad meta"},"_meta":false}}),
+            json!({"jsonrpc":"2.0","id":14,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":15,"method":"tools/list","params":{"cursor":""}}),
+            json!({"jsonrpc":"2.0","id":16,"method":"tools/list","params":{"cursor":"next"}}),
+            json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"missing","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"echo","arguments":{"text":"extra"},"extension":true}}),
+            json!({"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"echo","arguments":{"text":"malformed envelope"}},"extra":true}),
+            json!({"jsonrpc":"2.0","id":20,"method":"unknown/request","params":{}}),
+            json!({"jsonrpc":"2.0","method":"unknown/notification","params":{}}),
+            json!({"jsonrpc":"2.0","id":21,"method":"ping","params":{}}),
+        ];
+        let (responses, result) = serve_frames(server, &frames).await;
+        assert!(result.is_ok(), "unexpected server result: {result:?}");
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response["id"].clone())
+                .collect::<Vec<_>>(),
+            (1..=21).map(|id| json!(id)).collect::<Vec<_>>()
+        );
+        for response in &responses[0..4] {
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        assert_eq!(responses[4]["error"]["code"], -32002);
+        assert_eq!(responses[5]["error"]["code"], -32601);
+        assert_eq!(responses[6]["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(responses[7]["result"], json!({}));
+        assert_eq!(responses[8]["error"]["code"], -32002);
+        assert_eq!(responses[9]["error"]["code"], -32002);
+        for response in &responses[10..13] {
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        for response in &responses[13..15] {
+            assert!(response["result"]["tools"].is_array());
+            assert!(response["result"].get("nextCursor").is_none());
+        }
+        for response in &responses[15..18] {
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        assert_eq!(responses[18]["error"]["code"], -32600);
+        assert_eq!(responses[19]["error"]["code"], -32601);
+        assert_eq!(responses[20]["result"], json!({}));
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(tools.bridge_ops.load(Ordering::SeqCst), 0);
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
+async fn task7_lifecycle_june_rejects_task_for_initialized_and_cancelled() {
+    timeout(Duration::from_secs(5), async {
+        let tools = Arc::new(StubTools::new());
+        let mut session = Session::start(
+            McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap(),
+        )
+        .await;
+        session.send(&initialize(json!(1), "2025-06-18")).await;
+        assert_eq!(session.recv().await["id"], 1);
+        session
+            .send(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{"task":{}}}))
+            .await;
+        session
+            .send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .await;
+        assert_eq!(session.recv().await["error"]["code"], -32002);
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(tools.bridge_ops.load(Ordering::SeqCst), 0);
+
+        session
+            .send(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+            .await;
+        session
+            .send(&json!({"jsonrpc":"2.0","id":"active","method":"tools/call","params":{"name":"block","arguments":{}}}))
+            .await;
+        tools.wait_for_polls(1).await;
+        let token = tools.contexts.lock().await[0].cancel.clone();
+        session
+            .send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"active","task":{}}}))
+            .await;
+        session
+            .send(&json!({"jsonrpc":"2.0","id":3,"method":"ping","params":{}}))
+            .await;
+        assert_eq!(session.recv().await["id"], 3);
+        assert!(!token.is_cancelled());
+        session
+            .send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"active"}}))
+            .await;
+        tools.wait_for_cancel().await;
+        assert!(session.close().await.is_ok());
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
 async fn task7_lifecycle_strict_json_errors_are_fixed_and_side_effect_free() {
     timeout(Duration::from_secs(5), async {
         let service = Arc::new(NullService { definitions: lifecycle_definitions() });
@@ -1896,6 +2014,500 @@ impl AsyncWrite for PanicWriter {
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosingActiveKind {
+    Cooperative,
+    TokenIgnoringYielding,
+    AlreadyReady,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosingSource {
+    PartialEof,
+    QueueBackpressure,
+    WriterWriteZero,
+    WriterPanic,
+    ShutdownFailure,
+    PendingAfterPrefix,
+}
+
+impl ClosingSource {
+    fn stalls_writer(self) -> bool {
+        matches!(self, Self::QueueBackpressure | Self::PendingAfterPrefix)
+    }
+}
+
+struct ClosingTaskState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    cancelled: AtomicBool,
+    completed: AtomicBool,
+    dropped: AtomicBool,
+    live: AtomicUsize,
+    token: StdMutex<Option<tokio_util::sync::CancellationToken>>,
+    gate: Semaphore,
+}
+
+impl ClosingTaskState {
+    fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+            cancelled: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
+            live: AtomicUsize::new(0),
+            token: StdMutex::new(None),
+            gate: Semaphore::new(0),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notified = self.entered_notify.notified();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            timeout(Duration::from_secs(1), notified)
+                .await
+                .expect("Closing matrix task must enter");
+        }
+    }
+}
+
+struct ClosingTaskGuard {
+    state: Arc<ClosingTaskState>,
+}
+
+impl Drop for ClosingTaskGuard {
+    fn drop(&mut self) {
+        self.state.live.fetch_sub(1, Ordering::SeqCst);
+        self.state.dropped.store(true, Ordering::Release);
+    }
+}
+
+struct ClosingTools {
+    definitions: Vec<ToolDefinition>,
+    active_kind: ClosingActiveKind,
+    state: Arc<ClosingTaskState>,
+}
+
+impl ToolService for ClosingTools {
+    fn definitions(&self) -> &[ToolDefinition] {
+        &self.definitions
+    }
+
+    fn call(&self, _name: String, _arguments: Value, context: ToolCallContext) -> ToolFuture {
+        let active_kind = self.active_kind;
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.live.fetch_add(1, Ordering::SeqCst);
+            let _guard = ClosingTaskGuard {
+                state: Arc::clone(&state),
+            };
+            *state.token.lock().unwrap() = Some(context.cancel.clone());
+            state.entered.store(true, Ordering::Release);
+            state.entered_notify.notify_waiters();
+            match active_kind {
+                ClosingActiveKind::Cooperative => {
+                    tokio::select! {
+                        () = context.cancel.cancelled() => {
+                            state.cancelled.store(true, Ordering::Release);
+                            CallToolResult::text("cooperatively cancelled")
+                        }
+                        permit = state.gate.acquire() => {
+                            permit.expect("Closing matrix gate stays open").forget();
+                            state.completed.store(true, Ordering::Release);
+                            CallToolResult::text("released")
+                        }
+                    }
+                }
+                ClosingActiveKind::TokenIgnoringYielding => loop {
+                    tokio::task::yield_now().await;
+                },
+                ClosingActiveKind::AlreadyReady => {
+                    state
+                        .gate
+                        .acquire()
+                        .await
+                        .expect("Closing matrix gate stays open")
+                        .forget();
+                    state.completed.store(true, Ordering::Release);
+                    CallToolResult::text("already ready")
+                }
+            }
+        })
+    }
+}
+
+struct ClosingWriterState {
+    bytes: StdMutex<Vec<u8>>,
+    wrote: Notify,
+    blocked: AtomicBool,
+    blocked_notify: Notify,
+}
+
+impl ClosingWriterState {
+    fn new() -> Self {
+        Self {
+            bytes: StdMutex::new(Vec::new()),
+            wrote: Notify::new(),
+            blocked: AtomicBool::new(false),
+            blocked_notify: Notify::new(),
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.bytes.lock().unwrap().clone()
+    }
+
+    async fn wait_for_lines(&self, lines: usize) {
+        loop {
+            let notified = self.wrote.notified();
+            if self
+                .bytes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                >= lines
+            {
+                return;
+            }
+            timeout(Duration::from_secs(1), notified)
+                .await
+                .expect("Closing matrix writer must store line");
+        }
+    }
+
+    async fn wait_until_blocked(&self) {
+        loop {
+            let notified = self.blocked_notify.notified();
+            if self.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            timeout(Duration::from_secs(1), notified)
+                .await
+                .expect("Closing matrix writer must reach its durable block");
+        }
+    }
+
+    fn mark_blocked(&self) {
+        self.blocked.store(true, Ordering::Release);
+        self.blocked_notify.notify_waiters();
+    }
+}
+
+struct ClosingWriter {
+    source: ClosingSource,
+    state: Arc<ClosingWriterState>,
+}
+
+impl AsyncWrite for ClosingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut bytes = self.state.bytes.lock().unwrap();
+        let first_line_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1);
+        if first_line_end.is_none() {
+            bytes.extend_from_slice(buffer);
+            drop(bytes);
+            self.state.wrote.notify_waiters();
+            return Poll::Ready(Ok(buffer.len()));
+        }
+        match self.source {
+            ClosingSource::PartialEof | ClosingSource::ShutdownFailure => {
+                bytes.extend_from_slice(buffer);
+                drop(bytes);
+                self.state.wrote.notify_waiters();
+                Poll::Ready(Ok(buffer.len()))
+            }
+            ClosingSource::QueueBackpressure => {
+                drop(bytes);
+                self.state.mark_blocked();
+                Poll::Pending
+            }
+            ClosingSource::WriterWriteZero => Poll::Ready(Ok(0)),
+            ClosingSource::WriterPanic => {
+                drop(bytes);
+                panic!("HOSTILE Closing matrix writer panic")
+            }
+            ClosingSource::PendingAfterPrefix => {
+                const PREFIX_BYTES: usize = 32;
+                let second_bytes = bytes.len() - first_line_end.unwrap();
+                if second_bytes >= PREFIX_BYTES {
+                    drop(bytes);
+                    self.state.mark_blocked();
+                    return Poll::Pending;
+                }
+                let count = buffer.len().min(PREFIX_BYTES - second_bytes);
+                bytes.extend_from_slice(&buffer[..count]);
+                drop(bytes);
+                self.state.wrote.notify_waiters();
+                Poll::Ready(Ok(count))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.source == ClosingSource::ShutdownFailure {
+            Poll::Ready(Err(io::Error::other("HOSTILE Closing shutdown")))
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+async fn send_closing_frame(input: &mut DuplexStream, frame: Value) -> io::Result<()> {
+    let mut wire = serde_json::to_vec(&frame).unwrap();
+    wire.push(b'\n');
+    timeout(Duration::from_secs(1), input.write_all(&wire))
+        .await
+        .expect("Closing matrix input write must terminate")
+}
+
+async fn run_closing_matrix_case(source: ClosingSource, active_kind: ClosingActiveKind) {
+    let task_state = Arc::new(ClosingTaskState::new());
+    let tools = Arc::new(ClosingTools {
+        definitions: vec![lifecycle_definitions().remove(0)],
+        active_kind,
+        state: Arc::clone(&task_state),
+    });
+    let writer_state = Arc::new(ClosingWriterState::new());
+    let writer = ClosingWriter {
+        source,
+        state: Arc::clone(&writer_state),
+    };
+    let input_capacity = if source == ClosingSource::QueueBackpressure {
+        1
+    } else {
+        128 * 1024
+    };
+    let (mut input, server_reader) = tokio::io::duplex(input_capacity);
+    let server = McpServer::new(tools, MIN_MCP_FRAME_BYTES, 1).unwrap();
+    let serve = tokio::spawn(server.serve(server_reader, writer));
+
+    send_closing_frame(&mut input, initialize(json!(1), "2025-11-25"))
+        .await
+        .unwrap();
+    writer_state.wait_for_lines(1).await;
+    send_closing_frame(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+    )
+    .await
+    .unwrap();
+    send_closing_frame(
+        &mut input,
+        json!({"jsonrpc":"2.0","id":"active","method":"tools/call","params":{"name":"block","arguments":{}}}),
+    )
+    .await
+    .unwrap();
+    task_state.wait_until_entered().await;
+
+    let started = Instant::now();
+    match source {
+        ClosingSource::PartialEof => {
+            input.write_all(b"{").await.unwrap();
+            if active_kind == ClosingActiveKind::AlreadyReady {
+                task_state.gate.add_permits(1);
+            }
+            input.shutdown().await.unwrap();
+        }
+        ClosingSource::QueueBackpressure => {
+            send_closing_frame(
+                &mut input,
+                json!({"jsonrpc":"2.0","id":100,"method":"ping","params":{}}),
+            )
+            .await
+            .unwrap();
+            writer_state.wait_until_blocked().await;
+            for id in 101..=109 {
+                send_closing_frame(
+                    &mut input,
+                    json!({"jsonrpc":"2.0","id":id,"method":"ping","params":{}}),
+                )
+                .await
+                .unwrap();
+            }
+            send_closing_frame(
+                &mut input,
+                json!({"jsonrpc":"2.0","method":"unknown/notification","params":{}}),
+            )
+            .await
+            .unwrap();
+            if active_kind == ClosingActiveKind::AlreadyReady {
+                task_state.gate.add_permits(1);
+            } else {
+                let _ = send_closing_frame(
+                    &mut input,
+                    json!({"jsonrpc":"2.0","id":110,"method":"ping","params":{}}),
+                )
+                .await;
+            }
+        }
+        ClosingSource::WriterWriteZero | ClosingSource::WriterPanic => {
+            if active_kind == ClosingActiveKind::AlreadyReady {
+                task_state.gate.add_permits(1);
+            }
+            let _ = send_closing_frame(
+                &mut input,
+                json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}}),
+            )
+            .await;
+        }
+        ClosingSource::ShutdownFailure => {
+            if active_kind == ClosingActiveKind::AlreadyReady {
+                task_state.gate.add_permits(1);
+            }
+            input.shutdown().await.unwrap();
+        }
+        ClosingSource::PendingAfterPrefix => {
+            if active_kind == ClosingActiveKind::AlreadyReady {
+                task_state.gate.add_permits(1);
+            } else {
+                send_closing_frame(
+                    &mut input,
+                    json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}}),
+                )
+                .await
+                .unwrap();
+            }
+            writer_state.wait_until_blocked().await;
+            input.shutdown().await.unwrap();
+        }
+    }
+
+    let result = timeout(Duration::from_secs(2), serve)
+        .await
+        .expect("Closing matrix server must terminate within its bounded graces")
+        .expect("Closing matrix server must not panic");
+    let elapsed = started.elapsed();
+    match source {
+        ClosingSource::PartialEof => {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.code,
+                ErrorCode::ProtocolError,
+                "{source:?}/{active_kind:?}"
+            );
+            assert_eq!(error.message, "partial MCP frame at EOF");
+        }
+        _ => assert_eq!(
+            result.unwrap_err(),
+            BridgeError::io("MCP transport failed"),
+            "{source:?}/{active_kind:?}"
+        ),
+    }
+    if source.stalls_writer() || active_kind == ClosingActiveKind::TokenIgnoringYielding {
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "bounded grace was not observable for {source:?}/{active_kind:?}: {elapsed:?}"
+        );
+    }
+    assert!(
+        elapsed < Duration::from_millis(1_200),
+        "Closing exceeded its bounded graces for {source:?}/{active_kind:?}: {elapsed:?}"
+    );
+
+    assert_eq!(task_state.live.load(Ordering::Acquire), 0);
+    assert!(task_state.dropped.load(Ordering::Acquire));
+    match active_kind {
+        ClosingActiveKind::Cooperative => {
+            assert!(task_state.cancelled.load(Ordering::Acquire));
+            assert!(
+                task_state
+                    .token
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            );
+        }
+        ClosingActiveKind::TokenIgnoringYielding => assert!(
+            task_state
+                .token
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        ),
+        ClosingActiveKind::AlreadyReady => {
+            assert!(task_state.completed.load(Ordering::Acquire));
+        }
+    }
+
+    let bytes = writer_state.bytes();
+    let active_id = b"\"id\":\"active\"";
+    let complete_line_count = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let complete_lines: Vec<&[u8]> = bytes
+        .split(|byte| *byte == b'\n')
+        .take(complete_line_count)
+        .collect();
+    assert!(
+        complete_lines.iter().all(|line| !line
+            .windows(active_id.len())
+            .any(|window| window == active_id)),
+        "Closing emitted a complete call response for {source:?}/{active_kind:?}"
+    );
+    if source == ClosingSource::PendingAfterPrefix && active_kind == ClosingActiveKind::AlreadyReady
+    {
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(
+            bytes
+                .windows(active_id.len())
+                .any(|window| window == active_id),
+            "the call prefix past the suppression commit is non-retractable"
+        );
+    } else {
+        assert!(
+            !bytes
+                .windows(active_id.len())
+                .any(|window| window == active_id),
+            "uncommitted call output must be globally suppressed for {source:?}/{active_kind:?}"
+        );
+    }
+    if source == ClosingSource::PartialEof {
+        assert!(complete_lines.iter().any(|line| {
+            serde_json::from_slice::<Value>(line).is_ok_and(|value| value == parse_error_response())
+        }));
+    }
+}
+
+#[tokio::test]
+async fn task7_closing_source_by_active_call_matrix_is_complete_and_bounded() {
+    timeout(Duration::from_secs(15), async {
+        for source in [
+            ClosingSource::PartialEof,
+            ClosingSource::QueueBackpressure,
+            ClosingSource::WriterWriteZero,
+            ClosingSource::WriterPanic,
+            ClosingSource::ShutdownFailure,
+            ClosingSource::PendingAfterPrefix,
+        ] {
+            for active_kind in [
+                ClosingActiveKind::Cooperative,
+                ClosingActiveKind::TokenIgnoringYielding,
+                ClosingActiveKind::AlreadyReady,
+            ] {
+                run_closing_matrix_case(source, active_kind).await;
+            }
+        }
+    })
+    .await
+    .expect("complete Closing matrix must remain bounded");
 }
 
 #[tokio::test]

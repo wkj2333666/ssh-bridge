@@ -1036,6 +1036,35 @@ mod lifecycle_tests {
         writer.abort();
     }
 
+    #[tokio::test]
+    async fn task7_nominal_writer_early_return_is_an_owner_transport_failure_event() {
+        let (_input, reader) = tokio::io::duplex(64);
+        let mut frames = FrameReader::new(BufReader::new(reader), 64);
+        let mut joins = JoinSet::<CompletedCall>::new();
+        let mut writer = tokio::spawn(async { Ok(()) });
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_owner_event(&mut writer, &mut frames, &mut joins),
+        )
+        .await
+        .expect("nominal writer return must wake the owner");
+        match event {
+            OwnerEvent::Writer(result) => assert!(matches!(*result, Ok(Ok(())))),
+            _ => panic!("writer completion must win while input remains active"),
+        }
+
+        let owner = include_str!("mod.rs")
+            .split("OwnerEvent::Writer(_result) => {")
+            .nth(1)
+            .expect("owner has an explicit writer-result arm")
+            .split("OwnerEvent::Input(Err(_))")
+            .next()
+            .unwrap();
+        assert!(owner.contains("writer_observed = true;"));
+        assert!(owner.contains("transport_failed = true;"));
+        assert!(owner.contains("break;"));
+    }
+
     #[test]
     fn task7_prepared_call_line_is_intrinsically_exact_and_bounded() {
         let id = RequestId::try_from(json!("bounded")).unwrap();
