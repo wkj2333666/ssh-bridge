@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedRunRequest, render_fixed_command};
+use crate::ssh::{FixedOperationKind, FixedRunRequest, render_fixed_command};
 
 use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
 use super::{RemoteBridge, ResolvedSearch, SearchEngine, SearchMatch, SearchResult, compile_glob};
@@ -249,6 +249,7 @@ pub(super) async fn search(
     let candidates_result = bridge
         .execute_readonly_fixed(
             FixedRunRequest {
+                kind: FixedOperationKind::ReadOnly,
                 host: request.host.clone(),
                 script: CANDIDATE_SCRIPT,
                 args: vec![
@@ -392,6 +393,7 @@ pub(super) async fn search(
     let result = bridge
         .execute_readonly_fixed(
             FixedRunRequest {
+                kind: FixedOperationKind::ReadOnly,
                 host: request.host.clone(),
                 script,
                 args,

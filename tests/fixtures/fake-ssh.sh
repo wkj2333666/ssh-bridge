@@ -155,6 +155,8 @@ case "$remote_command" in
         printf 'TOOL_grep_nul=%s\0' "${FAKE_SSH_HAS_GREP_NUL:-1}"
         printf 'TOOL_xargs_nul=%s\0' "${FAKE_SSH_HAS_XARGS_NUL:-1}"
         printf 'TOOL_search_bound=%s\0' "${FAKE_SSH_HAS_SEARCH_BOUND:-1}"
+        printf 'TOOL_safe_write=%s\0' "${FAKE_SSH_HAS_SAFE_WRITE:-1}"
+        printf 'TOOL_guarded_delete=%s\0' "${FAKE_SSH_HAS_GUARDED_DELETE:-1}"
         exit 0
         ;;
 esac
@@ -176,6 +178,39 @@ fi
 
 case "${FAKE_SSH_MODE:-echo-argv}" in
     local-fixed)
+        case "${FAKE_SSH_LOCAL_FIXED_POST:-}" in
+            disconnect)
+                if /bin/sh -c "$remote_command" >/dev/null; then
+                    exit 255
+                else
+                    exit $?
+                fi
+                ;;
+            malformed)
+                if /bin/sh -c "$remote_command" >/dev/null; then
+                    printf GARBAGE
+                    exit 0
+                else
+                    exit $?
+                fi
+                ;;
+            trailing)
+                if /bin/sh -c "$remote_command"; then
+                    printf GARBAGE
+                    exit 0
+                else
+                    exit $?
+                fi
+                ;;
+            stderr)
+                if /bin/sh -c "$remote_command"; then
+                    printf POST_COMMIT_DIAGNOSTIC >&2
+                    exit 0
+                else
+                    exit $?
+                fi
+                ;;
+        esac
         exec /bin/sh -c "$remote_command"
         ;;
     echo-argv)

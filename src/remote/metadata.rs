@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::FixedRunRequest;
+use crate::ssh::{FixedOperationKind, FixedRunRequest};
 
 use super::protocol::{
     SpoolCursor, context, encode_bytes, entry_error, kind, parse_mode, parse_mtime, parse_u64,
@@ -163,6 +163,7 @@ pub(super) async fn list(
     let result = bridge
         .execute_readonly_fixed(
             FixedRunRequest {
+                kind: FixedOperationKind::ReadOnly,
                 host: request.host.clone(),
                 script: LIST_SCRIPT,
                 args: vec![
@@ -293,6 +294,7 @@ pub(super) async fn stat(
     let result = bridge
         .execute_readonly_fixed(
             FixedRunRequest {
+                kind: FixedOperationKind::ReadOnly,
                 host: request.host.clone(),
                 script: STAT_SCRIPT,
                 args: Vec::new(),

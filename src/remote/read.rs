@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::BridgeResult;
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::FixedRunRequest;
+use crate::ssh::{FixedOperationKind, FixedRunRequest};
 
 use super::protocol::{
     context, encode_bytes, entry_error, nul_fields, parse_u64, protocol_error, read_small_stream,
@@ -101,6 +101,7 @@ pub(super) async fn read(
         let result = bridge
             .execute_readonly_fixed(
                 FixedRunRequest {
+                    kind: FixedOperationKind::ReadOnly,
                     host: request.host.clone(),
                     script: READ_SCRIPT,
                     args: vec![

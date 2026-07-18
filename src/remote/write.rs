@@ -1,0 +1,2182 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{BridgeError, BridgeResult, ErrorCode};
+use crate::output::{InternalSpoolOwner, StreamKind};
+use crate::path::RemotePath;
+use crate::ssh::{FixedOperationKind, FixedRunRequest, FixedRunResult, render_fixed_command};
+
+use super::protocol::{context, encode_bytes, read_small_stream};
+use super::{
+    GuardedDeleteRequest, GuardedDeleteResult, MAX_INPUT_PATH_BYTES, RemoteBridge, WriteEncoding,
+    WriteMode, WriteOperation, WriteRequest, WriteResult,
+};
+
+const WRITE_PROTOCOL_LIMIT: u64 = 512;
+
+pub(super) const WRITE_SCRIPT: &str = r#"
+set -u
+
+parent=$1
+basename=$2
+operation=$3
+expected_size=$4
+expected_content_hash=$5
+expected_hash_present=$6
+expected_target_hash=$7
+
+newline='
+'
+
+codex_mutation_stat() {
+    stat --printf='%f:%u:%a:%s:%d:%i:%h\n' -- "$1" 2>/dev/null
+}
+
+codex_mutation_parent_stat_follow() {
+    stat -L --printf='%f:%u:%a:%s:%d:%i:%h\n' -- "$1" 2>/dev/null
+}
+
+codex_mutation_mktemp() {
+    mktemp --tmpdir="$1" .codex-ssh-bridge.XXXXXXXXXX
+}
+
+codex_mutation_stage() (
+    on_codex_mutation_stage_signal() {
+        trap - HUP INT TERM
+        exit 125
+    }
+    trap on_codex_mutation_stage_signal HUP INT TERM
+    dd of="$1" bs=262144 status=none conv=notrunc oflag=nofollow
+)
+
+codex_mutation_link() {
+    ln -- "$1" "$2"
+}
+
+codex_mutation_replace() {
+    mv -T -- "$1" "$2"
+}
+
+codex_mutation_mode() {
+    chmod -h "$1" -- "$2"
+}
+
+codex_mutation_remove() {
+    rm -f -- "$1"
+}
+
+codex_mutation_stat_parse() {
+    codex_stat_line=$1
+    case "$codex_stat_line" in ''|*[!0-9a-f:]*) return 1 ;; esac
+    codex_stat_old_ifs=$IFS
+    IFS=:
+    set -- $codex_stat_line
+    IFS=$codex_stat_old_ifs
+    [ "$#" -eq 7 ] || return 1
+    case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+    case "$2:$4:$5:$6:$7" in *[!0-9:]*) return 1 ;; esac
+    case "$3" in ''|*[!0-7]*) return 1 ;; esac
+    CODEX_STAT_TYPE=$1
+    CODEX_STAT_UID=$2
+    CODEX_STAT_MODE=$3
+    CODEX_STAT_SIZE=$4
+    CODEX_STAT_DEVICE=$5
+    CODEX_STAT_INODE=$6
+    CODEX_STAT_LINKS=$7
+}
+
+codex_mutation_stat_valid() {
+    codex_stat_line=$(codex_mutation_stat "$1") || return 9
+    codex_mutation_stat_parse "$codex_stat_line"
+}
+
+codex_mutation_parent_stat_follow_valid() {
+    codex_stat_line=$(codex_mutation_parent_stat_follow "$1") || return 9
+    codex_mutation_stat_parse "$codex_stat_line"
+}
+
+codex_mutation_hash() (
+    codex_hash_capture=$(
+        {
+            {
+                dd if="$1" bs=262144 status=none iflag=nofollow 2>/dev/null
+                printf 'CODEX_DD_STATUS=%s\n' "$?" >&2
+            } | sha256sum 2>/dev/null
+            printf 'CODEX_SHA_STATUS=%s\n' "$?" >&2
+        } 2>&1
+    )
+    codex_hash_dd=
+    codex_hash_sha=
+    codex_hash_digest=
+    codex_hash_dd_seen=0
+    codex_hash_sha_seen=0
+    codex_hash_digest_seen=0
+    codex_hash_valid=1
+    set -f
+    IFS="$newline"
+    for codex_hash_line in $codex_hash_capture; do
+        case "$codex_hash_line" in
+            CODEX_DD_STATUS=*)
+                if [ "$codex_hash_dd_seen" -ne 0 ]; then
+                    codex_hash_valid=0
+                    break
+                fi
+                codex_hash_dd_seen=1
+                codex_hash_dd=${codex_hash_line#CODEX_DD_STATUS=}
+                ;;
+            CODEX_SHA_STATUS=*)
+                if [ "$codex_hash_sha_seen" -ne 0 ]; then
+                    codex_hash_valid=0
+                    break
+                fi
+                codex_hash_sha_seen=1
+                codex_hash_sha=${codex_hash_line#CODEX_SHA_STATUS=}
+                ;;
+            *'  -')
+                if [ "$codex_hash_digest_seen" -ne 0 ]; then
+                    codex_hash_valid=0
+                    break
+                fi
+                codex_hash_digest_seen=1
+                codex_hash_digest=${codex_hash_line%  -}
+                ;;
+            *)
+                codex_hash_valid=0
+                break
+                ;;
+        esac
+    done
+    if [ "$codex_hash_dd_seen" -ne 1 ] || [ "$codex_hash_sha_seen" -ne 1 ]; then
+        codex_hash_valid=0
+    fi
+    if [ "$codex_hash_valid" -ne 1 ]; then
+        codex_hash_status=1
+    elif [ "$codex_hash_dd" != 0 ] || [ "$codex_hash_sha" != 0 ]; then
+        codex_hash_status=9
+    elif [ "$codex_hash_digest_seen" -ne 1 ] || [ "${#codex_hash_digest}" -ne 64 ]; then
+        codex_hash_status=1
+    else
+        case "$codex_hash_digest" in *[!0-9a-f]*) codex_hash_valid=0 ;; esac
+        if [ "$codex_hash_valid" -eq 1 ]; then
+            printf '%s\n' "$codex_hash_digest"
+            codex_hash_status=0
+        else
+            codex_hash_status=1
+        fi
+    fi
+    exit "$codex_hash_status"
+)
+
+codex_safe_write_sentinel() (
+    umask 077
+    codex_sentinel_dir=$(mktemp -d "${TMPDIR:-/tmp}/codex-sentinel-safe-write.XXXXXX" 2>/dev/null) || exit 9
+    cleanup_codex_sentinel() {
+        rm -rf -- "$codex_sentinel_dir" >/dev/null 2>&1 || return 1
+        [ ! -e "$codex_sentinel_dir" ] && [ ! -L "$codex_sentinel_dir" ]
+    }
+    on_codex_sentinel_signal() {
+        trap - 0 HUP INT TERM
+        cleanup_codex_sentinel >/dev/null 2>&1 || :
+        exit 9
+    }
+    trap 'cleanup_codex_sentinel >/dev/null 2>&1 || :' 0
+    trap on_codex_sentinel_signal HUP INT TERM
+
+    codex_sentinel_work=$codex_sentinel_dir/work
+    codex_sentinel_parent=$codex_sentinel_work/parent
+    codex_sentinel_parent_link=$codex_sentinel_work/parent-link
+    mkdir -m 700 -- "$codex_sentinel_work" "$codex_sentinel_parent" || exit 9
+    ln -s "$codex_sentinel_parent" "$codex_sentinel_parent_link" || exit 9
+    codex_mutation_parent_stat_follow_valid "$codex_sentinel_parent" || exit $?
+    codex_sentinel_parent_identity=$CODEX_STAT_DEVICE:$CODEX_STAT_INODE
+    codex_sentinel_parent_device=$CODEX_STAT_DEVICE
+    codex_mutation_parent_stat_follow_valid "$codex_sentinel_parent_link" || exit $?
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$codex_sentinel_parent_identity" ] || exit 1
+    case "$CODEX_STAT_TYPE" in 4???) ;; *) exit 1 ;; esac
+
+    codex_sentinel_tmp=$(codex_mutation_mktemp "$codex_sentinel_work") || exit 9
+    printf payload | codex_mutation_stage "$codex_sentinel_tmp" || exit 9
+    codex_mutation_stat_valid "$codex_sentinel_tmp" || exit $?
+    codex_sentinel_uid=$(id -u) || exit 9
+    codex_sentinel_stage_identity=$CODEX_STAT_DEVICE:$CODEX_STAT_INODE
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 1 ;; esac
+    [ "$CODEX_STAT_UID" = "$codex_sentinel_uid" ] || exit 1
+    [ "$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = 600:7:1 ] || exit 1
+    [ "$CODEX_STAT_DEVICE" = "$codex_sentinel_parent_device" ] || exit 1
+    codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_tmp") || exit $?
+    [ "$codex_sentinel_hash" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
+
+    codex_sentinel_created=$codex_sentinel_work/created
+    codex_mutation_link "$codex_sentinel_tmp" "$codex_sentinel_created" || exit 9
+    if codex_mutation_link "$codex_sentinel_tmp" "$codex_sentinel_created" 2>/dev/null; then exit 1; fi
+    codex_mutation_stat_valid "$codex_sentinel_created" || exit $?
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$codex_sentinel_stage_identity" ] || exit 1
+    codex_mutation_remove "$codex_sentinel_created" || exit 9
+    [ ! -e "$codex_sentinel_created" ] && [ ! -L "$codex_sentinel_created" ] || exit 1
+
+    codex_sentinel_replaced=$codex_sentinel_work/replaced
+    printf old >"$codex_sentinel_replaced" || exit 9
+    codex_mutation_replace "$codex_sentinel_tmp" "$codex_sentinel_replaced" || exit 9
+    [ ! -e "$codex_sentinel_tmp" ] && [ ! -L "$codex_sentinel_tmp" ] || exit 1
+    codex_mutation_mode 0640 "$codex_sentinel_replaced" || exit 9
+    codex_mutation_stat_valid "$codex_sentinel_replaced" || exit $?
+    [ "$CODEX_STAT_MODE" = 640 ] || exit 1
+    codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_replaced") || exit $?
+    [ "$codex_sentinel_hash" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
+
+    codex_sentinel_outside=$codex_sentinel_work/outside
+    codex_sentinel_link=$codex_sentinel_work/link
+    printf OUTSIDE >"$codex_sentinel_outside" || exit 9
+    chmod 0600 -- "$codex_sentinel_outside" || exit 9
+    ln -s "$codex_sentinel_outside" "$codex_sentinel_link" || exit 9
+    if printf CHANGED | codex_mutation_stage "$codex_sentinel_link" 2>/dev/null; then exit 1; fi
+    codex_sentinel_hash_status=0
+    codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_link") || codex_sentinel_hash_status=$?
+    [ "$codex_sentinel_hash_status" -eq 9 ] || exit 1
+    codex_mutation_mode 0640 "$codex_sentinel_link" || exit 9
+    codex_sentinel_outside_mode=$(stat --printf='%a' -- "$codex_sentinel_outside") || exit 9
+    codex_sentinel_outside_content=$(cat "$codex_sentinel_outside") || exit 9
+    [ "$codex_sentinel_outside_mode" = 600 ] || exit 1
+    [ "$codex_sentinel_outside_content" = OUTSIDE ] || exit 1
+
+    cleanup_codex_sentinel || exit 9
+    trap - 0 HUP INT TERM
+    exit 0
+)
+
+codex_sentinel_status=0
+codex_safe_write_sentinel || codex_sentinel_status=$?
+case "$codex_sentinel_status" in
+    0) ;;
+    1)
+        printf 'STATUS=CAPABILITY_MISMATCH\000CAPABILITY=safe_write\000'
+        exit 0
+        ;;
+    *) exit 9 ;;
+esac
+
+case "$operation:$expected_hash_present" in
+    CREATE:0) ;;
+    REPLACE:0|REPLACE:1) ;;
+    *) exit 2 ;;
+esac
+case "$expected_size" in ''|*[!0-9]*) exit 2 ;; esac
+case "$expected_content_hash" in *[!0-9a-f]*) exit 2 ;; esac
+[ "${#expected_content_hash}" -eq 64 ] || exit 2
+if [ "$expected_hash_present" = 1 ]; then
+    case "$expected_target_hash" in *[!0-9a-f]*) exit 2 ;; esac
+    [ "${#expected_target_hash}" -eq 64 ] || exit 2
+else
+    [ -z "$expected_target_hash" ] || exit 2
+fi
+
+tmp=
+cleanup_tmp() {
+    [ -z "$tmp" ] && return 0
+    codex_mutation_remove "$tmp" >/dev/null 2>&1 || return 1
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+    tmp=
+}
+on_write_signal() {
+    trap - 0 HUP INT TERM
+    cleanup_tmp >/dev/null 2>&1 || :
+    exit 125
+}
+trap 'cleanup_tmp >/dev/null 2>&1 || :' 0
+trap on_write_signal HUP INT TERM
+
+emit_one() {
+    cleanup_tmp || exit 90
+    trap - 0 HUP INT TERM
+    printf 'STATUS=%s\000' "$1"
+    exit 0
+}
+
+codex_parent_line=$(codex_mutation_parent_stat_follow "$parent") || {
+    if codex_mutation_stat_valid "$parent"; then
+        case "$CODEX_STAT_TYPE" in
+            4???) exit 3 ;;
+            a???) emit_one NOT_FOUND ;;
+            *) emit_one NOT_DIRECTORY ;;
+        esac
+    fi
+    if [ ! -e "$parent" ] && [ ! -L "$parent" ]; then emit_one NOT_FOUND; fi
+    exit 3
+}
+codex_mutation_stat_parse "$codex_parent_line" || exit 3
+case "$CODEX_STAT_TYPE" in 4???) ;; *) emit_one NOT_DIRECTORY ;; esac
+parent_device=$CODEX_STAT_DEVICE
+parent_inode=$CODEX_STAT_INODE
+
+if ! cd "$parent" 2>/dev/null; then
+    if codex_mutation_parent_stat_follow_valid "$parent" &&
+       [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$parent_device:$parent_inode" ]; then
+        case "$CODEX_STAT_TYPE" in 4???) emit_one PERMISSION_DENIED ;; esac
+    fi
+    exit 3
+fi
+codex_mutation_parent_stat_follow_valid . || exit 3
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$parent_device:$parent_inode" ] || exit 3
+
+target=./$basename
+target_initial_status=0
+codex_mutation_stat_valid "$target" || target_initial_status=$?
+if [ "$target_initial_status" -eq 0 ]; then
+    if [ "$operation" = CREATE ]; then
+        emit_one WRITE_CONFLICT
+    fi
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+    target_device=$CODEX_STAT_DEVICE
+    target_inode=$CODEX_STAT_INODE
+    target_mode=$CODEX_STAT_MODE
+    target_mode_decimal=$((0$target_mode))
+    [ $((target_mode_decimal & 07000)) -eq 0 ] || emit_one WRITE_CONFLICT
+else
+    if [ "$operation" = CREATE ]; then
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            emit_one WRITE_CONFLICT
+        fi
+    else
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+            emit_one NOT_FOUND
+        fi
+        exit 3
+    fi
+fi
+
+umask 077
+tmp=$(codex_mutation_mktemp .) || exit 4
+codex_mutation_stage "$tmp" || exit 4
+codex_mutation_stat_valid "$tmp" || exit 4
+stage_device=$CODEX_STAT_DEVICE
+stage_inode=$CODEX_STAT_INODE
+stage_uid=$(id -u) || exit 4
+case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 4 ;; esac
+[ "$CODEX_STAT_UID" = "$stage_uid" ] || exit 4
+[ "$CODEX_STAT_MODE" = 600 ] || exit 4
+[ "$CODEX_STAT_SIZE" = "$expected_size" ] || exit 4
+[ "$CODEX_STAT_DEVICE" = "$parent_device" ] || exit 4
+[ "$CODEX_STAT_LINKS" = 1 ] || exit 4
+stage_hash=$(codex_mutation_hash "$tmp") || exit 4
+[ "$stage_hash" = "$expected_content_hash" ] || exit 4
+
+if [ "$operation" = CREATE ]; then
+    if ! codex_mutation_link "$tmp" "$target" 2>/dev/null; then
+        if codex_mutation_stat_valid "$target" || [ -e "$target" ] || [ -L "$target" ]; then
+            emit_one WRITE_CONFLICT
+        fi
+        exit 5
+    fi
+
+    codex_mutation_stat_valid "$target" || exit 5
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
+    [ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:600:$expected_size:2" ] || exit 5
+    target_hash=$(codex_mutation_hash "$target") || exit 5
+    [ "$target_hash" = "$expected_content_hash" ] || exit 5
+
+    codex_mutation_remove "$tmp" || exit 5
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
+    tmp=
+
+    codex_mutation_stat_valid "$target" || exit 5
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
+    [ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:600:$expected_size:1" ] || exit 5
+    target_hash=$(codex_mutation_hash "$target") || exit 5
+    [ "$target_hash" = "$expected_content_hash" ] || exit 5
+
+    mode_decimal=$((0$CODEX_STAT_MODE))
+    trap - 0 HUP INT TERM
+    printf 'STATUS=SUCCESS\000OPERATION=CREATE\000SIZE=%s\000SHA256=%s\000MODE=%s\000TEMPORARY_CLEANUP_CONFIRMED=1\000' "$expected_size" "$expected_content_hash" "$mode_decimal"
+    exit 0
+fi
+
+target_final_status=0
+codex_mutation_stat_valid "$target" || target_final_status=$?
+if [ "$target_final_status" -ne 0 ]; then
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        emit_one WRITE_CONFLICT
+    fi
+    exit 5
+fi
+case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE:$CODEX_STAT_MODE" = "$target_device:$target_inode:$target_mode" ] || emit_one WRITE_CONFLICT
+target_final_mode_decimal=$((0$CODEX_STAT_MODE))
+[ $((target_final_mode_decimal & 07000)) -eq 0 ] || emit_one WRITE_CONFLICT
+
+if [ "$expected_hash_present" = 1 ]; then
+    target_hash_status=0
+    target_hash=$(codex_mutation_hash "$target") || target_hash_status=$?
+    if [ "$target_hash_status" -ne 0 ]; then
+        if codex_mutation_stat_valid "$target"; then
+            case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+            [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE:$CODEX_STAT_MODE" = "$target_device:$target_inode:$target_mode" ] || emit_one WRITE_CONFLICT
+        else
+            exit 5
+        fi
+        exit 5
+    fi
+    codex_mutation_stat_valid "$target" || exit 5
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE:$CODEX_STAT_MODE" = "$target_device:$target_inode:$target_mode" ] || emit_one WRITE_CONFLICT
+    [ "$target_hash" = "$expected_target_hash" ] || emit_one WRITE_CONFLICT
+fi
+
+codex_mutation_replace "$tmp" "$target" || exit 5
+[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
+tmp=
+
+codex_mutation_stat_valid "$target" || exit 5
+case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
+[ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:600:$expected_size:1" ] || exit 5
+target_hash=$(codex_mutation_hash "$target") || exit 5
+[ "$target_hash" = "$expected_content_hash" ] || exit 5
+
+codex_mutation_mode "$target_mode" "$target" || exit 5
+codex_mutation_stat_valid "$target" || exit 5
+case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
+[ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:$target_mode:$expected_size:1" ] || exit 5
+[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
+
+mode_decimal=$((0$CODEX_STAT_MODE))
+trap - 0 HUP INT TERM
+printf 'STATUS=SUCCESS\000OPERATION=REPLACE\000SIZE=%s\000SHA256=%s\000MODE=%s\000TEMPORARY_CLEANUP_CONFIRMED=1\000' "$expected_size" "$expected_content_hash" "$mode_decimal"
+exit 0
+"#;
+
+pub(super) const GUARDED_DELETE_SCRIPT: &str = r#"
+set -u
+
+parent=$1
+basename=$2
+expected_hash=$3
+
+newline='
+'
+
+codex_mutation_stat() {
+    stat --printf='%f:%u:%a:%s:%d:%i:%h\n' -- "$1" 2>/dev/null
+}
+
+codex_mutation_parent_stat_follow() {
+    stat -L --printf='%f:%u:%a:%s:%d:%i:%h\n' -- "$1" 2>/dev/null
+}
+
+codex_mutation_remove() {
+    rm -f -- "$1"
+}
+
+codex_mutation_stat_parse() {
+    codex_stat_line=$1
+    case "$codex_stat_line" in ''|*[!0-9a-f:]*) return 1 ;; esac
+    codex_stat_old_ifs=$IFS
+    IFS=:
+    set -- $codex_stat_line
+    IFS=$codex_stat_old_ifs
+    [ "$#" -eq 7 ] || return 1
+    case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+    case "$2:$4:$5:$6:$7" in *[!0-9:]*) return 1 ;; esac
+    case "$3" in ''|*[!0-7]*) return 1 ;; esac
+    CODEX_STAT_TYPE=$1
+    CODEX_STAT_UID=$2
+    CODEX_STAT_MODE=$3
+    CODEX_STAT_SIZE=$4
+    CODEX_STAT_DEVICE=$5
+    CODEX_STAT_INODE=$6
+    CODEX_STAT_LINKS=$7
+}
+
+codex_mutation_stat_valid() {
+    codex_stat_line=$(codex_mutation_stat "$1") || return 9
+    codex_mutation_stat_parse "$codex_stat_line"
+}
+
+codex_mutation_parent_stat_follow_valid() {
+    codex_stat_line=$(codex_mutation_parent_stat_follow "$1") || return 9
+    codex_mutation_stat_parse "$codex_stat_line"
+}
+
+codex_mutation_hash() (
+    codex_hash_capture=$(
+        {
+            {
+                dd if="$1" bs=262144 status=none iflag=nofollow 2>/dev/null
+                printf 'CODEX_DD_STATUS=%s\n' "$?" >&2
+            } | sha256sum 2>/dev/null
+            printf 'CODEX_SHA_STATUS=%s\n' "$?" >&2
+        } 2>&1
+    )
+    codex_hash_dd=
+    codex_hash_sha=
+    codex_hash_digest=
+    codex_hash_dd_seen=0
+    codex_hash_sha_seen=0
+    codex_hash_digest_seen=0
+    codex_hash_valid=1
+    set -f
+    IFS="$newline"
+    for codex_hash_line in $codex_hash_capture; do
+        case "$codex_hash_line" in
+            CODEX_DD_STATUS=*)
+                if [ "$codex_hash_dd_seen" -ne 0 ]; then
+                    codex_hash_valid=0
+                    break
+                fi
+                codex_hash_dd_seen=1
+                codex_hash_dd=${codex_hash_line#CODEX_DD_STATUS=}
+                ;;
+            CODEX_SHA_STATUS=*)
+                if [ "$codex_hash_sha_seen" -ne 0 ]; then
+                    codex_hash_valid=0
+                    break
+                fi
+                codex_hash_sha_seen=1
+                codex_hash_sha=${codex_hash_line#CODEX_SHA_STATUS=}
+                ;;
+            *'  -')
+                if [ "$codex_hash_digest_seen" -ne 0 ]; then
+                    codex_hash_valid=0
+                    break
+                fi
+                codex_hash_digest_seen=1
+                codex_hash_digest=${codex_hash_line%  -}
+                ;;
+            *)
+                codex_hash_valid=0
+                break
+                ;;
+        esac
+    done
+    if [ "$codex_hash_dd_seen" -ne 1 ] || [ "$codex_hash_sha_seen" -ne 1 ]; then
+        codex_hash_valid=0
+    fi
+    if [ "$codex_hash_valid" -ne 1 ]; then
+        codex_hash_status=1
+    elif [ "$codex_hash_dd" != 0 ] || [ "$codex_hash_sha" != 0 ]; then
+        codex_hash_status=9
+    elif [ "$codex_hash_digest_seen" -ne 1 ] || [ "${#codex_hash_digest}" -ne 64 ]; then
+        codex_hash_status=1
+    else
+        case "$codex_hash_digest" in *[!0-9a-f]*) codex_hash_valid=0 ;; esac
+        if [ "$codex_hash_valid" -eq 1 ]; then
+            printf '%s\n' "$codex_hash_digest"
+            codex_hash_status=0
+        else
+            codex_hash_status=1
+        fi
+    fi
+    exit "$codex_hash_status"
+)
+
+codex_guarded_delete_sentinel() (
+    umask 077
+    codex_sentinel_dir=$(mktemp -d "${TMPDIR:-/tmp}/codex-sentinel-guarded-delete.XXXXXX" 2>/dev/null) || exit 9
+    cleanup_codex_sentinel() {
+        rm -rf -- "$codex_sentinel_dir" >/dev/null 2>&1 || return 1
+        [ ! -e "$codex_sentinel_dir" ] && [ ! -L "$codex_sentinel_dir" ]
+    }
+    on_codex_sentinel_signal() {
+        trap - 0 HUP INT TERM
+        cleanup_codex_sentinel >/dev/null 2>&1 || :
+        exit 9
+    }
+    trap 'cleanup_codex_sentinel >/dev/null 2>&1 || :' 0
+    trap on_codex_sentinel_signal HUP INT TERM
+
+    codex_sentinel_parent=$codex_sentinel_dir/parent
+    codex_sentinel_parent_link=$codex_sentinel_dir/parent-link
+    mkdir -m 700 -- "$codex_sentinel_parent" || exit 9
+    ln -s "$codex_sentinel_parent" "$codex_sentinel_parent_link" || exit 9
+    codex_mutation_parent_stat_follow_valid "$codex_sentinel_parent" || exit $?
+    codex_sentinel_parent_identity=$CODEX_STAT_DEVICE:$CODEX_STAT_INODE
+    codex_mutation_parent_stat_follow_valid "$codex_sentinel_parent_link" || exit $?
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$codex_sentinel_parent_identity" ] || exit 1
+    case "$CODEX_STAT_TYPE" in 4???) ;; *) exit 1 ;; esac
+
+    codex_sentinel_victim=$codex_sentinel_parent/victim
+    printf payload >"$codex_sentinel_victim" || exit 9
+    codex_mutation_stat_valid "$codex_sentinel_victim" || exit $?
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 1 ;; esac
+    [ "$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = 600:7:1 ] || exit 1
+    codex_sentinel_identity=$CODEX_STAT_DEVICE:$CODEX_STAT_INODE
+    codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_victim") || exit $?
+    [ "$codex_sentinel_hash" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
+    codex_mutation_stat_valid "$codex_sentinel_victim" || exit $?
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 1 ;; esac
+    [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$codex_sentinel_identity" ] || exit 1
+    codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_victim") || exit $?
+    [ "$codex_sentinel_hash" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
+    codex_mutation_remove "$codex_sentinel_victim" || exit 9
+    [ ! -e "$codex_sentinel_victim" ] && [ ! -L "$codex_sentinel_victim" ] || exit 1
+
+    codex_sentinel_outside=$codex_sentinel_dir/outside
+    codex_sentinel_link=$codex_sentinel_parent/link
+    printf OUTSIDE >"$codex_sentinel_outside" || exit 9
+    ln -s "$codex_sentinel_outside" "$codex_sentinel_link" || exit 9
+    codex_mutation_stat_valid "$codex_sentinel_link" || exit $?
+    case "$CODEX_STAT_TYPE" in a???) ;; *) exit 1 ;; esac
+    codex_sentinel_hash_status=0
+    codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_link") || codex_sentinel_hash_status=$?
+    [ "$codex_sentinel_hash_status" -eq 9 ] || exit 1
+    codex_sentinel_outside_content=$(cat "$codex_sentinel_outside") || exit 9
+    [ "$codex_sentinel_outside_content" = OUTSIDE ] || exit 1
+
+    cleanup_codex_sentinel || exit 9
+    trap - 0 HUP INT TERM
+    exit 0
+)
+
+codex_sentinel_status=0
+codex_guarded_delete_sentinel || codex_sentinel_status=$?
+case "$codex_sentinel_status" in
+    0) ;;
+    1)
+        printf 'STATUS=CAPABILITY_MISMATCH\000CAPABILITY=guarded_delete\000'
+        exit 0
+        ;;
+    *) exit 9 ;;
+esac
+
+case "$expected_hash" in *[!0-9a-f]*) exit 2 ;; esac
+[ "${#expected_hash}" -eq 64 ] || exit 2
+
+emit_one() {
+    trap - HUP INT TERM
+    printf 'STATUS=%s\000' "$1"
+    exit 0
+}
+
+codex_parent_line=$(codex_mutation_parent_stat_follow "$parent") || {
+    if codex_mutation_stat_valid "$parent"; then
+        case "$CODEX_STAT_TYPE" in
+            4???) exit 3 ;;
+            a???) emit_one NOT_FOUND ;;
+            *) emit_one NOT_DIRECTORY ;;
+        esac
+    fi
+    if [ ! -e "$parent" ] && [ ! -L "$parent" ]; then emit_one NOT_FOUND; fi
+    exit 3
+}
+codex_mutation_stat_parse "$codex_parent_line" || exit 3
+case "$CODEX_STAT_TYPE" in 4???) ;; *) emit_one NOT_DIRECTORY ;; esac
+parent_device=$CODEX_STAT_DEVICE
+parent_inode=$CODEX_STAT_INODE
+
+if ! cd "$parent" 2>/dev/null; then
+    if codex_mutation_parent_stat_follow_valid "$parent" &&
+       [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$parent_device:$parent_inode" ]; then
+        case "$CODEX_STAT_TYPE" in 4???) emit_one PERMISSION_DENIED ;; esac
+    fi
+    exit 3
+fi
+codex_mutation_parent_stat_follow_valid . || exit 3
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$parent_device:$parent_inode" ] || exit 3
+
+target=./$basename
+target_status=0
+codex_mutation_stat_valid "$target" || target_status=$?
+if [ "$target_status" -ne 0 ]; then
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then emit_one NOT_FOUND; fi
+    exit 4
+fi
+case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+target_device=$CODEX_STAT_DEVICE
+target_inode=$CODEX_STAT_INODE
+
+target_hash_status=0
+target_hash=$(codex_mutation_hash "$target") || target_hash_status=$?
+if [ "$target_hash_status" -ne 0 ]; then
+    if codex_mutation_stat_valid "$target"; then
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+        [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$target_device:$target_inode" ] || emit_one WRITE_CONFLICT
+    else
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then emit_one WRITE_CONFLICT; fi
+    fi
+    exit 4
+fi
+[ "$target_hash" = "$expected_hash" ] || emit_one WRITE_CONFLICT
+
+target_status=0
+codex_mutation_stat_valid "$target" || target_status=$?
+if [ "$target_status" -ne 0 ]; then
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then emit_one WRITE_CONFLICT; fi
+    exit 4
+fi
+case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$target_device:$target_inode" ] || emit_one WRITE_CONFLICT
+
+target_hash_status=0
+target_hash=$(codex_mutation_hash "$target") || target_hash_status=$?
+if [ "$target_hash_status" -ne 0 ]; then
+    if codex_mutation_stat_valid "$target"; then
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) emit_one WRITE_CONFLICT ;; esac
+        [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$target_device:$target_inode" ] || emit_one WRITE_CONFLICT
+    else
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then emit_one WRITE_CONFLICT; fi
+    fi
+    exit 4
+fi
+[ "$target_hash" = "$expected_hash" ] || emit_one WRITE_CONFLICT
+
+codex_mutation_remove "$target" || exit 5
+[ ! -e "$target" ] && [ ! -L "$target" ] || exit 5
+printf 'STATUS=SUCCESS\000OPERATION=DELETE\000SHA256=%s\000ABSENCE_CONFIRMED=1\000' "$expected_hash"
+exit 0
+"#;
+
+#[derive(Debug)]
+struct ResolvedWrite {
+    host: String,
+    path: RemotePath,
+    parent: String,
+    basename: String,
+    content: Vec<u8>,
+    operation: WriteOperation,
+    expected_sha256: Option<String>,
+    raw_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct ResolvedDelete {
+    host: String,
+    path: RemotePath,
+    parent: String,
+    basename: String,
+    expected_sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WriteProtocol {
+    Success {
+        operation: WriteOperation,
+        size: u64,
+        sha256: String,
+        mode: u32,
+    },
+    Domain(ErrorCode),
+    CapabilityMismatch,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeleteProtocol {
+    Success { sha256: String },
+    Domain(ErrorCode),
+    CapabilityMismatch,
+}
+
+pub(super) async fn write(
+    bridge: &RemoteBridge,
+    request: WriteRequest,
+    cancel: CancellationToken,
+) -> BridgeResult<WriteResult> {
+    let mut resolved = resolve_write(bridge, request)?;
+    let limits = bridge.runner.config().host(&resolved.host)?.limits;
+    let args = fixed_args(&resolved);
+    let stdin = std::mem::take(&mut resolved.content);
+    let owner = InternalSpoolOwner::new();
+    let request = FixedRunRequest {
+        kind: FixedOperationKind::Mutation,
+        host: resolved.host.clone(),
+        script: WRITE_SCRIPT,
+        args,
+        stdin: Some(stdin),
+        required_capabilities: &["safe_write"],
+        stdout_limit: WRITE_PROTOCOL_LIMIT,
+        stderr_limit: 1,
+        timeout: Duration::from_millis(limits.command_timeout_ms),
+        cleanup: owner.registration(),
+    };
+    let (_owner, result) = execute_owned_mutation(bridge, request, owner, cancel).await?;
+
+    let protocol = parse_write_protocol(&result, &resolved)
+        .await
+        .map_err(|_| BridgeError::mutation_outcome_unknown())?;
+    match protocol {
+        WriteProtocol::Success {
+            operation,
+            size,
+            sha256,
+            mode,
+        } => Ok(WriteResult {
+            context: context(
+                resolved.host,
+                result.capability.physical_root.clone(),
+                &result.shell,
+            ),
+            actual_path: encode_bytes(resolved.path.absolute().as_bytes()),
+            relative_path: encode_bytes(resolved.path.relative().as_bytes()),
+            operation,
+            raw_bytes: size,
+            sha256,
+            mode,
+            temporary_cleanup_confirmed: true,
+        }),
+        WriteProtocol::Domain(code) => Err(domain_error(code)),
+        WriteProtocol::CapabilityMismatch => {
+            bridge.runner.invalidate_capability(&resolved.host).await;
+            Err(BridgeError::new(
+                ErrorCode::RemoteCapabilityMissing,
+                "remote safe-write capability is unavailable",
+                false,
+            ))
+        }
+    }
+}
+
+pub(super) async fn guarded_delete(
+    bridge: &RemoteBridge,
+    request: GuardedDeleteRequest,
+    cancel: CancellationToken,
+) -> BridgeResult<GuardedDeleteResult> {
+    let resolved = resolve_delete(bridge, request)?;
+    let limits = bridge.runner.config().host(&resolved.host)?.limits;
+    let owner = InternalSpoolOwner::new();
+    let request = FixedRunRequest {
+        kind: FixedOperationKind::Mutation,
+        host: resolved.host.clone(),
+        script: GUARDED_DELETE_SCRIPT,
+        args: delete_fixed_args(&resolved),
+        stdin: None,
+        required_capabilities: &["guarded_delete"],
+        stdout_limit: WRITE_PROTOCOL_LIMIT,
+        stderr_limit: 1,
+        timeout: Duration::from_millis(limits.command_timeout_ms),
+        cleanup: owner.registration(),
+    };
+    let (_owner, result) = execute_owned_mutation(bridge, request, owner, cancel).await?;
+
+    let protocol = parse_delete_protocol(&result, &resolved)
+        .await
+        .map_err(|_| BridgeError::mutation_outcome_unknown())?;
+    match protocol {
+        DeleteProtocol::Success { sha256 } => Ok(GuardedDeleteResult {
+            actual_path: encode_bytes(resolved.path.absolute().as_bytes()),
+            relative_path: encode_bytes(resolved.path.relative().as_bytes()),
+            deleted_sha256: sha256,
+            absence_confirmed: true,
+        }),
+        DeleteProtocol::Domain(code) => Err(delete_domain_error(code)),
+        DeleteProtocol::CapabilityMismatch => {
+            bridge.runner.invalidate_capability(&resolved.host).await;
+            Err(BridgeError::new(
+                ErrorCode::RemoteCapabilityMissing,
+                "remote guarded-delete capability is unavailable",
+                false,
+            ))
+        }
+    }
+}
+
+async fn execute_owned_mutation(
+    bridge: &RemoteBridge,
+    request: FixedRunRequest,
+    owner: InternalSpoolOwner,
+    cancel: CancellationToken,
+) -> BridgeResult<(InternalSpoolOwner, FixedRunResult)> {
+    let child_cancel = cancel.child_token();
+    let cancellation_on_drop = child_cancel.clone().drop_guard();
+    let runner = Arc::clone(&bridge.runner);
+    let owner_task = tokio::spawn(async move {
+        let result = runner.execute_fixed_once(request, child_cancel).await;
+        (owner, result)
+    });
+    let joined = owner_task
+        .await
+        .map_err(|_| BridgeError::mutation_outcome_unknown())?;
+    let _child_cancel = cancellation_on_drop.disarm();
+    let (owner, result) = joined;
+    result.map(|result| (owner, result))
+}
+
+fn resolve_write(bridge: &RemoteBridge, request: WriteRequest) -> BridgeResult<ResolvedWrite> {
+    let WriteRequest {
+        host,
+        path,
+        content,
+        encoding,
+        mode,
+    } = request;
+    let resolved_host = bridge.runner.config().host(&host)?;
+    let read_only = resolved_host.profile.read_only;
+    let root = resolved_host.profile.root.clone();
+    let limits = resolved_host.limits;
+    if read_only {
+        return Err(BridgeError::new(
+            ErrorCode::ReadOnlyHost,
+            "remote host is configured read-only",
+            false,
+        ));
+    }
+    validate_write_path(&path)?;
+    let resolved_path = RemotePath::resolve(&root, &path)?;
+    if resolved_path.relative().is_empty() {
+        return Err(BridgeError::invalid_argument(
+            "write target must not be the configured root",
+        ));
+    }
+    let (parent, basename) = split_parent_basename(resolved_path.absolute())?;
+    let (operation, expected_sha256) = match mode {
+        WriteMode::Create => (WriteOperation::Create, None),
+        WriteMode::Replace { expected_sha256 } => {
+            if let Some(expected) = &expected_sha256 {
+                validate_hash(expected)?;
+            }
+            (WriteOperation::Replace, expected_sha256)
+        }
+    };
+    let content = match encoding {
+        WriteEncoding::Utf8 => {
+            if content.len() > limits.max_write_bytes {
+                return Err(write_too_large());
+            }
+            content.into_bytes()
+        }
+        WriteEncoding::Base64 => {
+            preflight_base64_length(&content, limits.max_write_bytes)?;
+            let decoded = STANDARD.decode(content).map_err(|_| {
+                BridgeError::invalid_argument("write content is not canonical Base64")
+            })?;
+            if decoded.len() > limits.max_write_bytes {
+                return Err(write_too_large());
+            }
+            decoded
+        }
+    };
+    let raw_bytes = u64::try_from(content.len())
+        .map_err(|_| BridgeError::new(ErrorCode::RequestTooLarge, "write is too large", false))?;
+    let sha256 = format!("{:x}", Sha256::digest(&content));
+    let resolved = ResolvedWrite {
+        host,
+        path: resolved_path,
+        parent,
+        basename,
+        content,
+        operation,
+        expected_sha256,
+        raw_bytes,
+        sha256,
+    };
+    let command = render_fixed_command(WRITE_SCRIPT, &fixed_args(&resolved))?;
+    let transport_bytes = command
+        .len()
+        .checked_add(resolved.content.len())
+        .ok_or_else(request_too_large)?;
+    if transport_bytes > limits.max_frame_bytes {
+        return Err(request_too_large());
+    }
+    Ok(resolved)
+}
+
+fn resolve_delete(
+    bridge: &RemoteBridge,
+    request: GuardedDeleteRequest,
+) -> BridgeResult<ResolvedDelete> {
+    let GuardedDeleteRequest {
+        host,
+        path,
+        expected_sha256,
+    } = request;
+    let resolved_host = bridge.runner.config().host(&host)?;
+    let read_only = resolved_host.profile.read_only;
+    let root = resolved_host.profile.root.clone();
+    let max_frame_bytes = resolved_host.limits.max_frame_bytes;
+    if read_only {
+        return Err(BridgeError::new(
+            ErrorCode::ReadOnlyHost,
+            "remote host is configured read-only",
+            false,
+        ));
+    }
+    validate_write_path(&path)?;
+    validate_hash(&expected_sha256)?;
+    let resolved_path = RemotePath::resolve(&root, &path)?;
+    if resolved_path.relative().is_empty() {
+        return Err(BridgeError::invalid_argument(
+            "delete target must not be the configured root",
+        ));
+    }
+    let (parent, basename) = split_parent_basename(resolved_path.absolute())?;
+    let resolved = ResolvedDelete {
+        host,
+        path: resolved_path,
+        parent,
+        basename,
+        expected_sha256,
+    };
+    let command = render_fixed_command(GUARDED_DELETE_SCRIPT, &delete_fixed_args(&resolved))?;
+    if command.len() > max_frame_bytes {
+        return Err(request_too_large());
+    }
+    Ok(resolved)
+}
+
+fn fixed_args(resolved: &ResolvedWrite) -> Vec<String> {
+    vec![
+        resolved.parent.clone(),
+        resolved.basename.clone(),
+        match resolved.operation {
+            WriteOperation::Create => "CREATE",
+            WriteOperation::Replace => "REPLACE",
+        }
+        .to_owned(),
+        resolved.raw_bytes.to_string(),
+        resolved.sha256.clone(),
+        if resolved.expected_sha256.is_some() {
+            "1"
+        } else {
+            "0"
+        }
+        .to_owned(),
+        resolved.expected_sha256.clone().unwrap_or_default(),
+    ]
+}
+
+fn delete_fixed_args(resolved: &ResolvedDelete) -> Vec<String> {
+    vec![
+        resolved.parent.clone(),
+        resolved.basename.clone(),
+        resolved.expected_sha256.clone(),
+    ]
+}
+
+fn validate_write_path(path: &str) -> BridgeResult<()> {
+    if path.is_empty() || path == "." {
+        return Err(BridgeError::invalid_argument(
+            "write target must not be empty or dot",
+        ));
+    }
+    if path.len() > MAX_INPUT_PATH_BYTES {
+        return Err(request_too_large());
+    }
+    if path.as_bytes().contains(&0) {
+        return Err(BridgeError::invalid_argument(
+            "NUL is not valid in a remote path",
+        ));
+    }
+    Ok(())
+}
+
+fn split_parent_basename(path: &str) -> BridgeResult<(String, String)> {
+    let (parent, basename) = path
+        .rsplit_once('/')
+        .ok_or_else(|| BridgeError::invalid_argument("write target is invalid"))?;
+    if basename.is_empty() || basename == "." || basename == ".." {
+        return Err(BridgeError::invalid_argument("write target is invalid"));
+    }
+    Ok((
+        if parent.is_empty() { "/" } else { parent }.to_owned(),
+        basename.to_owned(),
+    ))
+}
+
+fn validate_hash(hash: &str) -> BridgeResult<()> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BridgeError::invalid_argument(
+            "expected SHA-256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_base64_length(content: &str, max_write_bytes: usize) -> BridgeResult<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    if !content.len().is_multiple_of(4) {
+        return Err(BridgeError::invalid_argument(
+            "write content is not canonical Base64",
+        ));
+    }
+    let padding = content
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
+    if padding > 2 || content.as_bytes()[..content.len() - padding].contains(&b'=') {
+        return Err(BridgeError::invalid_argument(
+            "write content is not canonical Base64",
+        ));
+    }
+    let decoded_length = (content.len() / 4)
+        .checked_mul(3)
+        .and_then(|length| length.checked_sub(padding))
+        .ok_or_else(write_too_large)?;
+    if decoded_length > max_write_bytes {
+        return Err(write_too_large());
+    }
+    Ok(())
+}
+
+async fn parse_write_protocol(
+    result: &crate::ssh::FixedRunResult,
+    resolved: &ResolvedWrite,
+) -> BridgeResult<WriteProtocol> {
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1).await?;
+    let stdout = read_small_stream(
+        &result.output,
+        StreamKind::Stdout,
+        WRITE_PROTOCOL_LIMIT as usize,
+    )
+    .await?;
+    parse_write_protocol_bytes(&stdout, &stderr, resolved)
+}
+
+fn parse_write_protocol_bytes(
+    stdout: &[u8],
+    stderr: &[u8],
+    resolved: &ResolvedWrite,
+) -> BridgeResult<WriteProtocol> {
+    if !stderr.is_empty() {
+        return Err(protocol_error("write protocol stderr is not empty"));
+    }
+    let records = parse_records(stdout)?;
+    match records.as_slice() {
+        [status] if status.as_slice() == b"STATUS=WRITE_CONFLICT" => {
+            Ok(WriteProtocol::Domain(ErrorCode::WriteConflict))
+        }
+        [status] if status.as_slice() == b"STATUS=NOT_FOUND" => {
+            Ok(WriteProtocol::Domain(ErrorCode::NotFound))
+        }
+        [status] if status.as_slice() == b"STATUS=NOT_DIRECTORY" => {
+            Ok(WriteProtocol::Domain(ErrorCode::NotDirectory))
+        }
+        [status] if status.as_slice() == b"STATUS=PERMISSION_DENIED" => {
+            Ok(WriteProtocol::Domain(ErrorCode::PermissionDenied))
+        }
+        [status, capability]
+            if status.as_slice() == b"STATUS=CAPABILITY_MISMATCH"
+                && capability.as_slice() == b"CAPABILITY=safe_write" =>
+        {
+            Ok(WriteProtocol::CapabilityMismatch)
+        }
+        [status, operation, size, sha256, mode, cleanup]
+            if status.as_slice() == b"STATUS=SUCCESS" =>
+        {
+            let operation = match operation.as_slice() {
+                b"OPERATION=CREATE" => WriteOperation::Create,
+                b"OPERATION=REPLACE" => WriteOperation::Replace,
+                _ => return Err(protocol_error("write operation is invalid")),
+            };
+            let size = parse_decimal_field(size, b"SIZE=")?;
+            let sha256 = parse_text_field(sha256, b"SHA256=")?;
+            validate_hash(&sha256).map_err(|_| protocol_error("write hash is invalid"))?;
+            let mode = parse_decimal_field(mode, b"MODE=")?;
+            let mode = u32::try_from(mode).map_err(|_| protocol_error("write mode is invalid"))?;
+            if mode > 0o777 {
+                return Err(protocol_error("write mode is invalid"));
+            }
+            if cleanup.as_slice() != b"TEMPORARY_CLEANUP_CONFIRMED=1" {
+                return Err(protocol_error("write cleanup proof is invalid"));
+            }
+            if operation != resolved.operation
+                || size != resolved.raw_bytes
+                || sha256 != resolved.sha256
+                || (operation == WriteOperation::Create && mode != 0o600)
+            {
+                return Err(protocol_error("write success does not match the request"));
+            }
+            Ok(WriteProtocol::Success {
+                operation,
+                size,
+                sha256,
+                mode,
+            })
+        }
+        _ => Err(protocol_error("write protocol record is invalid")),
+    }
+}
+
+async fn parse_delete_protocol(
+    result: &crate::ssh::FixedRunResult,
+    resolved: &ResolvedDelete,
+) -> BridgeResult<DeleteProtocol> {
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1).await?;
+    let stdout = read_small_stream(
+        &result.output,
+        StreamKind::Stdout,
+        WRITE_PROTOCOL_LIMIT as usize,
+    )
+    .await?;
+    parse_delete_protocol_bytes(&stdout, &stderr, resolved)
+}
+
+fn parse_delete_protocol_bytes(
+    stdout: &[u8],
+    stderr: &[u8],
+    resolved: &ResolvedDelete,
+) -> BridgeResult<DeleteProtocol> {
+    if !stderr.is_empty() {
+        return Err(protocol_error("delete protocol stderr is not empty"));
+    }
+    let records = parse_records(stdout)?;
+    match records.as_slice() {
+        [status] if status.as_slice() == b"STATUS=WRITE_CONFLICT" => {
+            Ok(DeleteProtocol::Domain(ErrorCode::WriteConflict))
+        }
+        [status] if status.as_slice() == b"STATUS=NOT_FOUND" => {
+            Ok(DeleteProtocol::Domain(ErrorCode::NotFound))
+        }
+        [status] if status.as_slice() == b"STATUS=NOT_DIRECTORY" => {
+            Ok(DeleteProtocol::Domain(ErrorCode::NotDirectory))
+        }
+        [status] if status.as_slice() == b"STATUS=PERMISSION_DENIED" => {
+            Ok(DeleteProtocol::Domain(ErrorCode::PermissionDenied))
+        }
+        [status, capability]
+            if status.as_slice() == b"STATUS=CAPABILITY_MISMATCH"
+                && capability.as_slice() == b"CAPABILITY=guarded_delete" =>
+        {
+            Ok(DeleteProtocol::CapabilityMismatch)
+        }
+        [status, operation, sha256, absence]
+            if status.as_slice() == b"STATUS=SUCCESS"
+                && operation.as_slice() == b"OPERATION=DELETE"
+                && absence.as_slice() == b"ABSENCE_CONFIRMED=1" =>
+        {
+            let sha256 = parse_text_field(sha256, b"SHA256=")?;
+            validate_hash(&sha256).map_err(|_| protocol_error("delete hash is invalid"))?;
+            if sha256 != resolved.expected_sha256 {
+                return Err(protocol_error("delete success does not match the request"));
+            }
+            Ok(DeleteProtocol::Success { sha256 })
+        }
+        _ => Err(protocol_error("delete protocol record is invalid")),
+    }
+}
+
+fn parse_records(bytes: &[u8]) -> BridgeResult<Vec<Vec<u8>>> {
+    if bytes.last() != Some(&0) {
+        return Err(protocol_error("write protocol is not NUL terminated"));
+    }
+    let mut records = Vec::new();
+    for record in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        if record.is_empty() {
+            return Err(protocol_error("write protocol contains an empty record"));
+        }
+        records.push(record.to_vec());
+    }
+    if records.is_empty() {
+        return Err(protocol_error("write protocol is empty"));
+    }
+    Ok(records)
+}
+
+fn parse_decimal_field(record: &[u8], prefix: &[u8]) -> BridgeResult<u64> {
+    let value = record
+        .strip_prefix(prefix)
+        .ok_or_else(|| protocol_error("write numeric field is invalid"))?;
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return Err(protocol_error("write numeric field is invalid"));
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| protocol_error("write numeric field is invalid"))
+}
+
+fn parse_text_field(record: &[u8], prefix: &[u8]) -> BridgeResult<String> {
+    let value = record
+        .strip_prefix(prefix)
+        .ok_or_else(|| protocol_error("write text field is invalid"))?;
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|_| protocol_error("write text field is invalid"))
+}
+
+fn domain_error(code: ErrorCode) -> BridgeError {
+    match code {
+        ErrorCode::WriteConflict => BridgeError::new(
+            ErrorCode::WriteConflict,
+            "remote write target conflicts with the request",
+            false,
+        ),
+        ErrorCode::NotFound => BridgeError::not_found(),
+        ErrorCode::NotDirectory => BridgeError::not_directory(),
+        ErrorCode::PermissionDenied => BridgeError::permission_denied(),
+        _ => BridgeError::mutation_outcome_unknown(),
+    }
+}
+
+fn delete_domain_error(code: ErrorCode) -> BridgeError {
+    match code {
+        ErrorCode::WriteConflict => BridgeError::new(
+            ErrorCode::WriteConflict,
+            "remote delete target conflicts with the expected content",
+            false,
+        ),
+        ErrorCode::NotFound => BridgeError::not_found(),
+        ErrorCode::NotDirectory => BridgeError::not_directory(),
+        ErrorCode::PermissionDenied => BridgeError::permission_denied(),
+        _ => BridgeError::mutation_outcome_unknown(),
+    }
+}
+
+fn protocol_error(message: &str) -> BridgeError {
+    BridgeError::new(ErrorCode::ProtocolError, message, false)
+}
+
+fn request_too_large() -> BridgeError {
+    BridgeError::new(
+        ErrorCode::RequestTooLarge,
+        "write request exceeds the configured frame limit",
+        false,
+    )
+}
+
+fn write_too_large() -> BridgeError {
+    BridgeError::new(
+        ErrorCode::RequestTooLarge,
+        "write content exceeds the configured limit",
+        false,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DeleteProtocol, GuardedDeleteRequest, ResolvedDelete, ResolvedWrite, WriteOperation,
+        WriteProtocol, parse_delete_protocol_bytes, parse_write_protocol_bytes,
+    };
+    use crate::config::{Config, HostProfile};
+    use crate::error::{BridgeResult, ErrorCode};
+    use crate::output::OutputStore;
+    use crate::path::RemotePath;
+    use crate::remote::RemoteBridge;
+    use crate::ssh::{RuntimePaths, SshRunner};
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    const ABC_HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn resolved(operation: WriteOperation) -> ResolvedWrite {
+        ResolvedWrite {
+            host: "dev".to_owned(),
+            path: RemotePath::resolve("/root", "file").unwrap(),
+            parent: "/root".to_owned(),
+            basename: "file".to_owned(),
+            content: Vec::new(),
+            operation,
+            expected_sha256: None,
+            raw_bytes: 3,
+            sha256: ABC_HASH.to_owned(),
+        }
+    }
+
+    fn parse_create(stdout: &[u8], stderr: &[u8]) -> BridgeResult<WriteProtocol> {
+        parse_write_protocol_bytes(stdout, stderr, &resolved(WriteOperation::Create))
+    }
+
+    fn assert_protocol_error(stdout: &[u8], stderr: &[u8]) {
+        assert_eq!(
+            parse_create(stdout, stderr).unwrap_err().code,
+            ErrorCode::ProtocolError,
+            "stdout={stdout:?}, stderr={stderr:?}"
+        );
+    }
+
+    fn delete_fixture(root: &std::path::Path) -> (tempfile::TempDir, RemoteBridge) {
+        delete_fixture_with_options(root, false, &[])
+    }
+
+    fn delete_fixture_with_options(
+        root: &std::path::Path,
+        read_only: bool,
+        extra: &[(&str, OsString)],
+    ) -> (tempfile::TempDir, RemoteBridge) {
+        let runtime_base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
+        let output = Arc::new(OutputStore::new(&runtime).unwrap());
+        let mut config = Config::default();
+        config.hosts.insert(
+            "dev".to_owned(),
+            HostProfile {
+                root: root.to_str().unwrap().to_owned(),
+                description: None,
+                read_only,
+                limits: Default::default(),
+            },
+        );
+        let mut environment = BTreeMap::from([
+            (
+                OsString::from("FAKE_SSH_MODE"),
+                OsString::from("local-fixed"),
+            ),
+            (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
+        ]);
+        for (key, value) in extra {
+            environment.insert(OsString::from(key), value.clone());
+        }
+        let runner = SshRunner::with_executable(
+            Arc::new(config),
+            runtime,
+            output,
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ssh.sh"),
+            environment,
+        )
+        .unwrap();
+        (runtime_base, RemoteBridge::new(Arc::new(runner)))
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn ssh_call_count(log: &std::path::Path, marker: &str) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == marker)
+            .count()
+    }
+
+    fn resolved_delete() -> ResolvedDelete {
+        ResolvedDelete {
+            host: "dev".to_owned(),
+            path: RemotePath::resolve("/root", "victim").unwrap(),
+            parent: "/root".to_owned(),
+            basename: "victim".to_owned(),
+            expected_sha256: sha256(b"victim"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_success_confirms_absence() {
+        let remote = tempfile::TempDir::new().unwrap();
+        std::fs::write(remote.path().join("victim"), b"victim").unwrap();
+        let (_runtime, bridge) = delete_fixture(remote.path());
+        let result = bridge
+            .guarded_delete(
+                GuardedDeleteRequest {
+                    host: "dev".to_owned(),
+                    path: "victim".to_owned(),
+                    expected_sha256: sha256(b"victim"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.deleted_sha256, sha256(b"victim"));
+        assert!(result.absence_confirmed);
+        assert!(!remote.path().join("victim").exists());
+    }
+
+    #[test]
+    fn task5_guarded_delete_protocol_parser_is_closed() {
+        let expected = sha256(b"victim");
+        let success =
+            format!("STATUS=SUCCESS\0OPERATION=DELETE\0SHA256={expected}\0ABSENCE_CONFIRMED=1\0");
+        assert_eq!(
+            parse_delete_protocol_bytes(success.as_bytes(), b"", &resolved_delete()).unwrap(),
+            DeleteProtocol::Success {
+                sha256: expected.clone()
+            }
+        );
+        for (record, result) in [
+            (
+                "STATUS=WRITE_CONFLICT\0",
+                DeleteProtocol::Domain(ErrorCode::WriteConflict),
+            ),
+            (
+                "STATUS=NOT_FOUND\0",
+                DeleteProtocol::Domain(ErrorCode::NotFound),
+            ),
+            (
+                "STATUS=NOT_DIRECTORY\0",
+                DeleteProtocol::Domain(ErrorCode::NotDirectory),
+            ),
+            (
+                "STATUS=PERMISSION_DENIED\0",
+                DeleteProtocol::Domain(ErrorCode::PermissionDenied),
+            ),
+        ] {
+            assert_eq!(
+                parse_delete_protocol_bytes(record.as_bytes(), b"", &resolved_delete()).unwrap(),
+                result
+            );
+        }
+        assert_eq!(
+            parse_delete_protocol_bytes(
+                b"STATUS=CAPABILITY_MISMATCH\0CAPABILITY=guarded_delete\0",
+                b"",
+                &resolved_delete(),
+            )
+            .unwrap(),
+            DeleteProtocol::CapabilityMismatch
+        );
+
+        let invalid = [
+            Vec::new(),
+            b"STATUS=NOT_FOUND".to_vec(),
+            b"STATUS=NOT_FOUND\0EXTRA=1\0".to_vec(),
+            b"STATUS=CAPABILITY_MISMATCH\0CAPABILITY=safe_write\0".to_vec(),
+            format!("STATUS=SUCCESS\0OPERATION=REMOVE\0SHA256={expected}\0ABSENCE_CONFIRMED=1\0")
+                .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=DELETE\0SHA256={}\0ABSENCE_CONFIRMED=1\0",
+                "0".repeat(64)
+            )
+            .into_bytes(),
+            format!("STATUS=SUCCESS\0OPERATION=DELETE\0SHA256={expected}\0ABSENCE_CONFIRMED=0\0")
+                .into_bytes(),
+        ];
+        for stdout in invalid {
+            assert_eq!(
+                parse_delete_protocol_bytes(&stdout, b"", &resolved_delete())
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ProtocolError,
+                "stdout={stdout:?}"
+            );
+        }
+        assert_eq!(
+            parse_delete_protocol_bytes(b"STATUS=NOT_FOUND\0", b"x", &resolved_delete())
+                .unwrap_err()
+                .code,
+            ErrorCode::ProtocolError
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_rejects_missing_wrong_hash_and_non_regular_entries() {
+        use std::os::unix::fs::symlink;
+
+        let remote = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(remote.path().join("directory")).unwrap();
+        let fifo = remote.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(remote.path().join("outside"), b"outside").unwrap();
+        symlink("outside", remote.path().join("live-link")).unwrap();
+        symlink("missing", remote.path().join("dangling-link")).unwrap();
+        std::fs::write(remote.path().join("wrong-hash"), b"old").unwrap();
+        let (_runtime, bridge) = delete_fixture(remote.path());
+
+        for (path, hash, expected_code) in [
+            ("missing", sha256(b"missing"), ErrorCode::NotFound),
+            ("directory", sha256(b"directory"), ErrorCode::WriteConflict),
+            ("fifo", sha256(b"fifo"), ErrorCode::WriteConflict),
+            ("live-link", sha256(b"outside"), ErrorCode::WriteConflict),
+            (
+                "dangling-link",
+                sha256(b"missing"),
+                ErrorCode::WriteConflict,
+            ),
+            ("wrong-hash", sha256(b"different"), ErrorCode::WriteConflict),
+        ] {
+            let error = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: path.to_owned(),
+                        expected_sha256: hash,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected_code, "path={path}");
+        }
+        assert_eq!(
+            std::fs::read(remote.path().join("outside")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            std::fs::read(remote.path().join("wrong-hash")).unwrap(),
+            b"old"
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_classifies_missing_and_non_directory_parents() {
+        let remote = tempfile::TempDir::new().unwrap();
+        std::fs::write(remote.path().join("regular-parent"), b"regular").unwrap();
+        let (_runtime, bridge) = delete_fixture(remote.path());
+        for (path, expected) in [
+            ("missing-parent/victim", ErrorCode::NotFound),
+            ("regular-parent/victim", ErrorCode::NotDirectory),
+        ] {
+            let error = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: path.to_owned(),
+                        expected_sha256: sha256(b"victim"),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected, "path={path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_local_rejections_launch_nothing() {
+        let remote = tempfile::TempDir::new().unwrap();
+        let controls = tempfile::TempDir::new().unwrap();
+        let log = controls.path().join("ssh.log");
+        let (_runtime, bridge) = delete_fixture_with_options(
+            remote.path(),
+            true,
+            &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+        );
+        let error = bridge
+            .guarded_delete(
+                GuardedDeleteRequest {
+                    host: "dev".to_owned(),
+                    path: "victim".to_owned(),
+                    expected_sha256: sha256(b"victim"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ReadOnlyHost);
+        assert!(!log.exists());
+
+        let (_runtime, bridge) = delete_fixture_with_options(
+            remote.path(),
+            false,
+            &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+        );
+        for (path, hash) in [(".", sha256(b"victim")), ("victim", "A".repeat(64))] {
+            assert_eq!(
+                bridge
+                    .guarded_delete(
+                        GuardedDeleteRequest {
+                            host: "dev".to_owned(),
+                            path: path.to_owned(),
+                            expected_sha256: hash,
+                        },
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidArgument
+            );
+        }
+        assert!(!log.exists());
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_sentinel_closes_second_stat_and_hash_drift() {
+        for (tool, expected_code) in [
+            ("stat", ErrorCode::RemoteCapabilityMissing),
+            ("dd", ErrorCode::MutationOutcomeUnknown),
+        ] {
+            let remote = tempfile::TempDir::new().unwrap();
+            let target = remote.path().join(tool);
+            std::fs::write(&target, b"victim").unwrap();
+            let controls = tempfile::TempDir::new().unwrap();
+            let log = controls.path().join("ssh.log");
+            let marker = controls.path().join(format!("{tool}-count"));
+            let scratch = controls.path().join("scratch");
+            std::fs::create_dir(&scratch).unwrap();
+            let shim = tempfile::TempDir::new().unwrap();
+            let executable = shim.path().join(tool);
+            let body = if tool == "stat" {
+                format!(
+                    "#!/bin/sh\ncase \" $* \" in *codex-sentinel-guarded-delete*/parent/victim*) marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); if [ \"$count\" -eq 2 ]; then /usr/bin/rm -f \"$marker\"; printf 'a1ff:0:777:7:1:2:1\\n'; exit 0; fi; printf %s \"$count\" >\"$marker\";; esac\nexec /usr/bin/stat \"$@\"\n",
+                    crate::quote::shell_word(marker.to_str().unwrap()).unwrap()
+                )
+            } else {
+                format!(
+                    "#!/bin/sh\ncase \" $* \" in *codex-sentinel-guarded-delete*/parent/victim*bs=262144*iflag=nofollow*) marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); if [ \"$count\" -eq 2 ]; then /usr/bin/rm -f \"$marker\"; exit 64; fi; printf %s \"$count\" >\"$marker\";; esac\nexec /usr/bin/dd \"$@\"\n",
+                    crate::quote::shell_word(marker.to_str().unwrap()).unwrap()
+                )
+            };
+            std::fs::write(&executable, body).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = OsString::from(format!(
+                "{}:/usr/local/bin:/usr/bin:/bin",
+                shim.path().display()
+            ));
+            let (_runtime, bridge) = delete_fixture_with_options(
+                remote.path(),
+                false,
+                &[
+                    ("PATH", path),
+                    ("TMPDIR", scratch.as_os_str().to_owned()),
+                    ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+                ],
+            );
+            let error = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: tool.to_owned(),
+                        expected_sha256: sha256(b"victim"),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected_code, "tool={tool}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"victim", "tool={tool}");
+            assert_eq!(ssh_call_count(&log, "P"), 1, "tool={tool}");
+            assert_eq!(ssh_call_count(&log, "C"), 1, "tool={tool}");
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_races_close_before_unlink_or_become_unknown_after_it() {
+        for race in ["identity", "second-hash", "rm-fail", "reappear"] {
+            let remote = tempfile::TempDir::new().unwrap();
+            let target = remote.path().join(race);
+            std::fs::write(&target, b"victim").unwrap();
+            let controls = tempfile::TempDir::new().unwrap();
+            let log = controls.path().join("ssh.log");
+            let marker = controls.path().join("hash-count");
+            let shim = tempfile::TempDir::new().unwrap();
+            let (tool, body) = match race {
+                "identity" => (
+                    "dd",
+                    format!(
+                        "#!/bin/sh\ncase \" $* \" in *\" if=./identity \"*bs=262144*iflag=nofollow*) /usr/bin/dd \"$@\"; status=$?; printf raced >{}; /usr/bin/mv -T -- {} {}; exit \"$status\";; esac\nexec /usr/bin/dd \"$@\"\n",
+                        crate::quote::shell_word(
+                            remote.path().join("identity-swap").to_str().unwrap()
+                        )
+                        .unwrap(),
+                        crate::quote::shell_word(
+                            remote.path().join("identity-swap").to_str().unwrap()
+                        )
+                        .unwrap(),
+                        crate::quote::shell_word(target.to_str().unwrap()).unwrap(),
+                    ),
+                ),
+                "second-hash" => (
+                    "dd",
+                    format!(
+                        "#!/bin/sh\ncase \" $* \" in *\" if=./second-hash \"*bs=262144*iflag=nofollow*) marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); printf %s \"$count\" >\"$marker\"; if [ \"$count\" -eq 2 ]; then printf changed >{}; fi;; esac\nexec /usr/bin/dd \"$@\"\n",
+                        crate::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+                        crate::quote::shell_word(target.to_str().unwrap()).unwrap(),
+                    ),
+                ),
+                "rm-fail" => (
+                    "rm",
+                    "#!/bin/sh\ncase \" $* \" in *\" ./rm-fail \"*) exit 64;; esac\nexec /usr/bin/rm \"$@\"\n"
+                        .to_owned(),
+                ),
+                "reappear" => (
+                    "rm",
+                    format!(
+                        "#!/bin/sh\ncase \" $* \" in *\" ./reappear \"*) /usr/bin/rm \"$@\"; status=$?; printf raced >{}; exit \"$status\";; esac\nexec /usr/bin/rm \"$@\"\n",
+                        crate::quote::shell_word(target.to_str().unwrap()).unwrap()
+                    ),
+                ),
+                _ => unreachable!(),
+            };
+            let executable = shim.path().join(tool);
+            std::fs::write(&executable, body).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = OsString::from(format!(
+                "{}:/usr/local/bin:/usr/bin:/bin",
+                shim.path().display()
+            ));
+            let (_runtime, bridge) = delete_fixture_with_options(
+                remote.path(),
+                false,
+                &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+            );
+            let error = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: race.to_owned(),
+                        expected_sha256: sha256(b"victim"),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            let expected = if matches!(race, "identity" | "second-hash") {
+                ErrorCode::WriteConflict
+            } else {
+                ErrorCode::MutationOutcomeUnknown
+            };
+            assert_eq!(error.code, expected, "race={race}");
+            assert!(target.exists(), "race={race}");
+            assert_eq!(ssh_call_count(&log, "C"), 1, "race={race}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_postcommit_ambiguity_is_unknown_without_retry() {
+        for post in ["disconnect", "malformed", "trailing", "stderr"] {
+            let remote = tempfile::TempDir::new().unwrap();
+            let target = remote.path().join(post);
+            std::fs::write(&target, b"victim").unwrap();
+            let controls = tempfile::TempDir::new().unwrap();
+            let log = controls.path().join("ssh.log");
+            let (_runtime, bridge) = delete_fixture_with_options(
+                remote.path(),
+                false,
+                &[
+                    ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+                    ("FAKE_SSH_LOCAL_FIXED_POST", OsString::from(post)),
+                ],
+            );
+            let error = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: post.to_owned(),
+                        expected_sha256: sha256(b"victim"),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown, "post={post}");
+            assert_eq!(error.details.mutation_may_have_applied, Some(true));
+            assert!(!target.exists(), "post={post}");
+            assert_eq!(ssh_call_count(&log, "C"), 1, "post={post}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task5_guarded_delete_stale_sentinel_reprobes_only_the_next_call() {
+        let remote = tempfile::TempDir::new().unwrap();
+        let target = remote.path().join("victim");
+        std::fs::write(&target, b"victim").unwrap();
+        let controls = tempfile::TempDir::new().unwrap();
+        let log = controls.path().join("ssh.log");
+        let marker = controls.path().join("mismatch-used");
+        let shim = tempfile::TempDir::new().unwrap();
+        let stat = shim.path().join("stat");
+        std::fs::write(
+            &stat,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *codex-sentinel-guarded-delete*parent-link*) marker={}; if [ ! -e \"$marker\" ]; then : >\"$marker\"; printf '41c0:0:700:0:1:2:1:extra\\n'; exit 0; fi;; esac\nexec /usr/bin/stat \"$@\"\n",
+                crate::quote::shell_word(marker.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:/usr/local/bin:/usr/bin:/bin",
+            shim.path().display()
+        ));
+        let (_runtime, bridge) = delete_fixture_with_options(
+            remote.path(),
+            false,
+            &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+        );
+        let request = || GuardedDeleteRequest {
+            host: "dev".to_owned(),
+            path: "victim".to_owned(),
+            expected_sha256: sha256(b"victim"),
+        };
+        let first = bridge
+            .guarded_delete(request(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(first.code, ErrorCode::RemoteCapabilityMissing);
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+        assert_eq!(ssh_call_count(&log, "P"), 1);
+        assert_eq!(ssh_call_count(&log, "C"), 1);
+
+        let second = bridge
+            .guarded_delete(request(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(second.absence_confirmed);
+        assert!(!target.exists());
+        assert_eq!(ssh_call_count(&log, "P"), 2);
+        assert_eq!(ssh_call_count(&log, "C"), 2);
+    }
+
+    #[tokio::test]
+    async fn task5_delete_exact_form_sentinel_matrix_is_semantic_and_future_only() {
+        struct Case {
+            form: &'static str,
+            tool: &'static str,
+            rule: &'static str,
+        }
+
+        let cases = [
+            Case {
+                form: "parent-follow",
+                tool: "stat",
+                rule: r#"case " $* " in
+  *" -L --printf=%f:%u:%a:%s:%d:%i:%h\n -- "*codex-sentinel-guarded-delete*/parent-link*)
+    if [ ! -e "$marker" ]; then : >"$marker"; printf '41ed:0:700:0:0:0:2\n'; exit 0; fi;;
+esac"#,
+            },
+            Case {
+                form: "lstat",
+                tool: "stat",
+                rule: r#"case " $* " in
+  *" --printf=%f:%u:%a:%s:%d:%i:%h\n -- "*codex-sentinel-guarded-delete*/parent/victim*)
+    if [ ! -e "$marker" ]; then : >"$marker"; printf '8180:0:640:8:0:0:1\n'; exit 0; fi;;
+esac"#,
+            },
+            Case {
+                form: "dd-input",
+                tool: "dd",
+                rule: r#"case " $* " in
+  *codex-sentinel-guarded-delete*/parent/victim*bs=262144*status=none*iflag=nofollow*)
+    if [ ! -e "$marker" ]; then : >"$marker"; printf corrupt; exit 0; fi;;
+esac"#,
+            },
+            Case {
+                form: "sha256sum-hash",
+                tool: "sha256sum",
+                rule: r#"if [ -e "$armed" ] && [ ! -e "$marker" ]; then
+  : >"$marker"
+  /usr/bin/rm -f -- "$armed"
+  /usr/bin/dd of=/dev/null status=none
+  printf '0000000000000000000000000000000000000000000000000000000000000000  -\n'
+  exit 0
+fi"#,
+            },
+            Case {
+                form: "rm",
+                tool: "rm",
+                rule: r#"case " $* " in
+  *" -f -- "*codex-sentinel-guarded-delete*/parent/victim*)
+    if [ ! -e "$marker" ]; then : >"$marker"; exit 0; fi;;
+esac"#,
+            },
+        ];
+
+        for case in cases {
+            let remote = tempfile::TempDir::new().unwrap();
+            let first_target = remote.path().join("first");
+            let second_target = remote.path().join("second");
+            std::fs::write(&first_target, b"first payload").unwrap();
+            std::fs::write(&second_target, b"second payload").unwrap();
+            let controls = tempfile::TempDir::new().unwrap();
+            let log = controls.path().join("ssh.log");
+            let marker = controls.path().join("semantic-drift-used");
+            let armed = controls.path().join("sentinel-hash-armed");
+            let scratch = controls.path().join("scratch");
+            std::fs::create_dir(&scratch).unwrap();
+            let shim = tempfile::TempDir::new().unwrap();
+            let executable = shim.path().join(case.tool);
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nmarker={}\narmed={}\n{}\nexec /usr/bin/{} \"$@\"\n",
+                    crate::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+                    crate::quote::shell_word(armed.to_str().unwrap()).unwrap(),
+                    case.rule,
+                    case.tool,
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if case.tool == "sha256sum" {
+                let stat = shim.path().join("stat");
+                std::fs::write(
+                    &stat,
+                    format!(
+                        "#!/bin/sh\ncase \" $* \" in *\" --printf=%f:%u:%a:%s:%d:%i:%h\\n -- \"*codex-sentinel-guarded-delete*/parent/victim*) : >{};; esac\nexec /usr/bin/stat \"$@\"\n",
+                        crate::quote::shell_word(armed.to_str().unwrap()).unwrap(),
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let path = OsString::from(format!(
+                "{}:/usr/local/bin:/usr/bin:/bin",
+                shim.path().display()
+            ));
+            let (_runtime, bridge) = delete_fixture_with_options(
+                remote.path(),
+                false,
+                &[
+                    ("PATH", path),
+                    ("TMPDIR", scratch.as_os_str().to_owned()),
+                    ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+                ],
+            );
+
+            let first = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: "first".to_owned(),
+                        expected_sha256: sha256(b"first payload"),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                first.code,
+                ErrorCode::RemoteCapabilityMissing,
+                "form={}",
+                case.form
+            );
+            assert!(marker.exists(), "form={}", case.form);
+            assert_eq!(
+                std::fs::read(&first_target).unwrap(),
+                b"first payload",
+                "form={}",
+                case.form
+            );
+            assert_eq!(ssh_call_count(&log, "P"), 1, "form={}", case.form);
+            assert_eq!(ssh_call_count(&log, "C"), 1, "form={}", case.form);
+            assert_eq!(
+                std::fs::read_dir(&scratch).unwrap().count(),
+                0,
+                "form={}",
+                case.form
+            );
+
+            let second = bridge
+                .guarded_delete(
+                    GuardedDeleteRequest {
+                        host: "dev".to_owned(),
+                        path: "second".to_owned(),
+                        expected_sha256: sha256(b"second payload"),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(second.absence_confirmed, "form={}", case.form);
+            assert!(!second_target.exists(), "form={}", case.form);
+            assert_eq!(ssh_call_count(&log, "P"), 2, "form={}", case.form);
+            assert_eq!(ssh_call_count(&log, "C"), 2, "form={}", case.form);
+        }
+    }
+
+    #[test]
+    fn task5_write_protocol_parser_accepts_only_closed_success_and_domain_shapes() {
+        let create = format!(
+            "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=3\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+        );
+        assert_eq!(
+            parse_create(create.as_bytes(), b"").unwrap(),
+            WriteProtocol::Success {
+                operation: WriteOperation::Create,
+                size: 3,
+                sha256: ABC_HASH.to_owned(),
+                mode: 0o600,
+            }
+        );
+
+        let replace = format!(
+            "STATUS=SUCCESS\0OPERATION=REPLACE\0SIZE=3\0SHA256={ABC_HASH}\0MODE=416\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+        );
+        assert_eq!(
+            parse_write_protocol_bytes(
+                replace.as_bytes(),
+                b"",
+                &resolved(WriteOperation::Replace),
+            )
+            .unwrap(),
+            WriteProtocol::Success {
+                operation: WriteOperation::Replace,
+                size: 3,
+                sha256: ABC_HASH.to_owned(),
+                mode: 0o640,
+            }
+        );
+
+        for (record, expected) in [
+            ("STATUS=WRITE_CONFLICT\0", ErrorCode::WriteConflict),
+            ("STATUS=NOT_FOUND\0", ErrorCode::NotFound),
+            ("STATUS=NOT_DIRECTORY\0", ErrorCode::NotDirectory),
+            ("STATUS=PERMISSION_DENIED\0", ErrorCode::PermissionDenied),
+        ] {
+            assert_eq!(
+                parse_create(record.as_bytes(), b"").unwrap(),
+                WriteProtocol::Domain(expected)
+            );
+        }
+        assert_eq!(
+            parse_create(b"STATUS=CAPABILITY_MISMATCH\0CAPABILITY=safe_write\0", b"",).unwrap(),
+            WriteProtocol::CapabilityMismatch
+        );
+    }
+
+    #[test]
+    fn task5_write_protocol_parser_rejects_every_open_or_mismatched_shape() {
+        let invalid: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"STATUS=WRITE_CONFLICT".to_vec(),
+            b"STATUS=WRITE_CONFLICT\0\0".to_vec(),
+            b"STATUS=WRITE_CONFLICT\0STATUS=WRITE_CONFLICT\0".to_vec(),
+            b"STATUS=WRITE_CONFLICT\0EXTRA=1\0".to_vec(),
+            b"STATUS=UNKNOWN\0".to_vec(),
+            b"STATUS=CAPABILITY_MISMATCH\0CAPABILITY=guarded_delete\0".to_vec(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=UPSERT\0SIZE=3\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=REPLACE\0SIZE=3\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=4\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=x\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=18446744073709551616\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=3\0SHA256={}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0",
+                "0".repeat(64)
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=3\0SHA256={}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=1\0",
+                "A".repeat(64)
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=3\0SHA256={ABC_HASH}\0MODE=416\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=3\0SHA256={ABC_HASH}\0MODE=512\0TEMPORARY_CLEANUP_CONFIRMED=1\0"
+            )
+            .into_bytes(),
+            format!(
+                "STATUS=SUCCESS\0OPERATION=CREATE\0SIZE=3\0SHA256={ABC_HASH}\0MODE=384\0TEMPORARY_CLEANUP_CONFIRMED=0\0"
+            )
+            .into_bytes(),
+        ];
+        for stdout in invalid {
+            assert_protocol_error(&stdout, b"");
+        }
+        assert_protocol_error(b"STATUS=WRITE_CONFLICT\0", b"diagnostic");
+    }
+}
