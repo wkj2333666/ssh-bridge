@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "Task 1 requires quoting functions to return the exact BridgeResult shape"
+)]
+
 use crate::error::{BridgeError, BridgeResult};
 
 pub fn shell_word(value: &str) -> BridgeResult<String> {

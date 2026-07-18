@@ -1,8 +1,9 @@
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use codex_ssh_bridge::config::{Config, Limits};
 use codex_ssh_bridge::error::ErrorCode;
@@ -13,6 +14,51 @@ use proptest::prelude::*;
 use tempfile::{NamedTempFile, TempDir};
 
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvironmentSandbox {
+    _lock: MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvironmentSandbox {
+    fn new(names: &[&'static str]) -> Self {
+        let lock = ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        Self { _lock: lock, saved }
+    }
+
+    fn set(&self, name: &'static str, value: impl AsRef<OsStr>) {
+        // SAFETY: EnvironmentSandbox holds the process-wide test mutex until
+        // drop and all environment-mutating tests use this helper.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    fn remove(&self, name: &'static str) {
+        // SAFETY: EnvironmentSandbox holds the process-wide test mutex until
+        // drop and all environment-mutating tests use this helper.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+impl Drop for EnvironmentSandbox {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            // SAFETY: restoration happens while the process-wide mutex is
+            // still held, including during unwinding from a failed assertion.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
 
 fn write_config(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().unwrap();
@@ -307,7 +353,7 @@ fn config_rejects_zero_over_ceiling_and_over_global_host_overrides() {
 
 #[cfg(unix)]
 #[test]
-fn config_rejects_group_writable_files_and_symlinks() {
+fn config_rejects_unsafe_modes_non_regular_files_and_symlinks() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     let directory = TempDir::new().unwrap();
@@ -316,6 +362,15 @@ fn config_rejects_group_writable_files_and_symlinks() {
     fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o620)).unwrap();
     let mode_error = Config::load(&unsafe_path).unwrap_err();
     assert_eq!(mode_error.code, ErrorCode::InvalidConfig);
+
+    fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o602)).unwrap();
+    let other_write_error = Config::load(&unsafe_path).unwrap_err();
+    assert_eq!(other_write_error.code, ErrorCode::InvalidConfig);
+
+    let non_regular = directory.path().join("directory.toml");
+    fs::create_dir(&non_regular).unwrap();
+    let file_type_error = Config::load(&non_regular).unwrap_err();
+    assert_eq!(file_type_error.code, ErrorCode::InvalidConfig);
 
     let target = directory.path().join("target.toml");
     fs::write(&target, "[hosts]\n").unwrap();
@@ -338,9 +393,86 @@ fn missing_config_is_a_typed_error_and_is_not_created() {
     assert!(!path.exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn config_load_never_reads_a_different_inode_after_security_validation() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    fn exchange(left: &Path, right: &Path) {
+        let left = CString::new(left.as_os_str().as_bytes()).unwrap();
+        let right = CString::new(right.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both C strings are NUL-terminated and remain alive for the
+        // syscall; AT_FDCWD makes their absolute paths self-contained.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                left.as_ptr(),
+                libc::AT_FDCWD,
+                right.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "renameat2 failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let directory = TempDir::new().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let alternate_path = directory.path().join("alternate");
+    let untrusted_path = directory.path().join("untrusted.toml");
+    fs::write(&config_path, "[hosts.safe]\nroot = \"/srv/safe\"\n").unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        &untrusted_path,
+        "[hosts.untrusted]\nroot = \"/srv/untrusted\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&untrusted_path, fs::Permissions::from_mode(0o666)).unwrap();
+    symlink(&untrusted_path, &alternate_path).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(2));
+    let swap_stop = Arc::clone(&stop);
+    let swap_barrier = Arc::clone(&barrier);
+    let swap_config_path = config_path.clone();
+    let swap_alternate_path = alternate_path.clone();
+    let swapper = std::thread::spawn(move || {
+        swap_barrier.wait();
+        while !swap_stop.load(Ordering::Relaxed) {
+            exchange(&swap_config_path, &swap_alternate_path);
+        }
+    });
+
+    barrier.wait();
+    let mut accepted_untrusted_inode = false;
+    for _ in 0..50_000 {
+        if let Ok(config) = Config::load(&config_path)
+            && config.hosts.contains_key("untrusted")
+        {
+            accepted_untrusted_inode = true;
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+
+    assert!(
+        !accepted_untrusted_inode,
+        "Config::load read an inode other than the one whose metadata it validated"
+    );
+}
+
 #[test]
 fn environment_config_path_is_marked_as_trusted_execution_authority_input() {
-    let _environment = ENVIRONMENT_LOCK.lock().unwrap();
+    let environment = EnvironmentSandbox::new(&["CODEX_SSH_BRIDGE_CONFIG"]);
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("config.toml");
     fs::write(&path, "[hosts]\n").unwrap();
@@ -350,21 +482,8 @@ fn environment_config_path_is_marked_as_trusted_execution_authority_input() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    let previous = std::env::var_os("CODEX_SSH_BRIDGE_CONFIG");
-    // SAFETY: this is the only environment-mutating test and the process-wide
-    // mutex remains held until the previous value is restored below.
-    unsafe { std::env::set_var("CODEX_SSH_BRIDGE_CONFIG", &path) };
+    environment.set("CODEX_SSH_BRIDGE_CONFIG", &path);
     let loaded = Config::load_default().unwrap();
-    match previous {
-        Some(value) => {
-            // SAFETY: guarded by ENVIRONMENT_LOCK; see above.
-            unsafe { std::env::set_var("CODEX_SSH_BRIDGE_CONFIG", value) };
-        }
-        None => {
-            // SAFETY: guarded by ENVIRONMENT_LOCK; see above.
-            unsafe { std::env::remove_var("CODEX_SSH_BRIDGE_CONFIG") };
-        }
-    }
 
     assert!(loaded.source.from_environment);
     assert_eq!(loaded.source.path, path);
@@ -379,27 +498,98 @@ fn environment_config_path_is_marked_as_trusted_execution_authority_input() {
     assert!(loaded.config.hosts.is_empty());
 }
 
+#[test]
+fn default_config_path_prefers_xdg_then_falls_back_to_home() {
+    let environment =
+        EnvironmentSandbox::new(&["CODEX_SSH_BRIDGE_CONFIG", "XDG_CONFIG_HOME", "HOME"]);
+    let directory = TempDir::new().unwrap();
+    let xdg = directory.path().join("xdg");
+    let home = directory.path().join("home");
+    let xdg_config = xdg.join("codex-ssh-bridge/config.toml");
+    let home_config = home.join(".config/codex-ssh-bridge/config.toml");
+    fs::create_dir_all(xdg_config.parent().unwrap()).unwrap();
+    fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+    fs::write(&xdg_config, "[hosts.xdg]\nroot = \"/srv/xdg\"\n").unwrap();
+    fs::write(&home_config, "[hosts.home]\nroot = \"/srv/home\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&xdg_config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&home_config, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    environment.remove("CODEX_SSH_BRIDGE_CONFIG");
+    environment.set("HOME", &home);
+    environment.set("XDG_CONFIG_HOME", &xdg);
+    let loaded = Config::load_default().unwrap();
+    assert_eq!(loaded.source.path, xdg_config);
+    assert!(!loaded.source.from_environment);
+    assert_eq!(loaded.source.warning, None);
+    assert!(loaded.config.host("xdg").is_ok());
+
+    environment.remove("XDG_CONFIG_HOME");
+    let loaded = Config::load_default().unwrap();
+    assert_eq!(loaded.source.path, home_config);
+    assert!(!loaded.source.from_environment);
+    assert_eq!(loaded.source.warning, None);
+    assert!(loaded.config.host("home").is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn atomic_save_writes_mode_0600_and_round_trips() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let root = TempDir::new().unwrap();
     let source = write_config(&valid_config(root.path()));
     let config = Config::load(source.path()).unwrap();
     let directory = TempDir::new().unwrap();
     let destination = directory.path().join("saved.toml");
+    let witness = directory.path().join("old-inode-witness");
+    fs::write(&destination, b"original destination bytes").unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&destination, &witness).unwrap();
+    let old_inode = fs::metadata(&witness).unwrap().ino();
 
     config.save_atomic(&destination).unwrap();
 
+    assert_eq!(fs::read(&witness).unwrap(), b"original destination bytes");
+    assert_eq!(fs::metadata(&witness).unwrap().ino(), old_inode);
+    assert_ne!(fs::metadata(&destination).unwrap().ino(), old_inode);
     assert_eq!(
         fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
         0o600
     );
     let loaded = Config::load(&destination).unwrap();
     assert_eq!(loaded, config);
-    let entries: Vec<_> = fs::read_dir(directory.path()).unwrap().collect();
-    assert_eq!(entries.len(), 1);
+    let mut entries: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["old-inode-witness", "saved.toml"]);
+}
+
+#[test]
+fn failed_atomic_save_preserves_destination_and_leaves_no_temporary_file() {
+    let root = TempDir::new().unwrap();
+    let source = write_config(&valid_config(root.path()));
+    let config = Config::load(source.path()).unwrap();
+    let directory = TempDir::new().unwrap();
+    let destination = directory.path().join("existing-directory");
+    let marker = destination.join("marker");
+    fs::create_dir(&destination).unwrap();
+    fs::write(&marker, b"must survive").unwrap();
+
+    assert!(config.save_atomic(&destination).is_err());
+
+    assert!(destination.is_dir());
+    assert_eq!(fs::read(&marker).unwrap(), b"must survive");
+    let entries: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["existing-directory"]);
 }
 
 #[test]
