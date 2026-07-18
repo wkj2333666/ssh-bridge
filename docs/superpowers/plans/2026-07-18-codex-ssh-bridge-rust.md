@@ -462,7 +462,16 @@ git commit -m "feat: add guarded remote patch application"
 
 - [ ] **Step 1: Write failing protocol state and frame tests**
 
-Test valid initialize flow for both supported versions plus JSON-RPC 1.0 rejection, non-object valid JSON (`-32600`), parse error (`-32700`), invalid/null/overlong IDs, requested-version `clientInfo`, unsupported-version bounded-current-union behavior, open capabilities and `_meta`, ping in AwaitInitialized and Ready, tool calls before initialization, duplicated initialize, unknown methods, notifications without responses, exact `DuplicateKey`/`StructuralBudget`/`Syntax` classification, oversized/over-depth/over-node/member/key-byte input rejection before excess allocation, wide-array/object RSS, exact frame minimum/minimum-minus-one, and cancellation read while another tool future is blocked. Add a two-version official golden matrix for initialize/ping/initialized/list/call/cancelled: 2025-06 accepts bounded extra top-level params and ignores/never reflects them; 2025-11 rejects fields outside official method shapes while keeping object `_meta` open; closed tool `arguments` stay closed in both, unnegotiated `task` is rejected, and invalid notifications cause no state/cancellation effect.
+Test valid initialize flow for both supported versions plus JSON-RPC 1.0 rejection, non-object valid JSON (`-32600`), parse error (`-32700`), invalid/null/overlong IDs, requested-version `clientInfo`, unsupported-version bounded-current-union behavior, open capabilities and `_meta`, ping in AwaitInitialized and Ready, tool calls before initialization, duplicated initialize, unknown methods, notifications without responses, exact `DuplicateKey`/`StructuralBudget`/`Syntax` classification, oversized/over-depth/over-node/member/key-byte input rejection before excess allocation, wide-array/object RSS, exact frame minimum/minimum-minus-one, and cancellation read while another tool future is blocked. Add a two-version project-policy golden matrix based on the official methods for initialize/ping/initialized/list/call/cancelled: 2025-06 accepts bounded extra top-level params and ignores/never reflects them; the project's 2025-11 validator rejects fields outside the known official field set while keeping object `_meta` open; closed tool `arguments` stay closed in both, unnegotiated `task` is rejected, and invalid notifications cause no state/cancellation effect.
+
+Split RED/GREEN groups in this order: constructor budgets; envelope and state;
+dispatch/admission; cancellation and buffered races; shutdown and writer. Use
+separate synchronous-invocation and future-first-poll counters, durable
+predicate/semaphore gates, and timeout-wrap every async wait. Cover request-
+only methods without IDs, notification-only methods with IDs, exact duplicate-
+ID priority, future-construction/poll panics, continuously ready notifications,
+clean/partial EOF, writer first-write failure, one-byte writes, forever-pending
+writer, and token-ignoring futures. No sleep is test synchronization.
 
 - [ ] **Step 2: Run protocol tests and verify red**
 
@@ -476,7 +485,49 @@ Read with `AsyncBufReadExt::fill_buf`, scanning for newline while counting bytes
 
 Keep lifecycle state in one owner task. Dispatch valid tool calls into a bounded `JoinSet` and map bounded `RequestId` to cancellation tokens. Serialize all responses through one writer task/channel so JSON lines cannot interleave. On `notifications/cancelled`, cancel immediately without waiting for the tool task and suppress its response.
 
-Negotiate exactly `2025-11-25` and `2025-06-18` from one constant and return server name/version/capabilities. Supported versions validate their requested shape: name/title/version for 2025-06-18 and those plus icons/description/websiteUrl for 2025-11-25. An unsupported version validates the bounded current 2025-11 union before selecting latest; latest-only fields pass there while fields outside the union fail. Use bounded absolute URIs and fixed non-echoing errors. For the six supported methods, negotiated June shapes collect and discard bounded additional top-level params, while November shapes use official closed fields; both keep object `_meta` and client capabilities open. Reject unnegotiated `task` and unknown fields in tool arguments at the tools layer.
+The main select monitors input, tool joins, and the writer join. Writer failure,
+panic/early return, backpressure, and EOF share one Closing transition; it sets
+Closing/rejects dispatch, partial EOF may try-send only `-32700`, then it sets
+global call-response suppression and cancels. Tagged queued call messages not
+yet committed past the writer's final suppression check are skipped; that
+commit is the non-retractable boundary. Task and
+writer cleanup use separate MCP-specific 250 ms graces, then abort and drain
+through another bounded 250 ms grace. Clean EOF succeeds after healthy cleanup;
+partial EOF returns fixed `PROTOCOL_ERROR` after its parse-error response, or
+fixed `MCP transport failed` when that response cannot be queued.
+Invoke `ToolService::call` inside the task and use a
+panic-safe task-ID/request-ID association so construction/poll panics produce
+fixed `-32603` for the correct active ID (or are suppressed after client
+cancellation/Closing) and release the registry entry/slot once.
+
+Classify requests and notifications before side effects. Request-only methods
+without IDs and malformed notifications do nothing; ID-bearing initialized or
+cancelled methods return fixed `-32600` without effect unless their legal ID is
+already in flight, in which case the global duplicate rule wins. Any present
+illegal ID is invalid with `id=null`, never a notification. A duplicate legal outstanding
+ID returns `-32600 Duplicate request id` with `id=null` after envelope/legal-ID
+validation but before lifecycle, params, name, and saturation, never
+overwriting the original. The biased select orders writer result, input, then
+tool completion, so buffered cancellation wins without starving writer faults;
+one `try_join_next_with_id` after every processed frame prevents a notification
+flood from starving completions.
+
+Negotiate exactly `2025-11-25` and `2025-06-18` from one constant and return server name/version/capabilities. Supported versions validate their requested shape: name/title/version for 2025-06-18 and those plus icons/description/websiteUrl for 2025-11-25. An unsupported version validates the bounded current 2025-11 union before selecting latest; latest-only fields pass there while fields outside the union fail. Use bounded absolute URIs and fixed non-echoing errors. For the six supported methods, negotiated June shapes collect and discard bounded additional top-level params, while November applies the project's closed validator to official fields; both keep object `_meta` and client capabilities open. Reject unnegotiated `task` and unknown fields in tool arguments at the tools layer.
+
+Absolute URIs use the conservative dependency-free ASCII RFC 3986 subset:
+valid scheme and nonempty suffix, complete percent escapes, no whitespace,
+controls, backslash, non-ASCII, or forbidden `"<>^` plus grave-accent/`{|}`
+bytes, plus `//` and nonempty authority for
+HTTP(S). For any `//` authority reject userinfo; accept bracketed parsed IPv6,
+parsed IPv4, or bounded DNS-like labels; and allow only an optional decimal
+`u16` port. Reject empty labels/host/port, unbracketed IPv6, and trailing junk.
+Test accepted `https`, `urn`, `data`, IPv4/IPv6/DNS/port forms and rejected
+relative, empty, ambiguous, malformed-authority, and exact/+1 byte cases.
+Cancellation requires bounded
+string/integer `requestId`, admits only optional bounded string reason and
+object `_meta` in November, allows/discards other bounded top-level fields in
+June, and rejects unnegotiated `task` in both. Validate the complete
+cancellation shape before registry lookup.
 
 The strict visitor enforces depth, node, aggregate member, and key-byte budgets, uses one shared failure marker to distinguish duplicate/structural/genuine-syntax errors, and reuses the destination `serde_json::Map` for duplicate detection rather than a second cloned-key set. A malformed tools/call envelope or unknown name is `-32602`; known-tool argument validation returns an actionable normal `isError=true` result and launches no bridge operation.
 

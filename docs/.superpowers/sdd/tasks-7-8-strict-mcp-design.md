@@ -414,6 +414,25 @@ most 256 bytes, sizes has at most 16 strings of at most 32 bytes, and theme is
 `data:`; `websiteUrl` is likewise an absolute URI. The bridge never fetches,
 logs, or reflects either URI.
 
+The implementation uses a conservative dependency-free RFC 3986 subset, not
+browser-style URL normalization. Bounds are checked before syntax. The URI is
+ASCII, contains no whitespace, controls, backslash, or ASCII byte values
+`0x22, 0x3c, 0x3e, 0x5e, 0x60, 0x7b, 0x7c, 0x7d`, starts with
+`[A-Za-z][A-Za-z0-9+.-]*:`, has a nonempty suffix made only from RFC 3986
+unreserved/gen-delim/sub-delim bytes, and uses only complete two-hex-digit
+percent escapes. For HTTP(S), the suffix starts `//`; authority is the bytes
+after it through the first `/`, `?`, `#`, or end and must be nonempty.
+For every `//` authority, userinfo is rejected; bracketed hosts must parse as
+`std::net::Ipv6Addr`; other hosts must parse as IPv4 or be DNS-like labels of
+at most 63 bytes and 253 bytes total with ASCII alphanumeric edges and only
+interior hyphens. A digits-and-dots host must parse as IPv4. Optional ports are
+nonempty decimal `u16`; empty host/label/port, unbracketed IPv6, and trailing
+junk fail. The scanner allocates no normalized URL and performs no resolution.
+This accepts ordinary `https:`, `urn:`, and `data:` absolute URIs while failing
+closed on relative, IRI, ambiguous-backslash, or normalization-dependent input.
+November's closed method-field validator is a project security policy for the
+supported version, not a claim that upstream mechanically enforces closure.
+
 The protocol never copies a serde error containing caller data into a response
 or log. Public errors use fixed messages and stable numeric codes.
 
@@ -449,6 +468,19 @@ serialized byte beyond `max_frame_bytes`, so checking cannot occur after an
 unbounded allocation.
 
 The writer channel capacity and each queued message are bounded.
+The lifecycle owner's main select continuously monitors the writer
+`JoinHandle`. Writer error, panic, or unexpected success while its channel is
+open, reader EOF/partial EOF, and bounded-channel backpressure all enter one
+idempotent Closing transition. It first rejects dispatch; partial EOF alone
+attempts its fixed parse error; then the owner globally suppresses call
+responses and cancels tasks. Writer messages are tagged call/control; queued
+call messages whose write has not committed past the final suppression check
+are discarded after suppression. That atomic check is the non-retractable
+write-start boundary. After the 250 ms MCP task
+grace the owner aborts/drains leftovers through a separate bounded 250 ms
+abort-drain grace, drops the sender, allows the writer to drain, and awaits its own
+250 ms MCP writer grace before abort/drain. Hostile writer error text is never
+reflected; writer/backpressure failure returns fixed `MCP transport failed`.
 `MIN_MCP_FRAME_BYTES` is a compiled 1 MiB lower bound and imports the bridge's
 shared 65,536-byte physical-root ceiling. Root appears inside the TextContent
 inner JSON and that whole string is escaped again by the outer MCP JSON, while
@@ -743,11 +775,41 @@ limit or guesses its own response allowance.
 limit equal to the validated configured global concurrency. Protocol parsing,
 ping, and cancellation do not consume a tool permit.
 
+Request-versus-notification shape is decided before any method side effect.
+`initialize`, `ping`, `tools/list`, and `tools/call` without an ID are ignored
+as invalid notifications with zero state/service effect and no response.
+Any present null, fractional, object/array/bool, or overlong ID is an invalid
+request with fixed `-32600` and `id=null`, never a notification.
+`notifications/initialized` and `notifications/cancelled` carrying a valid
+nonduplicate ID are invalid requests: they receive fixed `-32600 Invalid
+Request` for that ID and have zero state/cancellation effect. A duplicate legal
+ID follows the earlier global duplicate rule. Every malformed notification is
+response-free and side-effect-free.
+
 The lifecycle owner selects between the next input frame and the next joined
 tool completion. It therefore continues reading cancellation notifications
 while calls are blocked. Each accepted `tools/call` inserts exactly one
 request ID and token before spawning. Duplicate in-flight IDs and calls above
 the bound receive fixed errors without spawning a tool future.
+
+Duplicate outstanding IDs receive fixed `-32600`, message
+`Duplicate request id`, and `id=null` to avoid an ambiguous second response for
+the original ID. Validation order is strict JSON and envelope/legal ID,
+duplicate ID globally, lifecycle/method params, known name, then saturation.
+Thus every repeated legal in-flight ID gets the duplicate error regardless of
+the second method/params/name/load. String `"1"` and number `1` are distinct.
+The second request never overwrites the first, consumes no slot, and a later
+cancellation still targets the original. Reuse is allowed after removal.
+
+`ToolService::call` executes inside the spawned task so a panic during future
+construction or polling cannot unwind the owner. A panic-safe task-ID-to-
+request-ID association, such as `JoinSet::join_next_with_id`, recovers the ID
+from every `JoinError`. Every success, error, panic, cancellation, and shutdown
+path removes both associations and releases its owned slot exactly once. While
+the connection remains active and the call was not client-cancelled, a
+recoverable panic produces fixed `-32603` without panic payload; otherwise its
+response is suppressed. An association
+invariant failure closes the connection rather than guessing.
 
 ### 8.3 Cancellation races
 
@@ -765,8 +827,34 @@ removes the entry and discards its response. This ordering handles:
 An unknown, completed, malformed, or initialize-targeting cancellation
 notification is ignored. Its optional reason is neither reflected nor logged.
 
+Cancellation params are an object with required bounded string/integer
+`requestId`, optional at-most-1,024-UTF-8-byte string `reason`, and optional
+open-object `_meta`. Missing/null/fractional/oversized IDs, non-string reasons,
+and non-object params are invalid and side-effect-free. June negotiation
+discards other bounded top-level params; November rejects them. Unnegotiated
+`task` is rejected in both. A cancellation notification always needs
+`requestId`; task-only cancellation is not supported. All fields and version-
+specific closure are validated before any registry lookup or token trigger.
+Reason is borrow-validated in place and never cloned.
+
+The biased select orders writer result first, input second, and tool completion
+third. Writer failure cannot be input-starved, and an already-buffered
+cancellation wins over its simultaneously ready completion. Immediately after
+each handled frame the owner invokes `try_join_next_with_id` at most once and
+processes the result if present, preventing notification floods from starving
+tool cleanup.
+
 On EOF, all tokens are cancelled. The owner continues reaping tasks through a
-bounded cleanup grace and then aborts remaining local tasks. `SshRunner`
+MCP-specific 250 ms task-cleanup grace and then aborts and drains remaining
+local tasks. Closing rejects dispatch; partial EOF may enqueue only its fixed
+parse error; then the global suppression/cancellation phase ensures
+cooperative, uncooperative, panicked, or simultaneously ready completions emit
+nothing. A call line past the writer's suppression-check commit is not
+retractable.
+Clean EOF enqueues nothing and returns success after healthy cleanup. Partial
+EOF returns fixed `PROTOCOL_ERROR`/`partial MCP frame at EOF` after delivering
+its parse error; failure to enqueue that error becomes fixed MCP transport
+failure. `SshRunner`
 remains responsible for terminating process groups and reporting whether a
 remote process may continue.
 
@@ -1039,8 +1127,14 @@ ensure it is installed. The warning never includes the command text.
    `remote_apply_patch`, and `remote_run`.
 9. `remote_output_read` references are opaque, process-scoped, expiring, and
    provenance-checked by the existing output store.
-10. A panic or join failure in one tool task becomes a fixed internal error
-    for that ID and does not corrupt another response line.
+10. A panic or join failure in one active, non-client-cancelled tool task
+    becomes a fixed internal error for that ID; Closing/cancelled responses are
+    suppressed, and neither case corrupts another response line.
+11. Malformed notifications and request-only methods without IDs perform no
+    state transition, cancellation, service invocation, future poll, or remote
+    work.
+12. Closing suppresses all tool responses globally, and writer/task shutdown is
+    bounded, aborted, and drained without reflecting hostile I/O or panic text.
 
 ## 14. Resource and Performance Bounds
 
@@ -1093,7 +1187,8 @@ whole-product acceptance.
 - exact version-specific `clientInfo` fields, bounded absolute URI/icon
   validation, open capabilities, and open `_meta` on every supported method;
 - a six-method golden matrix proving June accepts/discards bounded extra
-  top-level params while November keeps official method fields closed, with
+  top-level params while November applies the project's closed validator to
+  the official method fields, with
   closed tool arguments and rejected unnegotiated `task` in both;
 - supported 2025-06 rejecting latest-only fields, supported 2025-11 accepting
   them, and an unsupported version accepting the bounded latest union while
@@ -1120,14 +1215,27 @@ whole-product acceptance.
 ### 15.2 Concurrency and cancellation
 
 - a blocked tool while ping and cancellation remain responsive;
+- separate synchronous invocation and first-poll counters proving rejected
+  calls consume no service invocation or admission slot;
+- request-only methods without IDs and notification-only methods with IDs
+  producing zero side effect;
 - string/numeric cancellation identity, unknown/duplicate/late cancellation,
-  and completion races;
+  malformed/versioned cancellation shapes, and buffered completion races;
+- exact duplicate-ID response and priority versus malformed params, unknown
+  name, and saturation, with string/number identity kept distinct;
 - suppression of a notification-cancelled call's response;
 - propagation of the exact cancellation token and `WireBudget` through
   `ToolCallContext` into validation, dispatch, and render tests;
-- EOF cancellation and bounded task cleanup;
+- future-construction/first-poll/later panic recovery by task ID with one-time
+  registry and slot cleanup;
+- EOF global suppression, writer failure/backpressure monitoring, and bounded
+  MCP-specific task/writer cleanup, including token-ignoring futures;
 - in-flight saturation without unbounded task creation; and
-- concurrent responses completing out of request order without interleaving.
+- concurrent responses completing out of request order without interleaving;
+- buffered-cancel priority plus one `try_join_next_with_id` after every handled
+  frame, preventing notification starvation; and
+- every async wait protected by a timeout and durable predicate/semaphore gates
+  rather than sleeps or lossy `Notify` events.
 
 ### 15.3 Schemas and bridge boundary
 

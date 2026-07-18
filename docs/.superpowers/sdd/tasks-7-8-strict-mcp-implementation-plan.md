@@ -999,18 +999,24 @@ git commit -m "feat: add bounded MCP stdio framing"
 - Consumes: strict frames, protocol constructors, `ToolService`, `CancellationToken`, and capped output.
 - Produces: `McpServer<S>::new`, `McpServer<S>::serve<R, W>`, exact lifecycle transitions, bounded in-flight calls, response suppression after MCP cancellation, and orderly EOF.
 
-- [ ] **Step 1: Add a deterministic stub service**
+- [ ] **Step 1: Add a deterministic, separately instrumented stub service**
 
 In `tests/mcp_protocol.rs` define a service whose `block` call waits on a
-`Notify` and records token cancellation, whose `echo` call returns one text
-block, and whose call counter proves admission:
+durable semaphore gate and records token cancellation, whose `echo` call
+returns one text block, and whose two counters distinguish synchronous service
+invocation from future polling:
 
 ```rust
 #[derive(Clone)]
 struct StubTools {
     definitions: Arc<Vec<ToolDefinition>>,
-    calls: Arc<AtomicUsize>,
-    cancelled: Arc<Notify>,
+    synchronous_calls: Arc<AtomicUsize>,
+    first_polls: Arc<AtomicUsize>,
+    observed_cancel: Arc<AtomicBool>,
+    entered: Arc<AtomicBool>,
+    entered_notify: Arc<Notify>,
+    release: Arc<Semaphore>,
+    contexts: Arc<Mutex<Vec<ToolCallContext>>>,
 }
 
 impl ToolService for StubTools {
@@ -1024,14 +1030,28 @@ impl ToolService for StubTools {
         arguments: serde_json::Value,
         context: ToolCallContext,
     ) -> ToolFuture {
-        let calls = Arc::clone(&self.calls);
-        let cancelled = Arc::clone(&self.cancelled);
+        self.synchronous_calls.fetch_add(1, Ordering::SeqCst);
+        let first_polls = Arc::clone(&self.first_polls);
+        let observed_cancel = Arc::clone(&self.observed_cancel);
+        let entered = Arc::clone(&self.entered);
+        let entered_notify = Arc::clone(&self.entered_notify);
+        let release = Arc::clone(&self.release);
+        let contexts = Arc::clone(&self.contexts);
         Box::pin(async move {
-            calls.fetch_add(1, Ordering::SeqCst);
+            first_polls.fetch_add(1, Ordering::SeqCst);
+            contexts.lock().await.push(context.clone());
+            entered.store(true, Ordering::Release);
+            entered_notify.notify_waiters();
             if name == "block" {
-                context.cancel.cancelled().await;
-                cancelled.notify_waiters();
-                return CallToolResult::text("cancelled internally");
+                tokio::select! {
+                    () = context.cancel.cancelled() => {
+                        observed_cancel.store(true, Ordering::SeqCst);
+                        return CallToolResult::text("cancelled internally");
+                    }
+                    permit = release.acquire() => {
+                        permit.expect("test release semaphore remains open").forget();
+                    }
+                }
             }
             if name == "echo" {
                 return match arguments.get("text").and_then(Value::as_str) {
@@ -1049,10 +1069,99 @@ impl ToolService for StubTools {
 
 Use exact closed test definitions for `block` and `echo`; do not use the final
 nine-tool registry in protocol-core tests.
-Record the received `ToolCallContext` in the stub and assert the exact token is
-cancelled and the exact per-ID `WireBudget` reaches the future unchanged.
+The synchronous counter records `ToolService::call`; the first-poll counter
+records actual future admission. Separate gates prove whether a future was
+only constructed or also consumed a slot and was first polled. Record the
+received `ToolCallContext`, compare both `WireBudget` fields exactly, cancel
+the recorded token from the test and observe the service's clone, then cancel
+through MCP and observe the recorded clone. These two directions prove shared
+token semantics rather than only equal initial state.
 
-- [ ] **Step 2: Add failing lifecycle tests**
+Every async test and every wait for a response, `Notify`, join, or EOF uses
+`tokio::time::timeout`: five seconds around each complete test and one second
+around focused events. The entered waiter loops over the durable
+`AtomicBool::load(Ordering::Acquire)` predicate and a pre-created
+`Notify::notified()` future, so `notify_waiters` cannot lose the event. Release
+uses a semaphore permit, which is also durable. Use these gates, never an
+unbounded wait or a sleep as synchronization; Task 5 does not add Tokio's
+`test-util` feature.
+
+- [ ] **Step 2: Add RED constructor and fixed-response budget tests**
+
+Counting-serialize initialize, ping, every fixed protocol error, and
+tools/list with the synthetic maximum wire ID. Also cover scalar, batch, null,
+fractional, and overlong IDs plus extra JSON-RPC envelope keys. With the stub
+definitions and the Task 5 result-only fallback exactly zero, assert:
+
+- `McpServer::new(service, required, max_inflight)` succeeds at the exact
+  service-specific requirement;
+- required-minus-one and `crate::MAX_FRAME_BYTES + 1` fail with fixed
+  `BridgeError::invalid_argument` messages containing no ID, definition, or
+  serde text;
+- nominal 1 MiB succeeds whenever the exact tools/list frame fits it; and
+- a nonzero direct calculator case proves `required_mcp_frame_bytes` and every
+  `WireBudget::for_response` use the same unmodified result-only byte count.
+
+Run `cargo test --test mcp_protocol task7_constructor_ -- --nocapture` and
+observe the expected compile failure because `McpServer` is absent.
+
+- [ ] **Step 3: GREEN the constructor from the one fallback source**
+
+Define:
+
+```rust
+pub struct McpServer<S> {
+    service: Arc<S>,
+    max_frame_bytes: usize,
+    max_inflight: usize,
+    compact_fallback_result_bytes: usize,
+}
+
+impl<S: ToolService> McpServer<S> {
+    pub fn new(
+        service: Arc<S>,
+        max_frame_bytes: usize,
+        max_inflight: usize,
+    ) -> BridgeResult<Self> {
+        let compact_fallback_result_bytes = 0;
+        let synthetic_id = RequestId::synthetic_max_wire();
+        let required = required_mcp_frame_bytes(
+            service.definitions(),
+            compact_fallback_result_bytes,
+            &synthetic_id,
+        )
+        .map_err(|_| {
+            BridgeError::invalid_argument("MCP response budget is invalid")
+        })?;
+        if max_frame_bytes < required || max_frame_bytes > crate::MAX_FRAME_BYTES {
+            return Err(BridgeError::invalid_argument("MCP frame bound is invalid"));
+        }
+        if max_inflight == 0 || max_inflight > 32 {
+            return Err(BridgeError::invalid_argument("MCP in-flight bound is invalid"));
+        }
+        Ok(Self {
+            service,
+            max_frame_bytes,
+            max_inflight,
+            compact_fallback_result_bytes,
+        })
+    }
+}
+```
+
+Pass the synthetic request ID by reference and never clone or reconstruct it
+inside a calculator. Map the counting helper's error to the fixed
+`BridgeError::invalid_argument("MCP response budget is invalid")`; do not
+propagate serde text. Validate
+`required <= max_frame_bytes <= crate::MAX_FRAME_BYTES` and
+`1 <= max_inflight <= 32` with fixed non-echoing invalid-argument errors.
+
+`compact_fallback_result_bytes` is the only stored fallback count. Task 5 sets
+it to zero exactly once; Task 7 changes only that initializer to
+`maximum_compact_fallback_result_bytes()`. Never pass `MIN_MCP_FRAME_BYTES` as
+this result-only value. Rerun `task7_constructor_` to GREEN before continuing.
+
+- [ ] **Step 4: Add RED envelope, request/notification, and lifecycle tests**
 
 Create an in-memory helper around `tokio::io::duplex` that writes compact
 frames and reads complete response lines. Cover:
@@ -1067,11 +1176,13 @@ frames and reads complete response lines. Cover:
 - optional open-object `_meta` values on initialize, ping,
   notifications/initialized, tools/list, tools/call, and
   notifications/cancelled are accepted and ignored; non-object `_meta` fails;
-- a versioned official golden matrix for initialize/ping/initialized/list/call/
+- a versioned project-policy golden matrix based on the official methods for
+  initialize/ping/initialized/list/call/
   cancelled: 2025-06 accepts, ignores, and never reflects additional bounded
-  top-level params extensions; 2025-11 rejects fields outside each method's
-  schema, and invalid initialized/cancelled notifications cause no state/cancel
-  effect; `task` is rejected because tasks were not negotiated;
+  top-level params extensions; the project's 2025-11 validator rejects fields
+  outside each method's known official field set, and invalid initialized/
+  cancelled notifications cause no state/cancel effect; `task` is rejected
+  because tasks were not negotiated;
 - capabilities is an open object; for `2025-06-18`, clientInfo accepts exactly
   required name/version plus optional title; for `2025-11-25`, it additionally
   accepts icons/description/websiteUrl, with bounded strings/icon count and
@@ -1094,8 +1205,18 @@ frames and reads complete response lines. Cover:
   actionable `isError=true` result and performs no bridge/remote work;
 - unknown request method versus unknown notification;
 - notifications producing no response;
-- duplicate in-flight string/numeric IDs; and
-- responses completing out of request order with exact IDs.
+- request-only `initialize`, `ping`, `tools/list`, and `tools/call` without an
+  ID producing no response, state transition, synchronous service invocation,
+  or future poll;
+- any envelope where `id` is present but null, fractional, object/array/bool,
+  or overlong producing fixed `-32600 Invalid Request` with `id=null`, never
+  being reclassified as a notification;
+- notification-only `notifications/initialized` and
+  `notifications/cancelled` with a valid nonduplicate ID returning fixed
+  `-32600 Invalid Request` for that ID and producing no state/cancellation
+  effect (a duplicate legal ID follows the earlier global duplicate rule);
+- invalid params container types and extra JSON-RPC envelope keys; and
+- validation failures leaving the service counters and registry at zero.
 
 This Task 5 suite also counting-serializes initialize, ping, and every fixed
 protocol error with the maximum wire ID and proves each fits the compiled
@@ -1114,7 +1235,117 @@ The initialize frame used by all positive tests is:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1"}}}
 ```
 
-- [ ] **Step 3: Add failing cancellation and saturation tests**
+Run `cargo test --test mcp_protocol task7_lifecycle_ -- --nocapture` and expect
+failures from absent envelope/state behavior, not fixture timeouts.
+
+- [ ] **Step 5: GREEN strict envelopes and lifecycle state transitions**
+
+Classify request versus notification before method side effects. A request has
+a present `id`; a notification has no `id`. Validate a present ID immediately:
+only bounded string/integer IDs are legal, while every invalid present ID gets
+fixed `-32600` with `id=null` and is never notification-shaped. Request-only
+methods received as notifications are ignored with zero effect. Notification-
+only methods received as nonduplicate requests return the fixed invalid-request
+response for their trusted ID and have zero effect. A duplicate legal ID is
+handled earlier by the global duplicate rule. Malformed notifications never emit
+a response and never change state, cancel a token, invoke the service, or poll
+a future. Malformed requests with a trusted ID receive the method-appropriate
+fixed error.
+
+Validate the JSON-RPC envelope and method params before changing state. Only
+after a valid initialize response is accepted by the bounded writer channel
+does state advance to `AwaitInitialized`; only a valid ID-less initialized
+notification advances to `Ready`. Run `task7_lifecycle_` to GREEN before adding
+dispatch.
+
+Use a dependency-free conservative absolute-URI validator. Validate the UTF-8
+byte ceiling first; require ASCII only; reject whitespace, controls, backslash,
+and ASCII byte values `0x22, 0x3c, 0x3e, 0x5e, 0x60, 0x7b, 0x7c, 0x7d`
+(`"`, `<`, `>`, `^`, grave accent, `{`, `|`, `}`); require a scheme matching
+`[A-Za-z][A-Za-z0-9+.-]*`, a colon, and a
+nonempty suffix; admit only RFC 3986 unreserved, gen-delim, and sub-delim bytes
+after the colon; and require each percent sign to have exactly two hexadecimal
+digits. For `http` and `https`, require the suffix to begin `//`; define
+authority as the bytes after `//` through the first `/`, `?`, `#`, or end, and
+require that slice to be nonempty. For any URI with `//`, reject userinfo;
+validate a bracketed host by parsing its interior with
+`std::net::Ipv6Addr`; otherwise accept `std::net::Ipv4Addr` or a DNS-like host
+of nonempty at-most-63-byte labels containing only ASCII alphanumeric or
+interior `-`, with no leading/trailing `-` and total host length at most 253.
+If a dotted host contains only digits and dots, require successful IPv4 parse
+rather than accepting it as DNS-like text.
+An optional port follows the host as `:` plus one or more ASCII digits and must
+parse as `u16`; unbracketed IPv6, empty labels/host/port, and trailing authority
+junk are rejected. This scanner allocates no normalized URL and performs no
+name resolution. Tests
+accept `https://example.test/a`, `urn:example:test`, and `data:,hello`; reject a
+relative path, empty scheme/suffix, whitespace, control, backslash, non-ASCII,
+each explicitly forbidden ASCII byte, malformed percent escape, and empty
+HTTP(S) authority, userinfo, malformed IPv4/IPv6, empty/invalid DNS label,
+nonnumeric/empty/out-of-range port, and authority trailing junk at exact and +1
+byte bounds. Add accepted bracketed IPv6, IPv4, DNS, and port cases. No URI is
+fetched, reflected, or logged. November's method-field closure is an explicit project security
+policy layered on the supported protocol version, not a claim that the upstream
+schema mechanically enforces closure.
+
+- [ ] **Step 6: Add RED dispatch, duplicate-ID, saturation, panic, and ordering tests**
+
+Start two gated calls and prove responses may complete out of request order
+with exact IDs and without line interleaving. With `max_inflight=2`, submit a
+third valid unique known-name request and assert fixed `-32000 Server busy`,
+`synchronous_calls == 2`, and `first_polls == 2`.
+
+Freeze duplicate in-flight ID as exactly:
+
+```json
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Duplicate request id"}}
+```
+
+Numeric `1` and string `"1"` remain distinct. Validation priority is: strict
+JSON and envelope/legal ID; duplicate outstanding ID globally; lifecycle and
+method-params shape; known tool-name lookup; then saturation. Any repeated
+legal in-flight ID therefore gets the duplicate error with `id=null`, even if
+the second envelope has illegal params, is not currently lifecycle-valid, has
+an unknown name, or arrives while saturated. Null/fractional/object/oversized
+IDs are not legal duplicates: they receive fixed `-32600 Invalid Request` with
+`id=null`. The duplicate consumes no new slot, never calls or polls the service,
+never overwrites the original registry entry, and later cancellation still
+reaches the original call. Reuse is allowed only after the original has been
+fully removed on completion.
+
+Add services that panic synchronously inside `ToolService::call`, on first
+future poll, and after first poll. Assert one fixed `-32603 Internal error` for
+the correct request, no panic payload or caller data in the wire response or
+returned `BridgeError`, one-time
+registry/slot release, continued service for other requests, and an empty
+registry after every success, error, panic, cancellation, and close. Verify
+this group RED with:
+
+```bash
+cargo test --test mcp_protocol task7_dispatch_ -- --nocapture
+cargo test --test mcp_protocol task7_inflight_ -- --nocapture
+cargo test --test mcp_protocol task7_panic_ -- --nocapture
+```
+
+Expected: failures identify missing dispatch/admission/panic behavior, not a
+fixture timeout.
+
+- [ ] **Step 7: GREEN bounded panic-safe dispatch and admission**
+
+Call `service.call(...)` inside the spawned task so future-construction and
+poll panics both become `JoinError` instead of unwinding the owner. Maintain a
+task-ID-to-request-ID map driven by `JoinSet::join_next_with_id`, or an exactly
+equivalent panic-safe association, in addition to the request registry. Insert
+the registry entry and `try_acquire_owned` its permit before spawn; associate the
+returned task ID immediately. Every join path removes both maps and drops the
+permit exactly once. A missing association is an internal invariant failure
+that enters Closing rather than guessing an ID.
+
+Use the one stored fallback count for exact per-ID `WireBudget`; pass both
+fields and the token unchanged in `ToolCallContext`. Run `task7_dispatch_`,
+`task7_inflight_`, and `task7_panic_` to GREEN.
+
+- [ ] **Step 8: Add RED cancellation-shape, race, and fairness tests**
 
 Send a `block` call with ID `"job"` followed by:
 
@@ -1126,91 +1357,28 @@ Assert the stub observes cancellation, no response for `"job"` is written, and
 a following ping still succeeds. Repeat for numeric ID, unknown ID, duplicate
 cancel, late cancel, malformed params, and a cancellation targeting initialize.
 
-Construct the server with `max_inflight=2`, start two blocked calls, and submit
-a third. Assert the third receives `-32000` and `calls == 2`.
+Explicitly test missing/null/fractional/oversized `requestId`, a non-string or
+over-1,024-byte `reason`, non-object params, and an ID-bearing cancelled method.
+After June negotiation, extra bounded top-level cancellation params are
+ignored; after November negotiation they are rejected. In both versions,
+`requestId` is required, `reason` is optional bounded UTF-8 text, `_meta` is an
+optional open object, and unnegotiated `task` is rejected. Invalid
+notifications produce no response and no cancellation effect. The reason is
+borrow-validated in place, never cloned, reflected, or logged. Fully validate
+requestId, reason, `_meta`, version-
+specific unknown fields, and `task` before looking up any registry entry or
+triggering any token.
 
-- [ ] **Step 4: Run lifecycle tests and verify RED**
+For the hard race, make the tool completion and cancellation frame both
+already buffered/ready before the owner polls either. Assert cancellation wins,
+the call response is suppressed, and registry/slot are released. Then stream a
+bounded sequence of continuously ready notifications while one completion is
+ready and prove the completion is reaped within a fixed number of owner
+iterations. Run
+`cargo test --test mcp_protocol task7_cancellation_ -- --nocapture` and verify
+RED from missing shape/race behavior, not a timeout.
 
-Run:
-
-```bash
-cargo test --test mcp_protocol task7_lifecycle_ -- --nocapture
-cargo test --test mcp_protocol task7_cancellation_ -- --nocapture
-cargo test --test mcp_protocol task7_inflight_ -- --nocapture
-```
-
-Expected: compilation fails because `McpServer` and its lifecycle owner are absent.
-
-- [ ] **Step 5: Implement server construction and writer ownership**
-
-Define:
-
-```rust
-pub struct McpServer<S> {
-    service: Arc<S>,
-    max_frame_bytes: usize,
-    max_inflight: usize,
-    compact_fallback_result_bytes: usize,
-}
-
-impl<S: ToolService> McpServer<S> {
-    pub fn new(
-        service: Arc<S>,
-        max_frame_bytes: usize,
-        max_inflight: usize,
-    ) -> BridgeResult<Self> {
-        // Task 5 has no tool-result renderer. Task 7 replaces this initializer
-        // with maximum_compact_fallback_result_bytes().
-        let compact_fallback_result_bytes = 0;
-        let required_frame_bytes = required_mcp_frame_bytes(
-            service.definitions(),
-            compact_fallback_result_bytes,
-            &RequestId::synthetic_max_wire(),
-        )?;
-        if max_frame_bytes < required_frame_bytes
-            || max_frame_bytes > crate::MAX_FRAME_BYTES
-        {
-            return Err(BridgeError::invalid_argument("MCP frame bound is invalid"));
-        }
-        if max_inflight == 0 || max_inflight > 32 {
-            return Err(BridgeError::invalid_argument("MCP in-flight bound is invalid"));
-        }
-        Ok(Self {
-            service,
-            max_frame_bytes,
-            max_inflight,
-            compact_fallback_result_bytes,
-        })
-    }
-}
-```
-
-`required_mcp_frame_bytes` counting-serializes the exact full tools/list
-response using the trusted service definitions and a synthetic request ID whose
-compact wire representation is exactly 256 bytes, then takes the maximum with
-the compiled 1 MiB complete-frame minimum and the JSON-RPC envelope plus its
-result-only compact-fallback argument. Task 5 passes zero because the real tool
-fallback does not exist yet; passing `MIN_MCP_FRAME_BYTES` here would be wrong
-because it is a complete-frame floor, not a result size. Task 7 replaces zero
-with the counting-serialized real largest fallback result. It allocates no
-unbounded output. Tests call
-the same helper and prove exact minimum succeeds and minimum-minus-one fails.
-
-`serve<R, W>` accepts `R: AsyncRead + Unpin + Send + 'static` and
-`W: AsyncWrite + Unpin + Send + 'static`. It wraps the reader in
-`BufReader`/`FrameReader` and spawns one writer task with a channel capacity of
-`max_inflight + 8`. The owner uses `try_send`; if the writer is backpressured
-beyond that bound, it enters Closing, cancels all calls, and returns a fixed
-I/O error instead of waiting and becoming unable to read cancellation.
-
-The writer serializes each already budgeted response through
-`serialize_json_line` and writes with `write_all`. A pre-dispatch/internal
-failure may use its preconstructed fixed `-32603`, but writer overflow must not
-replace a completed tool result, especially mutation truth. Unexpected overflow
-of such a response closes the connection without a partial line; renderer tests
-must make that path unreachable for valid bounded results.
-
-- [ ] **Step 6: Implement lifecycle validation and concurrent calls**
+- [ ] **Step 9: GREEN cancellation races with bounded notification fairness**
 
 Maintain:
 
@@ -1226,9 +1394,16 @@ struct CompletedCall {
 }
 ```
 
-The owner uses a biased `tokio::select!` with the input frame branch before
-`JoinSet::join_next` so an already-buffered cancellation is observed before a
-simultaneously ready completion. Handle methods exactly:
+Use a biased select ordered writer-result first, input second, and tool
+completion third. The writer can therefore never be starved by input, while
+input still wins over a simultaneously ready tool completion. Immediately
+after every processed input
+frame, call `try_join_next_with_id` at most once and process that completion if
+present before selecting the next frame. This exact one-frame/one-try-reap rule
+preserves cancel-wins and prevents a continuously ready notification stream
+from starving completion cleanup.
+
+Handle methods exactly:
 
 - `initialize` only in AwaitInitialize;
 - `notifications/initialized` only in AwaitInitialized;
@@ -1240,7 +1415,8 @@ simultaneously ready completion. Handle methods exactly:
 Select a protocol-shape validator. After supported 2025-06 negotiation, all six
 supported method params validate required standard fields but collect/discard
 additional top-level extension entries; they are never reflected or logged.
-After 2025-11 negotiation, use closed method-specific params at official fields.
+After 2025-11 negotiation, apply the project's closed validator to the official
+method fields.
 For initialize, inspect requested `protocolVersion` from the already strict
 Value: supported versions select their matching shape, while unsupported uses
 the bounded closed current-2025-11 union before latest selection. `_meta` and
@@ -1254,15 +1430,16 @@ Validate `tools/call.params` as containing required string `name`, object
 `arguments` defaulting to `{}`. Its `arguments` object and nested tagged inputs
 remain closed in both versions. Other top-level params follow June-open versus
 November-closed rules. Reject unnegotiated `task` fields.
-Reject an unknown name before spawn by checking `service.definitions()`.
+Reject an unknown name before spawn by checking `service.definitions()` after
+the duplicate-ID check and before saturation.
 Compute `WireBudget::for_response(self.max_frame_bytes, &id,
 self.compact_fallback_result_bytes)` for that exact request ID and construct
 `ToolCallContext { cancel: token.clone(), wire_budget }`. Insert the ID/token
-before spawning and pass the context to `service.call`. On completion remove
-the entry, suppress
-output if `cancelled_by_client`, and return the `CallToolResult` as the JSON-RPC
-result. Known-tool argument validation therefore stays inside the normal result
-channel; only envelope/name validation can produce `-32602`.
+before spawning and invoke `service.call` only inside the task. On completion,
+remove the task association and entry, release the slot, suppress output if
+`cancelled_by_client`, otherwise return the `CallToolResult` as the JSON-RPC
+result. Known-tool argument validation stays inside the normal result channel;
+only envelope/name validation can produce `-32602`.
 
 Validate version-specific `clientInfo` before changing state. Supported
 versions use their requested schema. An unsupported version uses the bounded
@@ -1272,30 +1449,132 @@ Initialize instructions explicitly warn that cancellation of a mutating call
 may leave partial/unknown effects and tell the client to inspect rather than
 blindly retry.
 
-- [ ] **Step 7: Implement cancellation and EOF cleanup**
+Rerun `cargo test --test mcp_protocol task7_cancellation_ -- --nocapture` to
+GREEN before adding shutdown behavior.
+
+- [ ] **Step 10: Add RED EOF, writer-failure, backpressure, and shutdown tests**
+
+Use writer fixtures that fail the first write, write only one byte per poll,
+and remain pending forever. Monitor the writer task in the owner's main select,
+not only during final shutdown. Test clean EOF, partial EOF, queue saturation,
+writer early return, writer panic, and a writer that never completes. For each,
+cover cooperative cancellation, a future that ignores its token, and a tool
+completion already ready in the `JoinSet` when Closing begins.
+
+Freeze these assertions:
+
+- entering Closing first rejects dispatch; partial EOF then attempts only fixed
+  `-32700` with `id=null`; next the owner sets one global
+  `suppress_call_responses` flag and cancels every token; no completion, panic
+  conversion, or not-yet-started queued call result is sent afterward; a line
+  whose writer already committed past its final suppression check is not
+  retractable; clean EOF queues nothing;
+- writer failure/backpressure sends no replacement to the broken writer,
+  exposes no hostile `io::Error` text, and returns only fixed local
+  `BridgeError::io("MCP transport failed")`;
+- complete JSON lines never interleave, including with the one-byte writer; and
+- all registries are empty and all slots are released after shutdown.
+
+Use MCP-specific constants, not SSH process constants:
+
+```rust
+const MCP_TASK_CLEANUP_GRACE: Duration = Duration::from_millis(250);
+const MCP_ABORT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const MCP_WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+```
+
+With durable gates and outer timeouts, prove cooperative tasks reap before the
+task grace; token-ignoring tasks are aborted no later than the grace plus a
+small scheduler allowance and drained within the abort-drain grace; and a
+pending writer is likewise aborted and drained within that bound. The test
+never sleeps for synchronization and does not require Tokio paused time. Run:
+
+```bash
+cargo test --test mcp_protocol task7_writer_ -- --nocapture
+cargo test --test mcp_protocol task7_eof_ -- --nocapture
+```
+
+Expected: failures show absent writer monitoring/cleanup/suppression, and the
+outer timeout still terminates every fixture.
+
+- [ ] **Step 11: GREEN one-owner Closing and bounded writer/task cleanup**
+
+`serve<R, W>` accepts `R: AsyncRead + Unpin + Send + 'static` and
+`W: AsyncWrite + Unpin + Send + 'static`. It wraps the reader in
+`BufReader`/`FrameReader`, spawns one writer task, and gives it the only stdout
+handle. The channel capacity is `max_inflight + 8`; `try_send` ensures the
+owner never waits for stdout while cancellation input is pending.
+
+The main select simultaneously monitors input, tool joins, and the writer
+`JoinHandle`. Writer error, panic, or unexpected success while the channel is
+open enters Closing immediately. Reader EOF/partial EOF and `try_send` full or
+closed use the same idempotent transition. The exact sequence is: set Closing
+and reject dispatch; on partial EOF only, `try_send` its fixed parse error;
+set global call-response suppression and cancel every token; reap through
+`MCP_TASK_CLEANUP_GRACE`; abort leftovers and drain only through
+`MCP_ABORT_DRAIN_GRACE`; drop the last sender so a
+healthy writer drains and shuts down; await its join through
+`MCP_WRITER_SHUTDOWN_GRACE`; then abort and drain it only through
+`MCP_ABORT_DRAIN_GRACE` if needed; and return only the fixed MCP transport
+failure for writer/backpressure faults.
+
+Store the writer handle as `Option<JoinHandle<_>>`. If the main select observes
+it first, take it and retain only its sanitized success/failure outcome; the
+shutdown path must not poll a completed handle twice. If it is still present
+after the sender is dropped, the writer drains the channel, calls
+`AsyncWriteExt::shutdown`, and is awaited through the writer grace.
+
+The writer serializes already budgeted responses through `serialize_json_line`
+and `write_all`. Channel messages are tagged `CallResponse` or `Control`; before
+starting each queued `CallResponse`, the writer checks the shared suppression
+flag and discards it when Closing has reached suppression. Define the
+non-retractable write start as the instant this check atomically commits to
+false for the dequeued message. A line past that commit cannot be retracted;
+the EOF race test therefore
+targets a completion simultaneously ready in the owner, which is never queued.
+Overflow closes the connection without a partial serialized line; the writer
+invents no semantic fallback. Every tool join/abort path removes both
+associations and releases slots exactly once.
 
 For a valid cancellation, find the exact ID, set `cancelled_by_client=true`,
 and call `cancel.cancel()`. Ignore unknown/completed/malformed IDs and reasons.
 Do not cancel initialize.
 
-On clean or partial EOF, set Closing, cancel all tokens, reap completed tasks
-for the existing process-cleanup grace, then `abort_all` and drain join
-results. Close the writer channel and await its task. Clean EOF with no
-in-flight calls returns success; partial EOF first queues `-32700` with
-`id=null`.
+Clean EOF with no in-flight calls and a healthy writer returns success. If the
+partial-EOF parse-error `try_send` succeeds, finish cleanup and return fixed
+`BridgeError::new(ErrorCode::ProtocolError, "partial MCP frame at EOF", false)`.
+If that send fails, record transport failure and return the fixed MCP transport
+error after cleanup.
+Completion already ready at either EOF is globally suppressed once the
+transition reaches its cancel/suppress phase.
 
-- [ ] **Step 8: Run all protocol-core tests**
+Rerun `task7_writer_` and `task7_eof_` to GREEN before the complete suite.
+
+- [ ] **Step 12: Run all protocol-core tests and invariant searches**
 
 Run:
 
 ```bash
+cargo test --test mcp_protocol task7_constructor_ -- --nocapture
+cargo test --test mcp_protocol task7_lifecycle_ -- --nocapture
+cargo test --test mcp_protocol task7_dispatch_ -- --nocapture
+cargo test --test mcp_protocol task7_inflight_ -- --nocapture
+cargo test --test mcp_protocol task7_panic_ -- --nocapture
+cargo test --test mcp_protocol task7_cancellation_ -- --nocapture
+cargo test --test mcp_protocol task7_writer_ -- --nocapture
+cargo test --test mcp_protocol task7_eof_ -- --nocapture
 cargo test --test mcp_protocol -- --nocapture
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+rg -n 'tokio::spawn|JoinSet|join_next_with_id|suppress_call_responses|MCP_TASK_CLEANUP_GRACE|MCP_WRITER_SHUTDOWN_GRACE' src/mcp tests/mcp_protocol.rs
 ```
 
 Expected: lifecycle, version, strict-shape, framing, concurrency, cancellation,
-writer, and EOF tests pass with no response for a client-cancelled call.
+writer, and EOF tests pass; the registry is empty on every terminal path; the
+writer join is monitored in the owner select; and no client-cancelled or
+Closing-suppressed call response is written.
 
-- [ ] **Step 9: Commit the protocol core**
+- [ ] **Step 13: Commit the protocol core**
 
 ```bash
 git add src/mcp/mod.rs src/mcp/protocol.rs tests/mcp_protocol.rs

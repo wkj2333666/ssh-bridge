@@ -259,11 +259,58 @@ Default protocol limits are an 8 MiB JSON-RPC frame, 256 KiB file chunk, 1 MiB m
 
 ## 12. Protocol and Error Model
 
-The MCP server implements a strict JSON-RPC 2.0 state machine for versions `2025-11-25` and `2025-06-18`, initialization, initialized notification, ping, tool listing, tool calls, cancellation, and orderly shutdown. Ping is valid after initialize while awaiting initialized and in Ready. Supported versions validate their requested `clientInfo` schema (`name/title/version` for 2025-06-18; those plus `icons/description/websiteUrl` for 2025-11-25). An unsupported version validates the bounded current 2025-11 union before the server selects the latest version; latest-only fields are accepted there, but fields outside the union are rejected. For initialize/ping/initialized/list/call/cancelled, negotiated 2025-06 accepts bounded additional top-level params, discards them, and never reflects them; negotiated 2025-11 uses the official closed method fields while retaining open object `_meta`. Tool `arguments` and nested tagged inputs remain closed in both versions, and an unnegotiated `task` field is rejected. A two-version golden matrix covers all six methods and proves invalid notifications have no state/cancellation effect. URI/string bounds, request/notification shape, ID type/size, lifecycle state, and tool schemas are validated. Client capabilities remain open objects.
+The MCP server implements a strict JSON-RPC 2.0 state machine for versions `2025-11-25` and `2025-06-18`, initialization, initialized notification, ping, tool listing, tool calls, cancellation, and orderly shutdown. Ping is valid after initialize while awaiting initialized and in Ready. Supported versions validate their requested `clientInfo` schema (`name/title/version` for 2025-06-18; those plus `icons/description/websiteUrl` for 2025-11-25). An unsupported version validates the bounded current 2025-11 union before the server selects the latest version; latest-only fields are accepted there, but fields outside the union are rejected. For initialize/ping/initialized/list/call/cancelled, negotiated 2025-06 accepts bounded additional top-level params, discards them, and never reflects them; negotiated 2025-11 applies the project's closed validator to the official method fields while retaining open object `_meta`. Tool `arguments` and nested tagged inputs remain closed in both versions, and an unnegotiated `task` field is rejected. A two-version golden matrix covers all six methods and proves invalid notifications have no state/cancellation effect. URI/string bounds, request/notification shape, ID type/size, lifecycle state, and tool schemas are validated. Client capabilities remain open objects.
+
+Request/notification classification precedes side effects: request-only methods
+without IDs are ignored with zero effect, while nonduplicate ID-bearing
+initialized or cancelled methods receive fixed `-32600` and have zero effect;
+duplicate legal IDs follow the global duplicate rule. Cancellation
+requires a bounded string/integer `requestId`; its optional reason is a bounded
+string and is never reflected. June discards other bounded cancellation fields,
+November rejects them, and unnegotiated `task` is always rejected. URI checks
+use a conservative ASCII RFC 3986 subset: valid scheme/nonempty suffix,
+complete percent escapes, no whitespace/control/backslash or ASCII
+`0x22,0x3c,0x3e,0x5e,0x60,0x7b,0x7c,0x7d`, and nonempty authority for HTTP(S).
+HTTP(S) authority is the slice after `//` through the first `/`, `?`, `#`, or
+end. Any `//` authority rejects userinfo; accepts bracketed `Ipv6Addr`, parsed
+IPv4, or bounded DNS-like labels; and admits only an optional decimal `u16`
+port. Empty/invalid hosts, labels, ports, unbracketed IPv6, and trailing junk
+fail without allocation or resolution. The bridge accepts bounded `https:`,
+`urn:`, and `data:` URIs but performs no normalization, fetch, reflection, or
+logging.
+
+Any present invalid/null/fractional/overlong ID is an invalid request with
+`id=null`, never a notification. Cancellation fully validates ID, reason,
+`_meta`, project-policy version closure, and rejected `task` before registry
+lookup or token trigger.
+
+Duplicate outstanding IDs return fixed `-32600 Duplicate request id` with
+`id=null` after envelope/legal-ID validation but before lifecycle, params, name,
+and saturation; string and numeric IDs remain distinct and the original entry
+is never overwritten. Reuse is allowed after removal.
+`ToolService::call` runs inside the spawned task. A panic-safe task-ID/request-
+ID registry converts future-construction or polling panics to fixed `-32603`
+while active (or suppresses them after client cancellation/Closing) and releases
+the registry entry and slot exactly once.
 
 Malformed `tools/call` envelopes and unknown tool names return JSON-RPC `-32602`. Once a known tool is selected, argument-schema failures return a normal `CallToolResult` with `isError=true` and actionable compact-JSON text, without invoking the bridge. Bridge errors also use compact-JSON text containing every available remote/host/root/shell and safe warning/error field; structured content repeats only small metadata. Strict parsing rejects duplicate keys and enforces depth, node/member, and aggregate-key-byte budgets before allocation; a shared marker distinguishes `DuplicateKey`, `StructuralBudget`, and genuine `Syntax`, while duplicate checks reuse the destination JSON map rather than cloning keys into a second set. Bounded newline framing rejects an oversized message before JSON parsing.
 
 Every accepted tool future receives `ToolCallContext { cancel, wire_budget }`; the exact token goes to the bridge and the exact budget goes to validation/success/error rendering. `max_frame_bytes` excludes the newline delimiter. A compiled 1 MiB `MIN_MCP_FRAME_BYTES` is statically checked against the shared 65,536-byte root ceiling times a conservative thirteen-byte combined expansion: root occurs in inner Text JSON which is escaped again by outer MCP JSON, and once directly in structured context. The reserve also covers a maximum 256-byte wire ID and 64 KiB fixed response overhead. Error rendering derives a context-free `RenderedErrorCore` from `BridgeError`; Text carries context once and the structured top level carries it once, while nested `structuredContent.error.details` excludes host/root/shell. The authoritative counting test starts from a real maximum `ErrorDetails` with maximum root/shell and bounded safe strings, projects it, and proves only those two root contexts exist and fit. Server construction also counts the trusted full nine-tool list and uses the largest requirement. Exact minimum succeeds and minimum-minus-one is rejected without root truncation. Response renderers reserve envelope/ID/fallback but not newline. The writer is only a capped final serializer. It never replaces a completed mutation result with `-32603`.
+
+The owner continuously selects on the writer task as well as input and tool
+completion. Writer error/panic/early return, backpressure, and EOF all enter one
+Closing transition that sets global call-response suppression before token
+cancellation. More exactly, it enters Closing/rejects dispatch, partial EOF may
+try-send only its parse error, then it suppresses/cancels. Tagged queued call
+messages are skipped unless the writer already committed past its final
+suppression check; that boundary is non-retractable. MCP-specific 250 ms task and writer graces are followed by abort-and-
+drain through a separate bounded 250 ms grace, including futures or writers
+that ignore cooperative shutdown. Clean EOF returns success after healthy
+cleanup; partial EOF returns fixed `PROTOCOL_ERROR` after its parse-error
+response, or fixed `MCP transport failed` if that response cannot be queued. Buffered
+cancellation wins because the biased select orders writer result, input, then
+tool completion; one `try_join_next_with_id` after every handled frame prevents
+notification starvation without starving writer failures.
 
 `required_mcp_frame_bytes` and `WireBudget::for_response` take fallback bytes
 for the serialized `result` value only, excluding JSON-RPC envelope, request ID,
