@@ -10,10 +10,10 @@ use codex_ssh_bridge::mcp::stdio::{
 use codex_ssh_bridge::mcp::{
     CallToolResult, MAX_INVALID_ARGUMENT_ACTION_BYTES, McpServer, ProtocolState, RequestId,
     SUPPORTED_PROTOCOL_VERSIONS, StrictJsonError, ToolAnnotations, ToolCallContext, ToolDefinition,
-    ToolFuture, ToolService, WireBudget, internal_error_response, invalid_params_response,
-    invalid_request_response, method_not_found_response, parse_error_response, parse_strict_json,
-    request_too_large_response, result_response, server_busy_response,
-    server_not_initialized_response,
+    ToolFuture, ToolService, WireBudget, duplicate_request_id_response, internal_error_response,
+    invalid_params_response, invalid_request_id_response, invalid_request_response,
+    method_not_found_response, parse_error_response, parse_strict_json, request_too_large_response,
+    result_response, server_busy_response, server_not_initialized_response,
 };
 use codex_ssh_bridge::{BridgeError, ErrorCode, ErrorDetails};
 use serde::Serialize;
@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{
     AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
 };
@@ -469,7 +470,11 @@ fn lifecycle_definitions() -> Vec<ToolDefinition> {
             name: name.into(),
             title: name.into(),
             description: format!("{name} test tool"),
-            input_schema: json!({"type":"object","additionalProperties":false}),
+            input_schema: if name == "echo" {
+                json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false})
+            } else {
+                json!({"type":"object","properties":{},"additionalProperties":false})
+            },
             annotations: ToolAnnotations {
                 read_only_hint: true,
                 destructive_hint: false,
@@ -487,6 +492,7 @@ struct StubTools {
     first_polls: Arc<AtomicUsize>,
     bridge_ops: Arc<AtomicUsize>,
     observed_cancel: Arc<AtomicBool>,
+    cancel_notify: Arc<Notify>,
     entered: Arc<AtomicBool>,
     entered_notify: Arc<Notify>,
     release: Arc<Semaphore>,
@@ -501,6 +507,7 @@ impl StubTools {
             first_polls: Arc::new(AtomicUsize::new(0)),
             bridge_ops: Arc::new(AtomicUsize::new(0)),
             observed_cancel: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(Notify::new()),
             entered: Arc::new(AtomicBool::new(false)),
             entered_notify: Arc::new(Notify::new()),
             release: Arc::new(Semaphore::new(0)),
@@ -519,6 +526,18 @@ impl StubTools {
                 .expect("tool must be first-polled");
         }
     }
+
+    async fn wait_for_cancel(&self) {
+        loop {
+            let notified = self.cancel_notify.notified();
+            if self.observed_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            timeout(Duration::from_secs(1), notified)
+                .await
+                .expect("service must observe cancellation");
+        }
+    }
 }
 
 impl ToolService for StubTools {
@@ -531,6 +550,7 @@ impl ToolService for StubTools {
         let first_polls = Arc::clone(&self.first_polls);
         let bridge_ops = Arc::clone(&self.bridge_ops);
         let observed_cancel = Arc::clone(&self.observed_cancel);
+        let cancel_notify = Arc::clone(&self.cancel_notify);
         let entered = Arc::clone(&self.entered);
         let entered_notify = Arc::clone(&self.entered_notify);
         let release = Arc::clone(&self.release);
@@ -545,6 +565,7 @@ impl ToolService for StubTools {
                 tokio::select! {
                     () = context.cancel.cancelled() => {
                         observed_cancel.store(true, Ordering::SeqCst);
+                        cancel_notify.notify_waiters();
                         return CallToolResult::text("cancelled internally");
                     }
                     permit = release.acquire() => {
@@ -582,8 +603,16 @@ impl Session {
         server: McpServer<S>,
         capacity: usize,
     ) -> Self {
-        let (input, server_reader) = tokio::io::duplex(128 * 1024);
-        let (server_writer, output) = tokio::io::duplex(capacity);
+        Self::start_with_capacities(server, 128 * 1024, capacity).await
+    }
+
+    async fn start_with_capacities<S: ToolService>(
+        server: McpServer<S>,
+        input_capacity: usize,
+        output_capacity: usize,
+    ) -> Self {
+        let (input, server_reader) = tokio::io::duplex(input_capacity);
+        let (server_writer, output) = tokio::io::duplex(output_capacity);
         let serve = tokio::spawn(server.serve(server_reader, server_writer));
         Self {
             input,
@@ -661,6 +690,56 @@ fn task7_constructor_enforces_exact_frame_and_inflight_bounds() {
     }
 }
 
+#[tokio::test]
+async fn task7_constructor_max_id_counts_every_fixed_response_and_live_control_result() {
+    timeout(Duration::from_secs(5), async {
+        let service = Arc::new(NullService {
+            definitions: lifecycle_definitions(),
+        });
+        let id = RequestId::synthetic_max_wire();
+        let id_value = serde_json::to_value(&id).unwrap();
+        let required = required_mcp_frame_bytes(service.definitions(), 0, &id).unwrap();
+        assert!(McpServer::new(Arc::clone(&service), required, 2).is_ok());
+        assert_eq!(
+            McpServer::new(Arc::clone(&service), required - 1, 2).unwrap_err(),
+            BridgeError::invalid_argument("MCP frame bound is invalid")
+        );
+
+        let fixed = [
+            parse_error_response(),
+            invalid_request_response(),
+            invalid_request_id_response(id.clone()),
+            duplicate_request_id_response(),
+            method_not_found_response(id.clone()),
+            invalid_params_response(id.clone()),
+            internal_error_response(id.clone()),
+            server_not_initialized_response(id.clone()),
+            request_too_large_response(),
+            server_busy_response(id.clone()),
+        ];
+        for response in fixed {
+            assert!(serde_json::to_vec(&response).unwrap().len() <= required);
+            assert!(serialize_json_line(&response, required).is_ok());
+        }
+
+        let server = McpServer::new(service, required, 2).unwrap();
+        let frames = [
+            initialize(id_value.clone(), "2025-11-25"),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            json!({"jsonrpc":"2.0","id":id_value.clone(),"method":"ping","params":{}}),
+            json!({"jsonrpc":"2.0","id":id_value,"method":"tools/list","params":{}}),
+        ];
+        let (responses, result) = serve_frames(server, &frames).await;
+        assert!(result.is_ok());
+        assert_eq!(responses.len(), 3);
+        for response in responses {
+            assert!(serde_json::to_vec(&response).unwrap().len() <= required);
+        }
+    })
+    .await
+    .expect("test must complete");
+}
+
 async fn serve_frames<S: ToolService>(
     server: McpServer<S>,
     frames: &[Value],
@@ -707,6 +786,23 @@ fn initialize(id: Value, version: &str) -> Value {
             "clientInfo":{"name":"test-client","version":"1"}
         }
     })
+}
+
+async fn initialize_client_is_accepted(version: &str, client_info: Value) -> bool {
+    let service = Arc::new(NullService {
+        definitions: lifecycle_definitions(),
+    });
+    let server = McpServer::new(service, MIN_MCP_FRAME_BYTES, 1).unwrap();
+    let request = json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":version,
+            "capabilities":{},
+            "clientInfo":client_info
+        }
+    });
+    let (responses, result) = serve_frames(server, &[request]).await;
+    assert!(result.is_ok());
+    responses[0].get("result").is_some()
 }
 
 #[tokio::test]
@@ -865,6 +961,146 @@ async fn task7_lifecycle_june_open_and_november_closed_method_extensions() {
 }
 
 #[tokio::test]
+async fn task7_lifecycle_june_initialize_rejects_unnegotiated_task() {
+    timeout(Duration::from_secs(5), async {
+        let service = Arc::new(NullService {
+            definitions: lifecycle_definitions(),
+        });
+        let server = McpServer::new(service, MIN_MCP_FRAME_BYTES, 1).unwrap();
+        let request = json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"x","version":"1"},
+                "task":{"ttl":1}
+            }
+        });
+        let (responses, result) = serve_frames(server, &[request]).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            responses,
+            [invalid_params_response(
+                RequestId::try_from(json!(1)).unwrap()
+            )]
+        );
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
+async fn task7_lifecycle_official_six_method_versioned_params_matrix() {
+    timeout(Duration::from_secs(5), async {
+        for version in ["2025-06-18", "2025-11-25"] {
+            let june = version == "2025-06-18";
+            let tools = Arc::new(StubTools::new());
+            let mut session = Session::start(McpServer::new(
+                Arc::clone(&tools),
+                MIN_MCP_FRAME_BYTES,
+                2,
+            ).unwrap()).await;
+            let init_extension = if june { json!({"extension":true}) } else { json!({}) };
+            session.send(&json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":version,"capabilities":{},
+                    "clientInfo":{"name":"x","version":"1"},
+                    "_meta":{"trace":1},
+                    "extension":init_extension.get("extension").cloned().unwrap_or(Value::Null)
+                }
+            })).await;
+            let init_response = session.recv().await;
+            if june {
+                assert_eq!(init_response["result"]["protocolVersion"], version);
+            } else {
+                assert_eq!(init_response["error"]["code"], -32602);
+                session.send(&json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"x","version":"1"},"_meta":{"trace":1}}})).await;
+                assert_eq!(session.recv().await["result"]["protocolVersion"], version);
+            }
+            session.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"trace":1},"extension":true}})).await;
+            if !june {
+                session.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}})).await;
+                assert_eq!(session.recv().await["error"]["code"], -32002);
+                session.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"trace":1}}})).await;
+            }
+
+            for (id, method, mut params) in [
+                (10, "ping", json!({"_meta":{"trace":1}})),
+                (11, "tools/list", json!({"_meta":{"trace":1}})),
+                (12, "tools/call", json!({"name":"echo","arguments":{"text":"ok"},"_meta":{"trace":1}})),
+            ] {
+                if june { params["extension"] = json!(true); }
+                session.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).await;
+                assert!(session.recv().await.get("result").is_some(), "version={version} method={method}");
+            }
+            assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 1);
+
+            for (id, method, params) in [
+                (20, "ping", json!({"task":{}})),
+                (21, "tools/list", json!({"task":{}})),
+                (22, "tools/call", json!({"name":"echo","arguments":{"text":"bad"},"task":{}})),
+            ] {
+                session.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).await;
+                assert_eq!(session.recv().await["error"]["code"], -32602);
+            }
+            assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 1);
+
+            session.send(&json!({"jsonrpc":"2.0","id":"cancel","method":"tools/call","params":{"name":"block","arguments":{}}})).await;
+            tools.wait_for_polls(2).await;
+            session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel","_meta":{"trace":1},"extension":true}})).await;
+            session.send(&json!({"jsonrpc":"2.0","id":29,"method":"ping","params":{}})).await;
+            assert_eq!(session.recv().await["id"], 29);
+            assert_eq!(tools.contexts.lock().await[1].cancel.is_cancelled(), june);
+            if !june {
+                session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel","task":{}}})).await;
+                session.send(&json!({"jsonrpc":"2.0","id":28,"method":"ping","params":{}})).await;
+                assert_eq!(session.recv().await["id"], 28);
+                assert!(!tools.contexts.lock().await[1].cancel.is_cancelled());
+                session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel","_meta":{"trace":1}}})).await;
+            }
+            session.send(&json!({"jsonrpc":"2.0","id":30,"method":"ping","params":{"_meta":{}}})).await;
+            assert_eq!(session.recv().await["id"], 30);
+            assert!(session.close().await.is_ok());
+        }
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
+async fn task7_lifecycle_duplicate_and_notification_shapes_have_zero_service_effect() {
+    timeout(Duration::from_secs(5), async {
+        let tools = Arc::new(StubTools::new());
+        let mut session = Session::start(McpServer::new(
+            Arc::clone(&tools),
+            MIN_MCP_FRAME_BYTES,
+            1,
+        ).unwrap()).await;
+        session.send(&json!({"jsonrpc":"2.0","method":"initialize","params":{}})).await;
+        session.send(&initialize(json!(1), "2025-11-25")).await;
+        assert_eq!(session.recv().await["id"], 1);
+        session.send(&initialize(json!(2), "2025-11-25")).await;
+        assert_eq!(session.recv().await["error"]["code"], -32600);
+        session.send(&json!({"jsonrpc":"2.0","id":3,"method":"notifications/initialized","params":{}})).await;
+        assert_eq!(session.recv().await["error"]["code"], -32600);
+        session.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{"task":{}}})).await;
+        session.send(&json!({"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}})).await;
+        assert_eq!(session.recv().await["error"]["code"], -32002);
+        session.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})).await;
+        session.send(&json!({"jsonrpc":"2.0","method":"ping","params":{}})).await;
+        session.send(&json!({"jsonrpc":"2.0","method":"tools/list","params":{}})).await;
+        session.send(&json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"text":"ignored"}}})).await;
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(tools.bridge_ops.load(Ordering::SeqCst), 0);
+        session.send(&json!({"jsonrpc":"2.0","id":5,"method":"ping","params":{}})).await;
+        assert_eq!(session.recv().await["id"], 5);
+        assert!(session.close().await.is_ok());
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
 async fn task7_lifecycle_strict_json_errors_are_fixed_and_side_effect_free() {
     timeout(Duration::from_secs(5), async {
         let service = Arc::new(NullService { definitions: lifecycle_definitions() });
@@ -1005,6 +1241,74 @@ async fn task7_lifecycle_client_info_exact_limits_and_plus_one() {
             assert_eq!(responses[0].get("result").is_some(), accepted);
         }
     }).await.expect("test must complete");
+}
+
+#[tokio::test]
+async fn task7_lifecycle_client_and_icon_complete_boundary_matrix() {
+    timeout(Duration::from_secs(5), async {
+        for (field, exact_limit) in [
+            ("name", 256),
+            ("title", 256),
+            ("version", 256),
+            ("description", 4096),
+        ] {
+            for delta in [0, 1] {
+                let mut client = json!({"name":"x","version":"1"});
+                let bytes = exact_limit + delta;
+                let value = format!("{}{}", "界".repeat(bytes / 3), "x".repeat(bytes % 3));
+                client
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.into(), Value::String(value));
+                assert_eq!(client[field].as_str().unwrap().len(), bytes);
+                assert_eq!(
+                    initialize_client_is_accepted("2025-11-25", client).await,
+                    delta == 0,
+                    "field={field} delta={delta}"
+                );
+            }
+        }
+
+        let base_icon = json!({"src":"data:,ok"});
+        for (icons, accepted) in [
+            (vec![base_icon.clone(); 16], true),
+            (vec![base_icon.clone(); 17], false),
+        ] {
+            assert_eq!(
+                initialize_client_is_accepted(
+                    "2025-11-25",
+                    json!({"name":"x","version":"1","icons":icons}),
+                )
+                .await,
+                accepted
+            );
+        }
+
+        for (icon, accepted) in [
+            (json!({"src":"data:,ok","mimeType":"x".repeat(256)}), true),
+            (json!({"src":"data:,ok","mimeType":"x".repeat(257)}), false),
+            (json!({"src":"data:,ok","sizes":vec!["1"; 16]}), true),
+            (json!({"src":"data:,ok","sizes":vec!["1"; 17]}), false),
+            (json!({"src":"data:,ok","sizes":["x".repeat(32)]}), true),
+            (json!({"src":"data:,ok","sizes":["x".repeat(33)]}), false),
+            (json!({"src":"data:,ok","theme":"light"}), true),
+            (json!({"src":"data:,ok","theme":"dark"}), true),
+            (json!({"src":"data:,ok","theme":"system"}), false),
+            (json!({"src":"data:,ok","unknown":true}), false),
+            (json!({"mimeType":"text/plain"}), false),
+        ] {
+            assert_eq!(
+                initialize_client_is_accepted(
+                    "2025-11-25",
+                    json!({"name":"x","version":"1","icons":[icon]}),
+                )
+                .await,
+                accepted
+            );
+        }
+    })
+    .await
+    .expect("test must complete");
 }
 
 #[derive(Clone, Copy)]
@@ -1182,6 +1486,48 @@ async fn task7_inflight_third_unique_known_call_is_busy_at_bound_two() {
 }
 
 #[tokio::test]
+async fn task7_inflight_oversized_flood_reaps_one_completion_and_releases_id() {
+    timeout(Duration::from_secs(5), async {
+        let tools = Arc::new(StubTools::new());
+        let mut session = Session::start_with_capacities(
+            McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap(),
+            4 * 1024 * 1024,
+            128 * 1024,
+        )
+        .await;
+        session.ready().await;
+        session.send(&json!({"jsonrpc":"2.0","id":"reuse","method":"tools/call","params":{"name":"block","arguments":{}}})).await;
+        tools.wait_for_polls(1).await;
+
+        let mut flood = Vec::new();
+        for _ in 0..3 {
+            flood.extend(std::iter::repeat_n(b'x', MIN_MCP_FRAME_BYTES + 1));
+            flood.push(b'\n');
+        }
+        flood.extend(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":"reuse","method":"tools/call","params":{"name":"echo","arguments":{"text":"second"}}})).unwrap());
+        flood.push(b'\n');
+        session.input.write_all(&flood).await.unwrap();
+        tools.release.add_permits(1);
+
+        assert_eq!(session.recv().await, request_too_large_response());
+        assert_eq!(session.recv().await["id"], "reuse");
+        let mut saw_second = false;
+        for _ in 0..3 {
+            let response = session.recv().await;
+            if response["id"] == "reuse" {
+                assert_eq!(response["result"]["content"][0]["text"], "second");
+                saw_second = true;
+            }
+        }
+        assert!(saw_second, "the completed ID and permit must be reusable");
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 2);
+        assert!(session.close().await.is_ok());
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
 async fn task7_dispatch_known_invalid_arguments_are_normal_tool_results() {
     timeout(Duration::from_secs(5), async {
         let tools = Arc::new(StubTools::new());
@@ -1210,12 +1556,14 @@ async fn task7_cancellation_cancels_shared_token_and_suppresses_response() {
         tools.wait_for_polls(1).await;
         let token = tools.contexts.lock().await[0].cancel.clone();
         session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"job","reason":"hostile\nreason"}})).await;
-        timeout(Duration::from_secs(1), async {
-            while !tools.observed_cancel.load(Ordering::Acquire) { tokio::task::yield_now().await; }
-        }).await.expect("service must observe cancellation");
+        tools.wait_for_cancel().await;
         assert!(token.is_cancelled());
         session.send(&json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}})).await;
         assert_eq!(session.recv().await["id"], 2);
+        session.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"slot released"}}})).await;
+        let admitted = session.recv().await;
+        assert_eq!(admitted["id"], 3);
+        assert_eq!(admitted["result"]["content"][0]["text"], "slot released");
         assert!(session.close().await.is_ok());
     }).await.expect("test must complete");
 }
@@ -1240,16 +1588,15 @@ async fn task7_cancellation_fully_validates_before_touching_token() {
         ] {
             session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":params})).await;
         }
-        tokio::task::yield_now().await;
+        session.send(&json!({"jsonrpc":"2.0","id":6,"method":"ping","params":{}})).await;
+        assert_eq!(session.recv().await["id"], 6);
         assert!(!tools.observed_cancel.load(Ordering::Acquire));
         assert!(!tools.contexts.lock().await[0].cancel.is_cancelled());
         session.send(&json!({"jsonrpc":"2.0","id":8,"method":"notifications/cancelled","params":{"requestId":7}})).await;
         assert_eq!(session.recv().await["error"]["code"], -32600);
         assert!(!tools.contexts.lock().await[0].cancel.is_cancelled());
         session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"_meta":{}}})).await;
-        timeout(Duration::from_secs(1), async {
-            while !tools.observed_cancel.load(Ordering::Acquire) { tokio::task::yield_now().await; }
-        }).await.expect("valid cancellation must propagate");
+        tools.wait_for_cancel().await;
         session.send(&json!({"jsonrpc":"2.0","id":9,"method":"ping","params":{}})).await;
         assert_eq!(session.recv().await["id"], 9);
         assert!(session.close().await.is_ok());
@@ -1323,7 +1670,8 @@ async fn task7_cancellation_versioned_extension_policy_unknown_duplicate_and_lat
             tools.wait_for_polls(1).await;
             session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"unknown","extension":true}})).await;
             session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":11,"extension":true}})).await;
-            tokio::task::yield_now().await;
+            session.send(&json!({"jsonrpc":"2.0","id":10,"method":"ping","params":{}})).await;
+            assert_eq!(session.recv().await["id"], 10);
             assert_eq!(tools.contexts.lock().await[0].cancel.is_cancelled(), extra_cancels);
             if !extra_cancels {
                 session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":11}})).await;
@@ -1449,6 +1797,86 @@ impl AsyncWrite for PrefixFailWriter {
     }
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+struct PrefixPendingWriter {
+    bytes: Arc<StdMutex<Vec<u8>>>,
+    pending_at: usize,
+}
+
+struct SwitchWriter {
+    bytes: Arc<StdMutex<Vec<u8>>>,
+    fail: Arc<AtomicBool>,
+    wrote: Arc<Notify>,
+}
+
+impl AsyncWrite for SwitchWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.fail.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::other("HOSTILE switched failure")));
+        }
+        self.bytes.lock().unwrap().extend_from_slice(buffer);
+        self.wrote.notify_waiters();
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn wait_for_stored_lines(bytes: &Arc<StdMutex<Vec<u8>>>, wrote: &Arc<Notify>, lines: usize) {
+    loop {
+        let notified = wrote.notified();
+        if bytes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            >= lines
+        {
+            return;
+        }
+        timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("writer must store the expected line");
+    }
+}
+
+impl AsyncWrite for PrefixPendingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let written = self.bytes.lock().unwrap().len();
+        if written >= self.pending_at {
+            return Poll::Pending;
+        }
+        let count = buffer.len().min(self.pending_at - written);
+        self.bytes
+            .lock()
+            .unwrap()
+            .extend_from_slice(&buffer[..count]);
+        Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
     }
 }
 
@@ -1594,6 +2022,35 @@ async fn task7_writer_prefix_error_and_panic_close_without_replacement() {
 }
 
 #[tokio::test]
+async fn task7_writer_pending_forever_after_controlled_prefix_is_bounded() {
+    timeout(Duration::from_secs(5), async {
+        let mut input = serde_json::to_vec(&initialize(json!(1), "2025-11-25")).unwrap();
+        input.push(b'\n');
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let writer = PrefixPendingWriter {
+            bytes: Arc::clone(&bytes),
+            pending_at: 23,
+        };
+        let service = Arc::new(NullService {
+            definitions: lifecycle_definitions(),
+        });
+        let started = Instant::now();
+        let error = McpServer::new(service, MIN_MCP_FRAME_BYTES, 1)
+            .unwrap()
+            .serve(std::io::Cursor::new(input), writer)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error, BridgeError::io("MCP transport failed"));
+        assert_eq!(bytes.lock().unwrap().len(), 23);
+        assert!(elapsed >= Duration::from_millis(200));
+        assert!(elapsed < Duration::from_millis(750));
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
 async fn task7_writer_failure_is_monitored_while_input_stays_open() {
     timeout(Duration::from_secs(5), async {
         let service = Arc::new(NullService {
@@ -1618,6 +2075,125 @@ async fn task7_writer_failure_is_monitored_while_input_stays_open() {
             .expect("owner must not panic")
             .unwrap_err();
         assert_eq!(error, BridgeError::io("MCP transport failed"));
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
+async fn task7_writer_failure_closes_cooperative_and_already_ready_calls_without_output() {
+    timeout(Duration::from_secs(5), async {
+        for make_ready in [false, true] {
+            let tools = Arc::new(StubTools::new());
+            let server = McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap();
+            let (mut input, server_reader) = tokio::io::duplex(128 * 1024);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let fail = Arc::new(AtomicBool::new(false));
+            let wrote = Arc::new(Notify::new());
+            let writer = SwitchWriter {
+                bytes: Arc::clone(&bytes),
+                fail: Arc::clone(&fail),
+                wrote: Arc::clone(&wrote),
+            };
+            let serve = tokio::spawn(server.serve(server_reader, writer));
+            for frame in [
+                initialize(json!(1), "2025-11-25"),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                json!({"jsonrpc":"2.0","id":"active","method":"tools/call","params":{"name":"block","arguments":{}}}),
+            ] {
+                let mut wire = serde_json::to_vec(&frame).unwrap();
+                wire.push(b'\n');
+                input.write_all(&wire).await.unwrap();
+            }
+            wait_for_stored_lines(&bytes, &wrote, 1).await;
+            tools.wait_for_polls(1).await;
+            if make_ready {
+                tools.release.add_permits(1);
+            }
+            fail.store(true, Ordering::Release);
+            let mut trigger = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}}),
+            )
+            .unwrap();
+            trigger.push(b'\n');
+            input.write_all(&trigger).await.unwrap();
+            let error = timeout(Duration::from_secs(1), serve)
+                .await
+                .expect("writer failure must close")
+                .expect("owner must not panic")
+                .unwrap_err();
+            assert_eq!(error, BridgeError::io("MCP transport failed"));
+            let stored = bytes.lock().unwrap().clone();
+            assert_eq!(stored.iter().filter(|byte| **byte == b'\n').count(), 1);
+            assert!(!String::from_utf8_lossy(&stored).contains("active"));
+            if !make_ready {
+                assert!(tools.observed_cancel.load(Ordering::Acquire));
+            }
+        }
+    })
+    .await
+    .expect("test must complete");
+}
+
+#[tokio::test]
+async fn task7_writer_failure_aborts_token_ignoring_call_within_cleanup_bound() {
+    timeout(Duration::from_secs(5), async {
+        let entered = Arc::new(Notify::new());
+        let tools = Arc::new(IgnoringTools {
+            definitions: lifecycle_definitions(),
+            entered: Arc::clone(&entered),
+        });
+        let server = McpServer::new(tools, MIN_MCP_FRAME_BYTES, 1).unwrap();
+        let (mut input, server_reader) = tokio::io::duplex(128 * 1024);
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let fail = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(Notify::new());
+        let writer = SwitchWriter {
+            bytes: Arc::clone(&bytes),
+            fail: Arc::clone(&fail),
+            wrote: Arc::clone(&wrote),
+        };
+        let serve = tokio::spawn(server.serve(server_reader, writer));
+        let entered_wait = entered.notified();
+        for frame in [
+            initialize(json!(1), "2025-11-25"),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+            json!({"jsonrpc":"2.0","id":"active","method":"tools/call","params":{"name":"block","arguments":{}}}),
+        ] {
+            let mut wire = serde_json::to_vec(&frame).unwrap();
+            wire.push(b'\n');
+            input.write_all(&wire).await.unwrap();
+        }
+        wait_for_stored_lines(&bytes, &wrote, 1).await;
+        timeout(Duration::from_secs(1), entered_wait)
+            .await
+            .expect("ignoring task must start");
+        fail.store(true, Ordering::Release);
+        let mut trigger = serde_json::to_vec(
+            &json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}}),
+        )
+        .unwrap();
+        trigger.push(b'\n');
+        input.write_all(&trigger).await.unwrap();
+        let started = Instant::now();
+        let error = timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("writer failure must close")
+            .expect("owner must not panic")
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error, BridgeError::io("MCP transport failed"));
+        assert!(elapsed >= Duration::from_millis(200));
+        assert!(elapsed < Duration::from_millis(750));
+        assert_eq!(
+            bytes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1
+        );
     })
     .await
     .expect("test must complete");
@@ -1660,6 +2236,14 @@ async fn task7_writer_capacity_overflow_writes_zero_bytes_of_that_frame() {
         assert_eq!(lines.len(), 1, "overflowing call frame must contribute zero bytes");
         assert_eq!(serde_json::from_slice::<Value>(lines[0]).unwrap()["id"], 1);
     }).await.expect("test must complete");
+}
+
+#[test]
+fn task7_writer_call_queue_is_intrinsically_prepared_and_bounded() {
+    let source = include_str!("../src/mcp/mod.rs");
+    assert!(source.contains("struct PreparedJsonLine"));
+    assert!(source.contains("CallResponse(PreparedJsonLine)"));
+    assert!(!source.contains("serde_json::to_value(completed.outcome)"));
 }
 
 #[tokio::test]
@@ -1748,7 +2332,11 @@ async fn task7_eof_aborts_token_ignoring_yielding_task_within_bound() {
         let notified = entered.notified();
         session.send(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"block","arguments":{}}})).await;
         timeout(Duration::from_secs(1), notified).await.expect("task must start");
+        let started = Instant::now();
         assert!(session.close().await.is_ok());
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(200));
+        assert!(elapsed < Duration::from_millis(750));
     }).await.expect("test must complete");
 }
 

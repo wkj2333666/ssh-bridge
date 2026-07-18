@@ -8,9 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use self::stdio::{FrameEvent, FrameReader, required_mcp_frame_bytes, write_json_line};
+use self::stdio::{
+    FrameEvent, FrameReader, required_mcp_frame_bytes, serialize_json_line, write_json_line,
+};
 use crate::ErrorCode;
 use crate::error::{BridgeError, BridgeResult};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -29,7 +32,27 @@ enum ProtocolShape {
 #[derive(Debug)]
 enum WriterMessage {
     Control(Value),
-    CallResponse(Value),
+    CallResponse(PreparedJsonLine),
+}
+
+#[derive(Debug)]
+struct PreparedJsonLine {
+    bytes: Vec<u8>,
+}
+
+impl PreparedJsonLine {
+    fn serialize<T: Serialize>(value: &T, max_frame_bytes: usize) -> Result<Self, ()> {
+        let bytes = serialize_json_line(value, max_frame_bytes).map_err(|_| ())?;
+        debug_assert!(bytes.len() <= max_frame_bytes + 1);
+        Ok(Self { bytes })
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedCallResponse<'a> {
+    jsonrpc: &'static str,
+    id: &'a RequestId,
+    result: &'a CallToolResult,
 }
 
 struct InFlight {
@@ -140,6 +163,18 @@ impl<S: ToolService> McpServer<S> {
                         transport_failed = true;
                         break;
                     }
+                    if try_reap_one_completion(
+                        &mut join_set,
+                        &mut active,
+                        &mut task_ids,
+                        &sender,
+                        self.max_frame_bytes,
+                    )
+                    .is_err()
+                    {
+                        transport_failed = true;
+                        break;
+                    }
                 }
                 OwnerEvent::Input(Ok(FrameEvent::Frame(frame))) => {
                     let mut initialize_transition = None;
@@ -162,17 +197,28 @@ impl<S: ToolService> McpServer<S> {
                             shape = Some(selected_shape);
                         }
                     }
-                    if !join_set.is_empty()
-                        && let Some(completion) = join_set.try_join_next_with_id()
-                        && process_completion(completion, &mut active, &mut task_ids, &sender)
-                            .is_err()
+                    if try_reap_one_completion(
+                        &mut join_set,
+                        &mut active,
+                        &mut task_ids,
+                        &sender,
+                        self.max_frame_bytes,
+                    )
+                    .is_err()
                     {
                         transport_failed = true;
                         break;
                     }
                 }
                 OwnerEvent::Tool(Some(completion)) => {
-                    if process_completion(completion, &mut active, &mut task_ids, &sender).is_err()
+                    if process_completion(
+                        completion,
+                        &mut active,
+                        &mut task_ids,
+                        &sender,
+                        self.max_frame_bytes,
+                    )
+                    .is_err()
                     {
                         transport_failed = true;
                         break;
@@ -468,6 +514,7 @@ fn process_completion(
     active: &mut HashMap<RequestId, InFlight>,
     task_ids: &mut HashMap<Id, RequestId>,
     sender: &mpsc::Sender<WriterMessage>,
+    max_frame_bytes: usize,
 ) -> Result<(), ()> {
     match completion {
         Ok((task_id, completed)) => {
@@ -481,11 +528,14 @@ fn process_completion(
                 return Err(());
             };
             if !inflight.cancelled_by_client {
+                let response = BorrowedCallResponse {
+                    jsonrpc: "2.0",
+                    id: &completed.id,
+                    result: &completed.outcome,
+                };
+                let prepared = PreparedJsonLine::serialize(&response, max_frame_bytes)?;
                 sender
-                    .try_send(WriterMessage::CallResponse(result_response(
-                        completed.id,
-                        serde_json::to_value(completed.outcome).map_err(|_| ())?,
-                    )))
+                    .try_send(WriterMessage::CallResponse(prepared))
                     .map_err(|_| ())?;
             }
             Ok(())
@@ -499,13 +549,30 @@ fn process_completion(
                 return Err(());
             };
             if !inflight.cancelled_by_client && !error.is_cancelled() {
+                let response = internal_error_response(id);
+                let prepared = PreparedJsonLine::serialize(&response, max_frame_bytes)?;
                 sender
-                    .try_send(WriterMessage::CallResponse(internal_error_response(id)))
+                    .try_send(WriterMessage::CallResponse(prepared))
                     .map_err(|_| ())?;
             }
             Ok(())
         }
     }
+}
+
+fn try_reap_one_completion(
+    join_set: &mut JoinSet<CompletedCall>,
+    active: &mut HashMap<RequestId, InFlight>,
+    task_ids: &mut HashMap<Id, RequestId>,
+    sender: &mpsc::Sender<WriterMessage>,
+    max_frame_bytes: usize,
+) -> Result<(), ()> {
+    if !join_set.is_empty()
+        && let Some(completion) = join_set.try_join_next_with_id()
+    {
+        process_completion(completion, active, task_ids, sender, max_frame_bytes)?;
+    }
+    Ok(())
 }
 
 fn remove_completion(
@@ -539,15 +606,18 @@ async fn writer_loop<W: AsyncWrite + Unpin>(
     max_frame_bytes: usize,
 ) -> BridgeResult<()> {
     while let Some(message) = receiver.recv().await {
-        let value = match message {
+        match message {
             WriterMessage::CallResponse(_) if suppress_call_responses.load(Ordering::Acquire) => {
                 continue;
             }
-            WriterMessage::Control(value) | WriterMessage::CallResponse(value) => value,
-        };
-        write_json_line(&mut writer, &value, max_frame_bytes)
-            .await
-            .map_err(|_| BridgeError::io("MCP transport failed"))?;
+            WriterMessage::CallResponse(prepared) => writer
+                .write_all(&prepared.bytes)
+                .await
+                .map_err(|_| BridgeError::io("MCP transport failed"))?,
+            WriterMessage::Control(value) => write_json_line(&mut writer, &value, max_frame_bytes)
+                .await
+                .map_err(|_| BridgeError::io("MCP transport failed"))?,
+        }
     }
     writer
         .shutdown()
@@ -565,6 +635,9 @@ fn valid_envelope(envelope: &Map<String, Value>) -> bool {
 
 fn validate_initialize_params(params: Option<&Value>) -> Result<(ProtocolShape, &'static str), ()> {
     let object = params.and_then(Value::as_object).ok_or(())?;
+    if object.contains_key("task") {
+        return Err(());
+    }
     let requested = object
         .get("protocolVersion")
         .and_then(Value::as_str)
@@ -924,8 +997,13 @@ fn is_pchar(byte: u8) -> bool {
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use super::{CompletedCall, FrameEvent, FrameReader, OwnerEvent, next_owner_event};
+    use super::{
+        BorrowedCallResponse, CompletedCall, FrameEvent, FrameReader, OwnerEvent, PreparedJsonLine,
+        next_owner_event,
+    };
     use crate::error::BridgeResult;
+    use crate::mcp::{CallToolResult, RequestId};
+    use serde_json::json;
     use std::future;
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufReader};
@@ -956,5 +1034,29 @@ mod lifecycle_tests {
         .unwrap();
         assert!(matches!(event, OwnerEvent::Input(Ok(FrameEvent::Frame(frame))) if frame == b"{}"));
         writer.abort();
+    }
+
+    #[test]
+    fn task7_prepared_call_line_is_intrinsically_exact_and_bounded() {
+        let id = RequestId::try_from(json!("bounded")).unwrap();
+        let result = CallToolResult::text("x".repeat(4096));
+        let response = BorrowedCallResponse {
+            jsonrpc: "2.0",
+            id: &id,
+            result: &result,
+        };
+        let exact = serde_json::to_vec(&response).unwrap().len();
+        let prepared = PreparedJsonLine::serialize(&response, exact).unwrap();
+        assert_eq!(prepared.bytes.len(), exact + 1);
+        assert_eq!(prepared.bytes.last(), Some(&b'\n'));
+        assert!(PreparedJsonLine::serialize(&response, exact - 1).is_err());
+
+        let huge = CallToolResult::text("x".repeat(2 * 1024 * 1024));
+        let huge_response = BorrowedCallResponse {
+            jsonrpc: "2.0",
+            id: &id,
+            result: &huge,
+        };
+        assert!(PreparedJsonLine::serialize(&huge_response, 1024 * 1024).is_err());
     }
 }
