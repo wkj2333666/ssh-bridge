@@ -29,6 +29,18 @@ impl RequestId {
     pub fn synthetic_max_wire() -> Self {
         Self::String("x".repeat(MAX_REQUEST_ID_WIRE_BYTES - 2))
     }
+
+    pub fn try_from_ref(value: &Value) -> Result<Self, RequestIdError> {
+        match value {
+            Value::String(value) if string_wire_len_at_most(value, MAX_REQUEST_ID_WIRE_BYTES) => {
+                Ok(Self::String(value.to_owned()))
+            }
+            Value::Number(value) if value.is_i64() || value.is_u64() => {
+                Ok(Self::Number(value.clone()))
+            }
+            _ => Err(RequestIdError),
+        }
+    }
 }
 
 impl Serialize for RequestId {
@@ -58,18 +70,7 @@ impl TryFrom<Value> for RequestId {
     type Error = RequestIdError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        match value {
-            Value::String(value) if string_wire_len_at_most(&value, MAX_REQUEST_ID_WIRE_BYTES) => {
-                Ok(Self::String(value))
-            }
-            Value::Number(value)
-                if (value.is_i64() || value.is_u64())
-                    && value.to_string().len() <= MAX_REQUEST_ID_WIRE_BYTES =>
-            {
-                Ok(Self::Number(value))
-            }
-            _ => Err(RequestIdError),
-        }
+        Self::try_from_ref(&value)
     }
 }
 
@@ -217,6 +218,14 @@ pub fn parse_error_response() -> Value {
 
 pub fn invalid_request_response() -> Value {
     null_id_error_response(-32600, "Invalid Request")
+}
+
+pub fn invalid_request_id_response(id: RequestId) -> Value {
+    id_error_response(id, -32600, "Invalid Request")
+}
+
+pub fn duplicate_request_id_response() -> Value {
+    null_id_error_response(-32600, "Duplicate request id")
 }
 
 pub fn method_not_found_response(id: RequestId) -> Value {
