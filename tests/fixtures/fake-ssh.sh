@@ -113,6 +113,13 @@ for argument do
     remote_command=$argument
 done
 
+if [ -n "${FAKE_SSH_PHASE_LOG:-}" ]; then
+    case "$remote_command" in
+        *codex_patch_snapshot_sentinel*) printf 'S\n' >>"$FAKE_SSH_PHASE_LOG" ;;
+        *codex_safe_write_sentinel*|*codex_guarded_delete_sentinel*) printf 'M\n' >>"$FAKE_SSH_PHASE_LOG" ;;
+    esac
+fi
+
 case "$remote_command" in
 	*CODEX_SSH_PROBE*)
 		log_call P "$@"
@@ -165,6 +172,9 @@ log_call C "$@"
 
 if [ -n "${FAKE_SSH_MISMATCH_FILE:-}" ] && [ ! -e "$FAKE_SSH_MISMATCH_FILE" ]; then
     : >"$FAKE_SSH_MISMATCH_FILE"
+    if [ -n "${FAKE_SSH_MISMATCH_STDOUT:-}" ]; then
+        printf '%s' "$FAKE_SSH_MISMATCH_STDOUT"
+    fi
     printf 'CODE=CAPABILITY_MISMATCH\0CAPABILITY=%s\0' "${FAKE_SSH_MISMATCH_KEY:-find_nul}" >&2
     exit 0
 fi
@@ -172,6 +182,9 @@ fi
 if [ -n "${FAKE_SSH_FIXED_SLEEP_SECONDS:-}" ]; then
     if [ -n "${FAKE_SSH_FIXED_STDOUT_BYTES:-}" ]; then
         emit_bytes "$FAKE_SSH_FIXED_STDOUT_BYTES" stdout
+    fi
+    if [ -n "${FAKE_SSH_FIXED_STDERR_BYTES:-}" ]; then
+        emit_bytes "$FAKE_SSH_FIXED_STDERR_BYTES" stderr
     fi
     run_fake_sleep "$FAKE_SSH_FIXED_SLEEP_SECONDS"
 fi

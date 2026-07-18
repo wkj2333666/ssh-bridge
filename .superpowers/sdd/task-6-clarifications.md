@@ -36,3 +36,16 @@ binding for implementation and review.
    the host effective `max_write_bytes`, and the fixed runner's safe output
    ceiling. A larger complete base is rejected before transfer; snapshot never
    substitutes the public truncating read API.
+9. `READ_CONFLICT` is the only non-success snapshot record that may accompany
+   partial or complete raw stdout; those bytes are discarded immediately.
+   Every other non-success or capability-mismatch record requires empty
+   stdout, otherwise the snapshot protocol is malformed and is not retried.
+10. Before the first mutation, preparation must pre-render and validate the
+    exact Task 5 Create/Replace/Delete command and input frame for every
+    prepared path. A later local frame-size failure must not occur after an
+    earlier mutation has committed.
+11. Parent device/inode binding applies within each snapshot and within each
+    Task 5 mutation. An intermediate parent symlink may retarget between those
+    two operations; this is an accepted operational-guard race window, not a
+    cross-operation sandbox guarantee, and documentation/tests must not claim
+    otherwise.
