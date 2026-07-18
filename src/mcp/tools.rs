@@ -1,9 +1,203 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{CallToolResult, ToolAnnotations, ToolDefinition};
+use crate::output::StreamKind;
+use crate::remote::{
+    ApplyPatchRequest, ListRequest, OutputReadRequest, ReadRequest, RemoteBridge, RemoteRunRequest,
+    RunShell, RunStdin, SearchRequest, StatRequest, WriteEncoding, WriteMode, WriteRequest,
+};
+
+use super::{
+    CallToolResult, ToolAnnotations, ToolCallContext, ToolDefinition, ToolFuture, ToolService,
+};
+
+#[derive(Clone)]
+pub struct RemoteMcpTools {
+    bridge: Arc<RemoteBridge>,
+}
+
+impl RemoteMcpTools {
+    pub fn new(bridge: Arc<RemoteBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+impl ToolService for RemoteMcpTools {
+    fn definitions(&self) -> &[ToolDefinition] {
+        tool_definitions()
+    }
+
+    fn call(&self, name: String, arguments: Value, context: ToolCallContext) -> ToolFuture {
+        let parsed = match parse_tool_arguments(&name, arguments) {
+            Ok(parsed) => parsed,
+            Err(result) => return Box::pin(async move { result }),
+        };
+        let bridge = Arc::clone(&self.bridge);
+        Box::pin(async move {
+            let ToolCallContext {
+                cancel,
+                wire_budget,
+            } = context;
+            match parsed {
+                ParsedToolArguments::Hosts(_) => {
+                    let result = bridge.hosts().await;
+                    super::render::hosts(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::List(arguments) => {
+                    let result = bridge
+                        .list(
+                            ListRequest {
+                                host: arguments.host,
+                                path: arguments.path,
+                                depth: arguments.depth,
+                                include_hidden: arguments.include_hidden,
+                                max_entries: arguments.max_entries,
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::list(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::Stat(arguments) => {
+                    let result = bridge
+                        .stat(
+                            StatRequest {
+                                host: arguments.host,
+                                paths: arguments.paths,
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::stat(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::Search(arguments) => {
+                    let result = bridge
+                        .search(
+                            SearchRequest {
+                                host: arguments.host,
+                                query: arguments.query,
+                                path: arguments.path,
+                                globs: arguments.globs,
+                                max_results: arguments.max_results,
+                                binary: arguments.binary,
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::search(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::Read(arguments) => {
+                    let result = bridge
+                        .read(
+                            ReadRequest {
+                                host: arguments.host,
+                                paths: arguments.paths,
+                                start_line: arguments.start_line,
+                                max_lines: arguments.max_lines,
+                                max_bytes: arguments.max_bytes,
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::read(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::OutputRead(arguments) => {
+                    let output_ref = arguments.output_ref;
+                    let result = bridge
+                        .output_read(
+                            OutputReadRequest {
+                                output_ref: output_ref.clone(),
+                                stream: map_stream(arguments.stream),
+                                offset: arguments.offset,
+                                max_bytes: arguments.max_bytes.unwrap_or(262_144),
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::output_read(&output_ref, result, wire_budget)
+                }
+                ParsedToolArguments::ApplyPatch(arguments) => {
+                    let result = bridge
+                        .apply_patch(
+                            ApplyPatchRequest {
+                                host: arguments.host,
+                                patch: arguments.patch,
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::apply_patch(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::Write(arguments) => {
+                    let result = bridge
+                        .write(
+                            WriteRequest {
+                                host: arguments.host,
+                                path: arguments.path,
+                                content: arguments.content,
+                                encoding: map_encoding(arguments.encoding),
+                                mode: map_write_mode(arguments.mode),
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::write(bridge, result, wire_budget, cancel).await
+                }
+                ParsedToolArguments::Run(arguments) => {
+                    let result = bridge
+                        .run(
+                            RemoteRunRequest {
+                                host: arguments.host,
+                                command: arguments.command,
+                                cwd: arguments.cwd,
+                                shell: map_run_shell(arguments.shell),
+                                timeout_ms: arguments.timeout_ms,
+                                stdin: arguments.stdin.map(|stdin| RunStdin {
+                                    encoding: map_encoding(stdin.encoding),
+                                    value: stdin.value,
+                                }),
+                            },
+                            cancel.clone(),
+                        )
+                        .await;
+                    super::render::run(bridge, result, wire_budget, cancel).await
+                }
+            }
+        })
+    }
+}
+
+fn map_encoding(encoding: ToolEncoding) -> WriteEncoding {
+    match encoding {
+        ToolEncoding::Utf8 => WriteEncoding::Utf8,
+        ToolEncoding::Base64 => WriteEncoding::Base64,
+    }
+}
+
+fn map_stream(stream: ToolStream) -> StreamKind {
+    match stream {
+        ToolStream::Stdout => StreamKind::Stdout,
+        ToolStream::Stderr => StreamKind::Stderr,
+    }
+}
+
+fn map_run_shell(shell: ToolRunShell) -> RunShell {
+    match shell {
+        ToolRunShell::Auto => RunShell::Auto,
+        ToolRunShell::Bash => RunShell::Bash,
+        ToolRunShell::Sh => RunShell::Sh,
+        ToolRunShell::Login => RunShell::Login,
+    }
+}
+
+fn map_write_mode(mode: ToolWriteMode) -> WriteMode {
+    match mode {
+        ToolWriteMode::Create {} => WriteMode::Create,
+        ToolWriteMode::Replace { expected_sha256 } => WriteMode::Replace { expected_sha256 },
+    }
+}
 
 const HOST_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 const OUTPUT_REF_PATTERN: &str = "^[0-9a-f]{32}$";
