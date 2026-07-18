@@ -472,8 +472,8 @@ inside `structuredContent.error.details`.
 The authoritative construction check uses a counting serializer over the real
 largest compact fallback model. It starts with an actual maximum `BridgeError`
 whose `ErrorDetails` contains a maximum control-heavy physical root and maximum
-shell version, projects it through `RenderedErrorCore`, and proves the root
-occurs in exactly the two intended contexts. It also uses maximum bounded safe
+control-heavy shell version, projects it through `RenderedErrorCore`, and
+proves the root occurs in exactly the two intended contexts. It also uses maximum bounded safe
 message/action/warnings using the worst legal alternating quote/backslash
 pattern and the synthetic maximum ID. Control-heavy message/action/warning
 inputs are not legal projections: Task 7 replaces every Unicode
@@ -488,7 +488,20 @@ construction rejects `max_frame_bytes` below it.
 A `WireBudget` reserves only the JSON-RPC envelope, bounded request ID, and a
 preconstructed compact fallback before a renderer receives its result budget.
 It does not subtract the newline delimiter because that delimiter is appended
-outside `max_frame_bytes`. These invariants guarantee that all minimum
+after successful capped serialization and remains outside `max_frame_bytes`.
+The `compact_fallback_bytes` argument
+to `required_mcp_frame_bytes` and `WireBudget::for_response` always means the
+serialized fallback `result` value alone; it excludes the JSON-RPC envelope,
+request ID, and newline. `MIN_MCP_FRAME_BYTES` is a complete-frame floor and
+must never be passed as that result-only argument. Task 5 passes zero until a
+real tool-result fallback exists; Task 7 replaces zero with the counting-
+serialized real largest fallback result. In each phase the effective minimum
+is exact: the maximum of the compiled full-frame floor, full tools/list frame,
+and envelope plus the phase's result-only fallback.
+The server stores that result-only count once. Construction passes the stored
+value to `required_mcp_frame_bytes`, and every accepted request passes the same
+unmodified value to `WireBudget::for_response`; tests assert this propagation.
+These invariants guarantee that all minimum
 responses and the exact nine-tool list can always be serialized.
 
 Tool tasks send already budgeted response models. Every bulk-bearing renderer
@@ -984,7 +997,9 @@ Error code, remote context, mutation truth/status/counts, retention status, and
 progress are never truncated. The real maximum compact-fallback counting model
 starts from a maximum actual `ErrorDetails`, applies `RenderedErrorCore`, and
 uses maximum message/action/warnings as well as maximum root and shell version;
-its safe strings use the worst legal alternating quote/backslash pattern. It
+the maximum shell version is control-heavy to exercise its largest permitted
+JSON expansion, and its safe strings use the worst legal alternating
+quote/backslash pattern. It
 asserts the root is absent from nested structured error detail and counts only
 the intended Text and structured-top-level context copies. Task 4 uses an
 equivalent test-only projection; Task 7 must replace it with the real sanitizer

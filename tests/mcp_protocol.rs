@@ -610,18 +610,22 @@ fn task7_min_frame_counts_complete_tools_list_and_definition_growth() {
     let short_count = exact_tools_list_response_bytes(&short, &id).unwrap();
     let long_count = exact_tools_list_response_bytes(&long, &id).unwrap();
     assert!(long_count > short_count);
+    assert!(short_count < MIN_MCP_FRAME_BYTES);
+    let task5_nominal = required_mcp_frame_bytes(&short, 0, &id).unwrap();
+    assert_eq!(task5_nominal, MIN_MCP_FRAME_BYTES);
+    assert!(WireBudget::for_response(task5_nominal, &id, 0).is_some());
 
-    let fallback = MIN_MCP_FRAME_BYTES + 17;
+    let fallback_result_bytes = MIN_MCP_FRAME_BYTES + 17;
     let envelope = serde_json::to_vec(&result_response(id.clone(), Value::Null))
         .unwrap()
         .len()
         - b"null".len();
     assert_eq!(
-        required_mcp_frame_bytes(&short, fallback, &id).unwrap(),
-        (envelope + fallback).max(short_count)
+        required_mcp_frame_bytes(&short, fallback_result_bytes, &id).unwrap(),
+        (envelope + fallback_result_bytes).max(short_count)
     );
-    let required = required_mcp_frame_bytes(&short, fallback, &id).unwrap();
-    assert!(WireBudget::for_response(required, &id, fallback).is_some());
+    let required = required_mcp_frame_bytes(&short, fallback_result_bytes, &id).unwrap();
+    assert!(WireBudget::for_response(required, &id, fallback_result_bytes).is_some());
     assert_eq!(
         required_mcp_frame_bytes(&long, 0, &id).unwrap(),
         MIN_MCP_FRAME_BYTES.max(long_count)
@@ -673,7 +677,13 @@ fn task7_min_frame_authoritative_future_renderer_projection_fits_compiled_floor(
         root.len(),
         codex_ssh_bridge::config::MAX_REMOTE_CONTEXT_ROOT_BYTES
     );
-    let version = "v".repeat(codex_ssh_bridge::capability::MAX_SHELL_VERSION_BYTES);
+    let version = "\u{1}".repeat(codex_ssh_bridge::capability::MAX_SHELL_VERSION_BYTES);
+    assert_eq!(
+        version.len(),
+        codex_ssh_bridge::capability::MAX_SHELL_VERSION_BYTES
+    );
+    assert!(version.chars().all(char::is_control));
+    assert!(serde_json::to_vec(&version).unwrap().len() > version.len());
     // Task 7's real safe-string projection must replace every Unicode control
     // character with one ASCII '?' before/during UTF-8-bound truncation. Quotes
     // and backslashes are therefore the largest legal JSON-escaping pattern.
@@ -732,12 +742,17 @@ fn task7_min_frame_authoritative_future_renderer_projection_fits_compiled_floor(
     let inner = serde_json::to_string(&projected).unwrap();
     let parsed_inner: Value = serde_json::from_str(&inner).unwrap();
     assert_eq!(count_exact_string(&parsed_inner, &root), 1);
+    assert_eq!(count_exact_string(&parsed_inner, &version), 1);
     let result = json!({
         "content":[{"type":"text","text":inner}],
         "structuredContent": projected,
         "isError":true
     });
     assert_eq!(count_exact_string(&result["structuredContent"], &root), 1);
+    assert_eq!(
+        count_exact_string(&result["structuredContent"], &version),
+        1
+    );
     let response = result_response(RequestId::synthetic_max_wire(), result);
     let exact = serde_json::to_vec(&response).unwrap().len();
     eprintln!("authoritative worst safe fallback bytes={exact}");

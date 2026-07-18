@@ -863,37 +863,33 @@ const _: () = assert!(
 );
 ```
 
-Add exact tests that the compiled minimum fits initialize, ping, every fixed
-protocol error, every compact tool fallback, a maximum 256-byte serialized ID,
-and the real largest compact fallback with an untruncated 65,536-byte
-control-heavy physical root in both inner Text JSON and direct structured
-top-level context plus a 256-byte shell version before outer serialization.
-Start with an actual maximum `BridgeError`/`ErrorDetails`, project it through
-`RenderedErrorCore`, and assert physical root/host/shell are absent from nested
-`structuredContent.error.details` and occur only in Text context and structured
-top-level context. Populate the same model with maximum bounded safe
-error/action/warnings using alternating quote/backslash bytes, the worst legal
-escaping pattern after Task 7 normalizes every Unicode `char::is_control()` to
-the single ASCII byte `?` before or during UTF-8-bound truncation. Task 4 may
-use an equivalent test-only projection, but Task 7 must replace it with the
-real sanitizer and `RenderedErrorCore`. Counting-serialize that real model and
-maximum ID and assert it fits the compile minimum; do not substitute a hand
-calculation for this authoritative test. With trusted stub definitions, use a counting serializer and
-synthetic maximum-wire ID to derive the non-degradable complete `tools/list`
-size and prove definition/description growth changes it. Assert
-`McpServer::new` accepts `max(MIN_MCP_FRAME_BYTES, exact_tools_list_bytes)` and
-rejects exactly one byte less. A definition/description growth must increase
-the calculated minimum rather than silently overflow later.
-Assert the exact effective minimum succeeds and one byte less fails, including
-the worst-root compact response; the renderer must not shorten root to pass.
+At Task 4, add exact tests for the compiled formula, a maximum 256-byte
+serialized ID, the generic full tools/list counting helper, and an equivalent
+test-only worst-response projection. That projection starts with an actual
+maximum `BridgeError`/`ErrorDetails`, an untruncated absolute 65,536-byte
+control-heavy root, a worst-escaped control-heavy 256-byte shell version, and
+maximum bounded safe error/action/warnings using alternating quote/backslash
+bytes. It asserts host/root/shell are absent from its nested error core, root
+occurs only in Text context and structured top-level context, exact projected
+bytes succeed, minus one fails, and the compiled 1 MiB floor fits. This is only
+an authoritative size projection: Task 7 must replace it with the real
+sanitizer and `RenderedErrorCore` assertions.
+
+With trusted stub definitions, use a counting serializer and synthetic
+maximum-wire ID to derive the non-degradable complete `tools/list` size and
+prove definition/description growth changes it. Task 5 owns initialize, ping,
+all fixed protocol-response fit tests, and `McpServer::new` exact/minus-one
+assertions once those production objects exist. Task 7 owns every real compact
+tool fallback, all bulk/mutation degradation assertions, the real largest
+fallback count, and repeated constructor exact/minus-one assertions. No Task 4
+test may claim production coverage for a type or renderer not yet implemented.
 
 Assert ID length cannot consume its reserve, and `WireBudget` subtracts only
 envelope/ID/fallback bytes with checked arithmetic; it must not subtract the
-newline delimiter. Force hosts/list/stat/search/read/output-read/run and
-mutation renderings over budget: each bulk tool must use its specified compact
-fallback and retain/preserve its appropriate ref/provenance; applied/partial/unknown mutation
-results must retain their exact status, changed/not-changed/unknown counts,
-`mutation_may_have_applied`, and a ref. They must never become `-32603`.
+newline delimiter. Here and in `required_mcp_frame_bytes`, fallback bytes mean
+the serialized fallback `result` alone, excluding envelope, ID, and newline;
+the compiled full-frame minimum must never be passed as that argument. The
+real per-tool over-budget and mutation-truth assertions are assigned to Task 7.
 
 - [ ] **Step 3: Run framing tests and verify RED**
 
@@ -961,12 +957,14 @@ newline only after capped serialization succeeds; it is not part of
 `serde_json::to_vec` or `to_string` before the cap.
 
 `WireBudget::for_response` reserves the compact JSON-RPC envelope, the at-most
-256-byte serialized ID, and the largest fixed compact fallback before returning
-a renderer budget. It does not reserve the delimiter. `McpServer::new` rejects
-a frame limit below both `MIN_MCP_FRAME_BYTES` and the counting-serialized exact
-full tools/list response for `service.definitions()`. The writer accepts only
-budgeted response models; it is the final invariant check and never invents a
-different semantic result.
+256-byte serialized ID, and the result-only largest fixed compact fallback
+before returning a renderer budget. It does not reserve the delimiter.
+`required_mcp_frame_bytes` takes that same result-only fallback size, adds the
+exact envelope with checked arithmetic, and compares the complete response to
+the compiled full-frame floor and exact tools/list frame. Task 5 wires
+`McpServer::new`; Task 4 only supplies and tests these generic calculators. The
+writer accepts only budgeted response models; it is the final invariant check
+and never invents a different semantic result.
 
 - [ ] **Step 6: Run framing and serializer tests**
 
@@ -1099,6 +1097,17 @@ frames and reads complete response lines. Cover:
 - duplicate in-flight string/numeric IDs; and
 - responses completing out of request order with exact IDs.
 
+This Task 5 suite also counting-serializes initialize, ping, and every fixed
+protocol error with the maximum wire ID and proves each fits the compiled
+full-frame floor. With the stub definitions and result-only fallback size zero,
+it computes `required_mcp_frame_bytes`, proves `McpServer::new` accepts that
+exact value and rejects one byte less, and proves the nominal 1 MiB floor is
+accepted whenever tools/list does not exceed it. These production assertions
+were intentionally not claimed by Task 4. The stub also records the
+`ToolCallContext` and proves its `wire_budget.compact_fallback_bytes` is exactly
+the server's stored result-only value; a nonzero shared-calculator case proves
+constructor minimum and per-ID budget use the identical unmodified count.
+
 The initialize frame used by all positive tests is:
 
 ```json
@@ -1141,6 +1150,7 @@ pub struct McpServer<S> {
     service: Arc<S>,
     max_frame_bytes: usize,
     max_inflight: usize,
+    compact_fallback_result_bytes: usize,
 }
 
 impl<S: ToolService> McpServer<S> {
@@ -1149,10 +1159,13 @@ impl<S: ToolService> McpServer<S> {
         max_frame_bytes: usize,
         max_inflight: usize,
     ) -> BridgeResult<Self> {
+        // Task 5 has no tool-result renderer. Task 7 replaces this initializer
+        // with maximum_compact_fallback_result_bytes().
+        let compact_fallback_result_bytes = 0;
         let required_frame_bytes = required_mcp_frame_bytes(
             service.definitions(),
-            MIN_MCP_FRAME_BYTES,
-            RequestId::synthetic_max_wire(),
+            compact_fallback_result_bytes,
+            &RequestId::synthetic_max_wire(),
         )?;
         if max_frame_bytes < required_frame_bytes
             || max_frame_bytes > crate::MAX_FRAME_BYTES
@@ -1162,7 +1175,12 @@ impl<S: ToolService> McpServer<S> {
         if max_inflight == 0 || max_inflight > 32 {
             return Err(BridgeError::invalid_argument("MCP in-flight bound is invalid"));
         }
-        Ok(Self { service, max_frame_bytes, max_inflight })
+        Ok(Self {
+            service,
+            max_frame_bytes,
+            max_inflight,
+            compact_fallback_result_bytes,
+        })
     }
 }
 ```
@@ -1170,8 +1188,12 @@ impl<S: ToolService> McpServer<S> {
 `required_mcp_frame_bytes` counting-serializes the exact full tools/list
 response using the trusted service definitions and a synthetic request ID whose
 compact wire representation is exactly 256 bytes, then takes the maximum with
-the compiled 1 MiB minimum and the real maximum compact-fallback count. It
-allocates no unbounded output. Tests call
+the compiled 1 MiB complete-frame minimum and the JSON-RPC envelope plus its
+result-only compact-fallback argument. Task 5 passes zero because the real tool
+fallback does not exist yet; passing `MIN_MCP_FRAME_BYTES` here would be wrong
+because it is a complete-frame floor, not a result size. Task 7 replaces zero
+with the counting-serialized real largest fallback result. It allocates no
+unbounded output. Tests call
 the same helper and prove exact minimum succeeds and minimum-minus-one fails.
 
 `serve<R, W>` accepts `R: AsyncRead + Unpin + Send + 'static` and
@@ -1233,7 +1255,8 @@ Validate `tools/call.params` as containing required string `name`, object
 remain closed in both versions. Other top-level params follow June-open versus
 November-closed rules. Reject unnegotiated `task` fields.
 Reject an unknown name before spawn by checking `service.definitions()`.
-Compute `WireBudget` for that exact request ID and construct
+Compute `WireBudget::for_response(self.max_frame_bytes, &id,
+self.compact_fallback_result_bytes)` for that exact request ID and construct
 `ToolCallContext { cancel: token.clone(), wire_budget }`. Insert the ID/token
 before spawning and pass the context to `service.call`. On completion remove
 the entry, suppress
@@ -1646,7 +1669,8 @@ Assert:
   stderr, ControlPath, runtime directory, and agent-socket sentinel strings.
 - maximum 1,024-byte safe message/action, 16 warnings of 1,024 bytes using the
   worst legal alternating quote/backslash pattern, and
-  maximum 256-byte shell version fit the real compact-fallback count; +1 inputs
+  maximum control-heavy 256-byte shell version fit the real compact-fallback
+  count; +1 inputs
   normalize every Unicode `char::is_control()` to one ASCII `?`, truncate at
   UTF-8 boundaries with explicit truncation flags, and preserve quotes,
   backslashes, ordinary Unicode, code, context, truth, counts, and progress.
@@ -1758,6 +1782,17 @@ or call `OutputStore` directly. Non-command retained detail is stored as
 canonical bytes in the reference's logical `stdout` stream, and compact
 metadata includes `detail_retained=true`, `output_ref`, and
 `output_stream="stdout"`, preserving the frozen nine-tool schema.
+
+Once these real renderers exist, counting-serialize the largest compact
+fallback `result` value into `maximum_compact_fallback_result_bytes()` and
+replace Task 5's temporary zero initializer inside `McpServer::new`. Store that
+one derived value in `McpServer::compact_fallback_result_bytes`; both
+`required_mcp_frame_bytes` during construction and every per-ID
+`WireBudget::for_response` must read that same field. This helper
+returns result-only bytes—never the full frame, envelope, ID, newline, or
+`MIN_MCP_FRAME_BYTES`. Recompute the exact effective constructor minimum as the
+maximum of compiled floor, full tools/list frame, and envelope plus that real
+fallback result; repeat exact/minus-one tests before any end-to-end acceptance.
 
 Define truthful provenance and expose only a generic bridge facade:
 
@@ -1947,7 +1982,8 @@ Close stdin and assert:
 - stderr contains no config contents, host path, ControlPath, or caller frame.
 
 Construct the same `RemoteMcpTools` in memory, compute its exact required frame
-from all nine definitions and the synthetic maximum ID, and assert
+from all nine definitions, the synthetic maximum ID, and the real result-only
+largest compact-fallback count, and assert
 `McpServer::new` accepts that exact maximum-with-compiled-minimum and rejects
 one byte less. The accepted server must return the complete nine-tool list.
 

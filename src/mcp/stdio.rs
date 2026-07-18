@@ -239,6 +239,9 @@ pub fn exact_tools_list_response_bytes(
     })
 }
 
+/// Calculates the complete response-frame minimum. `compact_fallback_bytes`
+/// is the serialized `result` value only: it excludes the JSON-RPC envelope,
+/// request ID, and newline delimiter.
 pub fn required_mcp_frame_bytes(
     definitions: &[ToolDefinition],
     compact_fallback_bytes: usize,
@@ -302,6 +305,8 @@ fn frame_size_error() -> serde_json::Error {
 }
 
 impl WireBudget {
+    /// Reserves a result-only compact fallback plus the exact JSON-RPC
+    /// envelope. The newline delimiter is outside `max_frame_bytes`.
     pub fn for_response(
         max_frame_bytes: usize,
         id: &RequestId,

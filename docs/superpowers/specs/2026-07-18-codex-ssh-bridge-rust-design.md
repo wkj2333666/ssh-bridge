@@ -265,6 +265,20 @@ Malformed `tools/call` envelopes and unknown tool names return JSON-RPC `-32602`
 
 Every accepted tool future receives `ToolCallContext { cancel, wire_budget }`; the exact token goes to the bridge and the exact budget goes to validation/success/error rendering. `max_frame_bytes` excludes the newline delimiter. A compiled 1 MiB `MIN_MCP_FRAME_BYTES` is statically checked against the shared 65,536-byte root ceiling times a conservative thirteen-byte combined expansion: root occurs in inner Text JSON which is escaped again by outer MCP JSON, and once directly in structured context. The reserve also covers a maximum 256-byte wire ID and 64 KiB fixed response overhead. Error rendering derives a context-free `RenderedErrorCore` from `BridgeError`; Text carries context once and the structured top level carries it once, while nested `structuredContent.error.details` excludes host/root/shell. The authoritative counting test starts from a real maximum `ErrorDetails` with maximum root/shell and bounded safe strings, projects it, and proves only those two root contexts exist and fit. Server construction also counts the trusted full nine-tool list and uses the largest requirement. Exact minimum succeeds and minimum-minus-one is rejected without root truncation. Response renderers reserve envelope/ID/fallback but not newline. The writer is only a capped final serializer. It never replaces a completed mutation result with `-32603`.
 
+`required_mcp_frame_bytes` and `WireBudget::for_response` take fallback bytes
+for the serialized `result` value only, excluding JSON-RPC envelope, request ID,
+and newline. The 1 MiB constant is a complete-frame floor and is never supplied
+as that argument. Task 5 passes zero until real tool-result rendering exists;
+Task 7 replaces it with the counting-serialized real largest fallback result.
+`McpServer` stores this one result-only count; construction and every per-ID
+`WireBudget::for_response` consume the same field, with an equality/propagation
+test preventing budget drift.
+Task 4 owns only the generic counting and test-only worst-size projection;
+Task 5 owns server/lifecycle exact-min tests, and Task 7 owns real renderer and
+all bulk/mutation fallback assertions. The worst projection uses an absolute
+control-heavy maximum root, control-heavy maximum shell version, and the worst
+legal alternating quote/backslash safe strings.
+
 All bulk tools—not only read/run—have compact fallbacks. Hosts/list/stat/search/read retain omitted canonical detail behind a bridge-owned logical-stdout ref, and run preserves or creates a ref. Output-read preserves its reference, but after wire shrink sets `next_offset = offset + actual_inline_raw_bytes` and derives EOF from that actual raw position; UTF-8 and Base64 offsets are always stored raw bytes. Multi-page reassembly tests prove no gap or overlap. `remote_hosts` has no five-entry hard limit; five is only expected concurrent peak. Retention is best-effort: read-only failure preserves context/count/truncation with `detail_retained=false`, mutation failure preserves truth/counts, and neither becomes `-32603`. Successful retention returns the true/ref pair. MCP never accesses output-store internals.
 
 Stable bridge error codes include:
