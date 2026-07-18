@@ -1,0 +1,31 @@
+{
+  "name": "codex-ssh-bridge",
+  "version": "0.1.0",
+  "description": "Run structured SSH operations from local Codex without installing Codex on remote hosts.",
+  "author": {
+    "name": "Local developer"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ssh",
+    "remote-development",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex SSH Bridge",
+    "shortDescription": "Operate allowlisted SSH hosts from local Codex.",
+    "longDescription": "Keeps Codex and SSH credentials on the local machine while exposing bounded remote command and file tools over a dependency-free MCP server.",
+    "developerName": "Local developer",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use Remote SSH Ops to inspect my configured devbox.",
+      "Run the tests on my configured SSH host and explain failures."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

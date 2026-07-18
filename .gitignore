@@ -1,0 +1,4 @@
+.worktrees/
+target/
+.superpowers/
+bin/codex-ssh-bridge

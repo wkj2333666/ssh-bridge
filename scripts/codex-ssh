@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+sys.dont_write_bytecode = True
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+from ssh_bridge import (  # noqa: E402
+    Bridge,
+    BridgeError,
+    ConfigError,
+    default_config_path,
+    load_config,
+)
+
+
+def emit(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def init_config(args: argparse.Namespace) -> int:
+    path = Path(args.config).expanduser() if args.config else default_config_path()
+    if path.exists() and not args.force:
+        raise BridgeError(f"refusing to overwrite existing config: {path}; pass --force explicitly")
+    payload = {
+        "version": 1,
+        "ssh": {
+            "binary": "ssh",
+            "connect_timeout_sec": 10,
+            "server_alive_interval_sec": 15,
+            "server_alive_count_max": 3,
+        },
+        "limits": {
+            "command_timeout_sec": 120,
+            "max_command_timeout_sec": 1800,
+            "max_output_bytes": 1_048_576,
+            "max_file_bytes": 1_048_576,
+        },
+        "hosts": {
+            args.host: {
+                "root": args.root,
+                "read_only": args.read_only,
+                "description": args.description,
+            }
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if args.force else os.O_EXCL)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    emit({"created": str(path), "host": args.host, "next": f"ssh {args.host}"})
+    return 0
+
+
+def bridge_from_args(args: argparse.Namespace) -> Bridge:
+    path = Path(args.config).expanduser() if getattr(args, "config", None) else None
+    return Bridge(load_config(path))
+
+
+def doctor(args: argparse.Namespace) -> int:
+    bridge = bridge_from_args(args)
+    checks: dict[str, Any] = {
+        "config": str(bridge.config.path),
+        "ssh_binary": bridge._ssh_binary(),
+        "hosts": bridge.list_hosts()["hosts"],
+    }
+    if args.host:
+        checks["ssh_resolution"] = bridge.resolved_ssh_config(args.host)
+        checks["probe"] = bridge.probe(args.host, args.timeout_sec)
+    emit(checks)
+    return 0
+
+
+def mount_sshfs(args: argparse.Namespace) -> int:
+    bridge = bridge_from_args(args)
+    host = bridge._host(args.host)
+    sshfs = shutil.which("sshfs")
+    if sshfs is None:
+        raise BridgeError("sshfs was not found on PATH; install SSHFS locally first")
+    mountpoint = Path(args.mountpoint).expanduser().resolve()
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    if any(mountpoint.iterdir()) and not args.allow_nonempty:
+        raise BridgeError("mountpoint is not empty; pass --allow-nonempty only after inspection")
+    remote_path = bridge._remote_path(host, args.remote_path or ".")
+    ssh = bridge.config.ssh
+    argv = [sshfs]
+    if ssh.config_file is not None:
+        argv.extend(["-F", str(ssh.config_file)])
+    argv.extend(
+        [
+            f"{host.alias}:{remote_path}",
+            str(mountpoint),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "reconnect",
+            "-o",
+            f"ServerAliveInterval={ssh.server_alive_interval_sec}",
+            "-o",
+            f"ServerAliveCountMax={ssh.server_alive_count_max}",
+        ]
+    )
+    if args.allow_nonempty:
+        argv.extend(["-o", "nonempty"])
+    completed = subprocess.run(argv, check=False, timeout=args.timeout_sec)
+    if completed.returncode != 0:
+        raise BridgeError(f"sshfs failed with exit code {completed.returncode}")
+    emit(
+        {
+            "host": host.alias,
+            "remote_path": remote_path,
+            "mountpoint": str(mountpoint),
+            "warning": "Files are remote, but ordinary local shell commands still run locally.",
+        }
+    )
+    return 0
+
+
+def unmount_sshfs(args: argparse.Namespace) -> int:
+    mountpoint = Path(args.mountpoint).expanduser().resolve()
+    if not mountpoint.exists():
+        raise BridgeError(f"mountpoint does not exist: {mountpoint}")
+    if sys.platform == "darwin" or "bsd" in sys.platform:
+        command = shutil.which("umount")
+        argv = [command, str(mountpoint)] if command else []
+    else:
+        command = shutil.which("fusermount3") or shutil.which("fusermount")
+        argv = [command, "-u", str(mountpoint)] if command else []
+    if not argv:
+        raise BridgeError("no supported unmount command was found")
+    completed = subprocess.run(argv, check=False, timeout=args.timeout_sec)
+    if completed.returncode != 0:
+        raise BridgeError(f"unmount failed with exit code {completed.returncode}")
+    emit({"unmounted": str(mountpoint)})
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="codex-ssh",
+        description="Local SSH helper used by the Codex SSH Bridge plugin.",
+    )
+    root.add_argument(
+        "--config",
+        help="Config path (default: CODEX_SSH_BRIDGE_CONFIG or ~/.config/codex-ssh-bridge/config.json)",
+    )
+    commands = root.add_subparsers(dest="subcommand", required=True)
+
+    init = commands.add_parser("init", help="Create a minimal local configuration")
+    init.add_argument("--host", required=True, help="Concrete alias from ~/.ssh/config")
+    init.add_argument("--root", required=True, help="Absolute remote project path, or '.'")
+    init.add_argument("--description", default="")
+    init.add_argument("--read-only", action="store_true")
+    init.add_argument("--force", action="store_true")
+    init.set_defaults(action=init_config)
+
+    hosts = commands.add_parser("hosts", help="List allowlisted hosts")
+    hosts.set_defaults(action=lambda args: (emit(bridge_from_args(args).list_hosts()), 0)[1])
+
+    check = commands.add_parser("doctor", help="Validate config and optionally probe a host")
+    check.add_argument("--host")
+    check.add_argument("--timeout-sec", type=int, default=20)
+    check.set_defaults(action=doctor)
+
+    run = commands.add_parser("run", help="Run a remote command")
+    run.add_argument("host")
+    run.add_argument("--cwd", default=".")
+    run.add_argument("--timeout-sec", type=int)
+    run.add_argument("command", nargs="+")
+
+    def run_action(args: argparse.Namespace) -> int:
+        command = args.command
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            raise BridgeError("provide a command after --")
+        payload = bridge_from_args(args).run(
+            args.host,
+            shlex.join(command),
+            cwd=args.cwd,
+            timeout_sec=args.timeout_sec,
+        )
+        emit(payload)
+        return 0 if payload["exit_code"] == 0 else int(payload["exit_code"])
+
+    run.set_defaults(action=run_action)
+
+    mount = commands.add_parser("mount", help="Explicitly mount a remote path with SSHFS")
+    mount.add_argument("host")
+    mount.add_argument("mountpoint")
+    mount.add_argument("--remote-path", default=".")
+    mount.add_argument("--allow-nonempty", action="store_true")
+    mount.add_argument("--timeout-sec", type=int, default=30)
+    mount.set_defaults(action=mount_sshfs)
+
+    unmount = commands.add_parser("unmount", help="Unmount an SSHFS mountpoint")
+    unmount.add_argument("mountpoint")
+    unmount.add_argument("--timeout-sec", type=int, default=30)
+    unmount.set_defaults(action=unmount_sshfs)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return int(args.action(args))
+    except (BridgeError, ConfigError, OSError, subprocess.SubprocessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
