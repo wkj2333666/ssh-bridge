@@ -2,7 +2,16 @@
 
 Date: 2026-07-18
 
-Status: Controller-bound requirements; implementation review pending
+Status: Controller-approved formal-review revision; rework in progress
+
+## Formal Review Revision
+
+The first implementation commit (`6356179`) was not approved. This revision
+supersedes every earlier passage that allowed whole-frame `read_stream`
+aggregation, retry inside the general `SshRunner` fixed executor, local list
+hidden filtering, or a planned-SIGPIPE success path. The seven Important
+findings are binding and must all pass RED/GREEN regression tests before the
+Task 4 rework can be approved.
 
 ## 1. Scope
 
@@ -441,7 +450,13 @@ stream ceilings plus an aggregate checked ceiling. Both streams are forced to
 private spools so previews are never used as protocol data. Internal captures
 are not inserted into `OutputStore`'s public token map and cannot be paged by
 `output_read`; `InternalCapturedOutput` exposes only crate-private bounded page
-reads.
+reads. `SpoolCursor` reads those files in 64-KiB pages, tracks a checked raw
+offset, and retains at most its current incomplete field or line. A delimiter
+at byte 65,536 is handled exactly like one within a page. List/stat/search
+consume fields or JSON lines directly from the cursor and retain only their
+public result ceiling plus one lookahead; none first collects a stream up to
+8 MiB in one `Vec`. Small closed stderr control records and read content use
+the same cursor with their narrower 1-KiB and 1-MiB bounds.
 
 A fixed script emits an explicit `CAPABILITY_MISMATCH` result only when a tool
 that was functionally probed is no longer usable. It exits zero and emits the
@@ -449,10 +464,15 @@ strict stderr record `CODE=CAPABILITY_MISMATCH\0CAPABILITY=<key>\0`, with no
 other field or byte. `<key>` must occur exactly once in that invocation's
 compile-time `required_capabilities`; an unknown key, duplicate/extra field,
 nonterminal record, or nonzero exit is `ProtocolError`, never a retry trigger.
-The facade invalidates that host and repeats the same already-validated
-read-only request once. A cached `false` capability fails immediately without
-a retry. No transport, timeout, cancellation, filesystem, output-limit, or
-other framing failure is retried.
+`SshRunner::execute_fixed` performs exactly one execution and never interprets
+or retries this record. A crate-private `RemoteBridge` read-only wrapper parses
+the completed exit-zero fixed result, invalidates the host capability, probes
+again, and repeats the same already-validated read-only operation at most once.
+This boundary is deliberately inside the Task 4 facade so future Task 5 writes
+cannot inherit automatic retry. A cached `false` capability fails immediately.
+Transport, timeout, cancellation, filesystem, output-limit, ordinary nonzero
+exit, and all non-mismatch protocol failures execute once and are never
+retried.
 
 Every facade entry that can start a fixed operation first creates an
 `InternalSpoolOwner`. It owns an `Arc<Mutex<CleanupState>>`; the request gives
@@ -488,20 +508,31 @@ The capability probe continues to use its private probe directory and strict
 NUL records. Task 4 adds functional flags rather than assuming a GNU-looking
 binary is compatible:
 
-- `read_slice`: the chosen stat/wc/tail/sed/head/cat pipeline preserves NUL,
-  missing-final-newline, byte ceilings, and line boundaries.
-- `find_nul`: find can emit raw paths and fixed metadata as NUL records and can
-  honor the required no-follow/depth behavior.
-- `stat_printf`: stat emits the hexadecimal mode, size, epoch seconds, and
-  nanosecond timestamp form the parser expects.
-- `rg_json`: rg fixed-string JSON produces the required text/byte forms and
-  exit statuses.
-- `grep_nul`: grep fixed-string/no-binary output uses a NUL filename boundary.
-- `xargs_nul`: NUL-delimited stdin reaches child argv without altering
-  non-UTF-8 path bytes.
-- `search_bound`: private mode-0700 `mktemp -d`, `mkfifo`, `head -c`, trapped
-  scratch cleanup, sequential `xargs -0`, and the expected planned-cutoff
-  status signature work together without `pipefail`.
+- `read_slice`: the exact `tail -n`, `head -n`, `head -c`, `tail -c`, `wc -l`
+  sequence used by read preserves binary NUL, a final non-LF line, byte
+  lookahead, and success/failure status.
+- `find_nul`: the exact GNU `find -H` options used by list/search emit NUL
+  fields, dereference only the starting root, do not follow descendant
+  symlinks, honor `mindepth`/`maxdepth`, and support hidden pruning.
+- `stat_printf`: the exact `%f`, `%s`, `%Y`, and `%y` forms used by metadata
+  preserve a pre-epoch second and nine nanosecond digits.
+- `rg_json`: the exact fixed-string/hidden/no-ignore/text variants used by
+  search produce documented JSON event kinds, binary byte fields, and statuses
+  0/1/>1.
+- `grep_nul`: the exact `grep -IHnZ -F --` form uses a NUL filename boundary,
+  ignores binary input, and preserves its exit status.
+- `xargs_nul`: the exact sequential `xargs -0 -r sh -c` form reconstructs NUL
+  operands, including newline bytes, and preserves child failure.
+- `search_bound`: mode-0700 `mktemp -d`, `mkfifo`, a parent-held FIFO read fd,
+  `head -c limit+1` to bounded scratch, draining the remainder from that same
+  fd, final producer/xargs status capture, and trapped cleanup work without
+  `pipefail` or planned SIGPIPE.
+
+Each flag is independent. A PATH-prepended incompatible shim for one exact
+behavior makes only the corresponding flag false. Probe scratch cleanup is
+asserted after both success and every failed behavior. In the fake SSH fixture,
+`FAKE_SSH_MODE=local-fixed` executes the real capability command by default;
+synthetic all-true records are never allowed to mask the production probe.
 
 Probe parsing still rejects unknown keys, duplicates, malformed booleans, or a
 wrong protocol version. Existing flags needed by later write tasks remain.
@@ -510,17 +541,24 @@ wrong protocol version. Existing flags needed by later write tasks remain.
 
 ### List
 
-The list script validates the root and emits fixed groups of NUL fields for at
-most `max_entries + 1` qualifying entries. Depth 1 means direct children and
-the root itself is excluded. With `include_hidden=false`, any relative
-component beginning with `.` is pruned. The configured root operand is
-dereferenced, while descendant symlinks are not followed.
+The list script accepts `show_hidden` and `max_entries` as explicit positional
+operands. It changes directory through the configured root, then uses the
+functionally probed `find -H` form. Depth 1 means direct children and the root
+itself is excluded. With `include_hidden=false`, the remote find expression
+prunes a candidate before descent when any root-relative component begins with
+`.`. Qualifying records pass through sequential NUL xargs grouping; only after
+qualification does a private counter emit at most `max_entries + 1` complete
+metadata groups. Therefore a hidden flood neither consumes the entry budget nor
+causes `truncated=true`. The configured root operand is dereferenced, while
+descendant symlinks are not followed.
 
-Each record contains raw actual-path bytes plus kind, size, mode, mtime seconds,
-and mtime nanoseconds. The local parser checks the exact field count, numeric
-ranges, and terminal NUL, strips only the normalized configured-root prefix,
-sorts by raw relative path bytes, retains at most the requested count, and
-sets `truncated` only after observing one additional qualifying record.
+Each record contains raw root-relative-path bytes plus kind, size, mode, mtime
+seconds, and mtime nanoseconds. Rust reconstructs the actual operand bytes from
+the configured list-root operand, never from `physical_root`. `SpoolCursor`
+checks the exact field count and numeric ranges across page boundaries, sorts
+by raw relative path bytes, retains at most `max_entries + 1`, returns the first
+requested count, and sets `truncated` only after observing the qualifying
+lookahead record.
 
 A missing root returns `NotFound`; an unreadable root returns
 `PermissionDenied`; a non-directory root returns `NotDirectory`. No raw remote
@@ -589,35 +627,36 @@ files and never follows descendant symlinks.
 Search uses one bounded-output helper for both phases. The helper creates a
 private mode-0700 directory with functionally probed `mktemp -d`, installs
 signal/exit traps before creating a FIFO and status files, and starts the fixed
-producer in the background with stdout attached to that FIFO. In the
-foreground, functionally probed `head -c` copies at most the caller-supplied
-`remaining_protocol_bytes + 1` raw bytes from the FIFO into a private scratch
-file; this is never greater than `max_frame_bytes + 1`. It then waits for the
-producer, records whether the extra byte was observed, and copies only that
-already-bounded scratch file to SSH stdout. POSIX sh never uses or assumes
-`pipefail`.
+producer in the background with stdout attached to that FIFO. The parent shell
+opens one read fd and keeps it open. A foreground `head -c` child copies at
+most the caller-supplied `remaining_protocol_bytes + 1` raw bytes from that fd
+into private scratch; this is never greater than `max_frame_bytes + 1`. The
+parent then drains all remaining FIFO bytes from the same fd to `/dev/null`, so
+the producer is never intentionally terminated by SIGPIPE. It waits for the
+real producer, engine, and xargs statuses before deciding whether any bounded
+scratch is usable. POSIX sh never uses or assumes `pipefail`.
 
 The producer uses sequential, functionally probed `xargs -0` batches. Each
 fixed inner wrapper suppresses utility diagnostics, maps engine status 0 to
 match success and status 1 to no-match success, and writes the first status
 greater than 1 into a separate private status record before stopping xargs.
-The outer wrapper also records xargs' aggregate status. The `search_bound`
-functional probe freezes the exact signal/xargs status produced when the
-foreground byte cutoff intentionally closes the FIFO. A pre-cutoff engine
-error is never reclassified as truncation; only the probed cutoff signature is
-accepted when the extra byte proves a planned cutoff. An unrecognized nonzero
-producer status is a fixed operation error. Scratch files and the FIFO are
+The outer wrapper also records xargs' aggregate status. After the drain and
+wait, any real producer, engine, or xargs error wins over the byte cap even when
+a complete capped prefix exists. Only all-zero final statuses allow the
+bounded scratch to be emitted with a cap marker. Scratch files and the FIFO are
 removed by the trap on success, error, cancellation, and signal termination.
 
 Search then has two uses of that helper:
 
 1. A fixed find operation enumerates regular-file candidates as raw
-   NUL-delimited actual paths. It returns at most 10,001 records and at most
-   `max_frame_bytes + 1` bytes. Rust parses the entire bounded capture while
-   retaining no more than 10,001 paths, derives lossless relative paths,
-   applies all positive slash-aware `globset` matchers to raw Unix path bytes,
-   and sorts selected candidates by raw relative bytes. Hitting the candidate
-   count or planned byte ceiling sets `truncated=true`.
+   NUL-delimited actual paths. A remote qualifying counter emits at most 10,001
+   records and the bounded helper emits at most `max_frame_bytes + 1` bytes.
+   Rust parses the entire bounded capture with `SpoolCursor`, retaining no more
+   than 10,001 matching paths, derives lossless relative paths, applies all
+   positive slash-aware matchers built with
+   `GlobBuilder::literal_separator(true)`, and sorts selected candidates by raw
+   relative bytes. Hitting the candidate count or byte ceiling sets
+   `truncated=true`.
 2. The filtered raw paths are divided into bounded stdin batches, each of which
    satisfies `rendered_command_bytes + stdin_bytes <= max_frame_bytes`. Each
    batch is sent as NUL-delimited bytes to a fixed POSIX-sh script.
@@ -633,7 +672,8 @@ Search then has two uses of that helper:
 When `rg_json=true`, rg runs with JSON and fixed-string semantics. With
 `binary=false` it ignores binary files; with `binary=true` it uses rg's byte
 form. Its bounded raw JSON stream may contain the documented non-match event
-kinds; Rust validates their framing and strictly parses every match event,
+kinds `begin`, `end`, and `summary`; Rust validates and ignores only those
+known kinds, rejects every unknown event kind, and strictly parses every match,
 requiring the path, line, first byte-column, and line text/bytes forms. It
 rejects an oversized event and does not expose submatch arrays.
 
@@ -644,14 +684,15 @@ the following line record, finds the literal query bytes locally to obtain the
 one-based byte column, and losslessly encodes the line content.
 
 Rust consumes every completed batch within the global bounded
-`max_frame_bytes + 1` content budget but retains only `max_results + 1`
+`max_frame_bytes + 1` content budget using `SpoolCursor` but retains only
+`max_results + 1`
 matching records. It returns the first
 `max_results` and sets `truncated=true` if the extra match exists, candidate
-enumeration was incomplete, or the planned byte cutoff was reached. An
+enumeration was incomplete, or the byte cutoff was reached. An
 incomplete first record/event is an oversized-record `ProtocolError`. If at
 least one complete record precedes a trailing partial record exactly at the
-planned cutoff, Rust discards only that partial suffix and reports truncation;
-the same partial record without a proved planned cutoff is `ProtocolError`.
+byte cutoff, Rust discards only that partial suffix and reports truncation;
+the same partial record without a proved byte cutoff is `ProtocolError`.
 This helper's explicit one-byte lookahead is below `OutputStore`'s hard capture
 limit: an `OutputLimit` always discards the capture and aborts the operation,
 and is never converted to partial success. rg/grep exit 1 is a successful

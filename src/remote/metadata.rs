@@ -1,51 +1,115 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedRunRequest, SshRunner};
+use crate::ssh::FixedRunRequest;
 
 use super::protocol::{
-    context, encode_bytes, entry_error, kind, nul_fields, parse_mode, parse_mtime, parse_u64,
-    protocol_error, read_stream, trim_capped_nul_groups, utf8,
+    SpoolCursor, context, encode_bytes, entry_error, kind, parse_mode, parse_mtime, parse_u64,
+    protocol_error, read_small_stream, utf8,
 };
 use super::{
-    ListEntry, ListResult, RemoteFileKind, RemoteMetadata, ResolvedList, ResolvedStat, StatEntry,
-    StatResult,
+    ListEntry, ListResult, RemoteBridge, RemoteFileKind, RemoteMetadata, ResolvedList,
+    ResolvedStat, StatEntry, StatResult,
 };
 
 const LIST_SCRIPT: &str = r#"
 root=$1
 depth=$2
-limit=$3
+show_hidden=$3
+max_entries=$4
+limit=$5
+if ! find -H . -mindepth 1 -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=find_nul\000' >&2
+    exit 0
+fi
+if ! printf 'x\000' | xargs -0 -r sh -c 'exit 0' codex-ssh-list-probe >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2
+    exit 0
+fi
+if ! command -v mktemp >/dev/null 2>&1 ||
+   ! command -v mkfifo >/dev/null 2>&1 ||
+   ! command -v head >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
+    exit 0
+fi
 if [ ! -e "$root" ] && [ ! -L "$root" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
 if [ ! -d "$root" ]; then printf 'NOT_DIRECTORY\000' >&2; exit 0; fi
 if [ ! -r "$root" ]; then printf 'PERMISSION_DENIED\000' >&2; exit 0; fi
+cd -- "$root" 2>/dev/null || { printf 'PERMISSION_DENIED\000' >&2; exit 0; }
 umask 077
 scratch=$(mktemp -d /tmp/codex-ssh-list.XXXXXX) || exit 2
 cleanup() { rm -rf -- "$scratch"; }
 trap cleanup EXIT HUP INT TERM
-fifo=$scratch/fifo
+raw_fifo=$scratch/raw-fifo
+out_fifo=$scratch/out-fifo
 data=$scratch/data
-status=$scratch/status
-mkfifo "$fifo" || exit 2
+find_status=$scratch/find-status
+xargs_status=$scratch/xargs-status
+count_file=$scratch/count
+printf 0 >"$count_file"
+mkfifo "$raw_fifo" "$out_fifo" || exit 2
 (
-    find -H "$root" -mindepth 1 -maxdepth "$depth" -printf '%p\000%y\000%s\000%m\000%T@\000' 2>/dev/null >"$fifo"
-    printf '%s' "$?" >"$status"
+    if [ "$show_hidden" = 1 ]; then
+        find -H . -mindepth 1 -maxdepth "$depth" -printf '%P\000%y\000%s\000%m\000%T@\000' 2>/dev/null
+    else
+        find -H . -mindepth 1 -maxdepth "$depth" \
+            \( -path './.*' -o -path '*/.*' \) -prune -o \
+            -printf '%P\000%y\000%s\000%m\000%T@\000' 2>/dev/null
+    fi >"$raw_fifo"
+    printf '%s' "$?" >"$find_status"
 ) &
-producer=$!
-head -c "$limit" <"$fifo" >"$data" || exit 2
-wait "$producer" || true
+find_pid=$!
+(
+    xargs -0 -r -n 100 sh -c '
+        count_file=$1
+        max_entries=$2
+        shift 2
+        count=$(cat "$count_file") || exit 65
+        while [ "$#" -ge 5 ]; do
+            if [ "$count" -lt $((max_entries + 1)) ]; then
+                count=$((count + 1))
+                printf "%s\000%s\000%s\000%s\000%s\000" "$1" "$2" "$3" "$4" "$5"
+            fi
+            shift 5
+        done
+        [ "$#" -eq 0 ] || exit 65
+        printf "%s" "$count" >"$count_file"
+    ' codex-ssh-list "$count_file" "$max_entries" <"$raw_fifo" >"$out_fifo" 2>/dev/null
+    printf '%s' "$?" >"$xargs_status"
+) &
+xargs_pid=$!
+exec 3<"$out_fifo"
+head -c "$limit" <&3 >"$data"
+head_status=$?
+cat <&3 >/dev/null
+drain_status=$?
+exec 3<&-
+wait "$xargs_pid" 2>/dev/null
+xargs_wait=$?
+wait "$find_pid" 2>/dev/null
+find_wait=$?
 bytes=$(wc -c <"$data")
-producer_status=$(cat "$status" 2>/dev/null || printf 2)
-if [ "$bytes" -lt "$limit" ] && [ "$producer_status" -ne 0 ]; then exit 2; fi
+xargs_final=$(cat "$xargs_status" 2>/dev/null || printf 2)
+find_final=$(cat "$find_status" 2>/dev/null || printf 2)
+if [ "$head_status" -ne 0 ] || [ "$drain_status" -ne 0 ] ||
+   [ "$xargs_wait" -ne 0 ] || [ "$find_wait" -ne 0 ] ||
+   [ "$xargs_final" -ne 0 ] || [ "$find_final" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
 "#;
 
 const STAT_SCRIPT: &str = r#"
+if ! stat --printf='%f' -- /dev/null >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=stat_printf\000' >&2
+    exit 0
+fi
+if ! printf 'x\000' | xargs -0 -r sh -c 'exit 0' codex-ssh-stat-probe >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2
+    exit 0
+fi
 exec xargs -0 -r sh -c '
 for path do
     printf "%s\000" "$path"
@@ -61,24 +125,27 @@ done
 "#;
 
 pub(super) async fn list(
-    runner: &Arc<SshRunner>,
+    bridge: &RemoteBridge,
     request: ResolvedList,
     cancel: CancellationToken,
 ) -> BridgeResult<ListResult> {
+    let runner = &bridge.runner;
     let limits = runner.config().host(&request.host)?.limits;
     let owner = InternalSpoolOwner::new();
-    let result = runner
-        .execute_fixed(
+    let result = bridge
+        .execute_readonly_fixed(
             FixedRunRequest {
                 host: request.host.clone(),
                 script: LIST_SCRIPT,
                 args: vec![
                     request.path.absolute().to_owned(),
                     request.depth.to_string(),
+                    if request.include_hidden { "1" } else { "0" }.to_owned(),
+                    request.max_entries.to_string(),
                     (limits.max_frame_bytes + 1).to_string(),
                 ],
                 stdin: None,
-                required_capabilities: &["find_nul", "search_bound"],
+                required_capabilities: &["find_nul", "xargs_nul", "search_bound"],
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
                 stderr_limit: 1024,
                 timeout: Duration::from_millis(limits.command_timeout_ms),
@@ -87,7 +154,7 @@ pub(super) async fn list(
             cancel,
         )
         .await?;
-    let stderr = read_stream(&result.output, StreamKind::Stderr, 1024).await?;
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
     let capped = stderr == b"CAPPED\0";
     if !stderr.is_empty() && !capped {
         return match stderr.as_slice() {
@@ -97,48 +164,77 @@ pub(super) async fn list(
             _ => Err(protocol_error("list control record is invalid")),
         };
     }
-    let mut stdout = read_stream(
+    let root = request.path.absolute().as_bytes();
+    let mut cursor = SpoolCursor::new(
         &result.output,
         StreamKind::Stdout,
         limits.max_frame_bytes + 1,
-    )
-    .await?;
-    if capped {
-        trim_capped_nul_groups(&mut stdout, 5)?;
-    }
-    let fields = nul_fields(&stdout)?;
-    if !capped && fields.len() % 5 != 0 {
-        return Err(protocol_error("list field count is invalid"));
-    }
-    let root = request.path.absolute().as_bytes();
-    let mut entries = Vec::new();
-    for record in fields.chunks_exact(5) {
-        let actual = record[0];
-        let relative = relative(root, actual)?;
+    )?;
+    let mut entries = Vec::with_capacity(request.max_entries.saturating_add(1));
+    let mut qualifying = 0usize;
+    let mut completed_records = 0usize;
+    'records: loop {
+        let first = if capped {
+            cursor.next_field_capped(limits.max_frame_bytes).await?
+        } else {
+            cursor.next_field(limits.max_frame_bytes).await?
+        };
+        let Some(actual) = first else { break };
+        let mut record = Vec::with_capacity(5);
+        record.push(actual);
+        for _ in 1..5 {
+            let field = if capped {
+                cursor.next_field_capped(limits.max_frame_bytes).await?
+            } else {
+                cursor.next_field(limits.max_frame_bytes).await?
+            };
+            let Some(field) = field else {
+                if capped {
+                    break 'records;
+                }
+                return Err(protocol_error("list field count is invalid"));
+            };
+            record.push(field);
+        }
+        let discovered = record[0].as_slice();
+        if discovered.is_empty() || discovered.starts_with(b"/") {
+            return Err(protocol_error("list relative path is invalid"));
+        }
+        let actual = join_raw(root, discovered);
+        let relative = join_raw(request.path.relative().as_bytes(), discovered);
+        completed_records += 1;
         if !request.include_hidden
             && relative
                 .split(|byte| *byte == b'/')
                 .any(|part| part.first() == Some(&b'.'))
         {
-            continue;
+            return Err(protocol_error("list returned a hidden path after pruning"));
         }
-        let (mtime_seconds, mtime_nanoseconds) = parse_mtime(record[4])?;
-        entries.push(ListEntry {
-            actual_path: encode_bytes(actual),
-            relative_path: encode_bytes(relative),
-            metadata: RemoteMetadata {
-                kind: kind(record[1])?,
-                size: parse_u64(record[2])?,
-                mode: parse_mode(record[3])?,
-                mtime_seconds,
-                mtime_nanoseconds,
-            },
-        });
+        qualifying = qualifying
+            .checked_add(1)
+            .ok_or_else(|| protocol_error("list entry count overflowed"))?;
+        let (mtime_seconds, mtime_nanoseconds) = parse_mtime(&record[4])?;
+        if entries.len() < request.max_entries.saturating_add(1) {
+            entries.push(ListEntry {
+                actual_path: encode_bytes(&actual),
+                relative_path: encode_bytes(&relative),
+                metadata: RemoteMetadata {
+                    kind: kind(&record[1])?,
+                    size: parse_u64(&record[2])?,
+                    mode: parse_mode(&record[3])?,
+                    mtime_seconds,
+                    mtime_nanoseconds,
+                },
+            });
+        }
+    }
+    if capped && cursor.discarded_incomplete() && completed_records == 0 {
+        return Err(protocol_error("list record is oversized"));
     }
     entries.sort_by(|left, right| {
         decoded_sort_key(&left.relative_path).cmp(&decoded_sort_key(&right.relative_path))
     });
-    let truncated = capped || entries.len() > request.max_entries;
+    let truncated = capped || qualifying > request.max_entries;
     entries.truncate(request.max_entries);
     Ok(ListResult {
         context: context(
@@ -154,10 +250,11 @@ pub(super) async fn list(
 }
 
 pub(super) async fn stat(
-    runner: &Arc<SshRunner>,
+    bridge: &RemoteBridge,
     request: ResolvedStat,
     cancel: CancellationToken,
 ) -> BridgeResult<StatResult> {
+    let runner = &bridge.runner;
     let limits = runner.config().host(&request.host)?.limits;
     let mut stdin = Vec::new();
     for path in &request.paths {
@@ -165,8 +262,8 @@ pub(super) async fn stat(
         stdin.push(0);
     }
     let owner = InternalSpoolOwner::new();
-    let result = runner
-        .execute_fixed(
+    let result = bridge
+        .execute_readonly_fixed(
             FixedRunRequest {
                 host: request.host.clone(),
                 script: STAT_SCRIPT,
@@ -181,47 +278,48 @@ pub(super) async fn stat(
             cancel,
         )
         .await?;
-    let stderr = read_stream(&result.output, StreamKind::Stderr, 1024).await?;
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
     if !stderr.is_empty() {
         return Err(protocol_error("stat control record is invalid"));
     }
-    let stdout = read_stream(&result.output, StreamKind::Stdout, limits.max_frame_bytes).await?;
-    let fields = nul_fields(&stdout)?;
-    let mut cursor = 0;
+    let mut cursor = SpoolCursor::new(&result.output, StreamKind::Stdout, limits.max_frame_bytes)?;
     let mut entries = Vec::with_capacity(request.paths.len());
     for requested in &request.paths {
-        let actual = fields
-            .get(cursor)
+        let actual = cursor
+            .next_field(limits.max_frame_bytes)
+            .await?
             .ok_or_else(|| protocol_error("stat response is incomplete"))?;
-        let status = fields
-            .get(cursor + 1)
+        let status = cursor
+            .next_field(64)
+            .await?
             .ok_or_else(|| protocol_error("stat response is incomplete"))?;
-        if *actual != requested.absolute().as_bytes() {
+        if actual != requested.absolute().as_bytes() {
             return Err(protocol_error("stat response order is invalid"));
         }
-        cursor += 2;
-        let actual_path = encode_bytes(actual);
+        let actual_path = encode_bytes(&actual);
         let relative_path = encode_bytes(requested.relative().as_bytes());
-        if *status == b"OK" {
-            let mode = fields
-                .get(cursor)
+        if status == b"OK" {
+            let mode = cursor
+                .next_field(64)
+                .await?
                 .ok_or_else(|| protocol_error("stat response is incomplete"))?;
-            let size = fields
-                .get(cursor + 1)
+            let size = cursor
+                .next_field(64)
+                .await?
                 .ok_or_else(|| protocol_error("stat response is incomplete"))?;
-            let mtime = fields
-                .get(cursor + 2)
+            let mtime = cursor
+                .next_field(128)
+                .await?
                 .ok_or_else(|| protocol_error("stat response is incomplete"))?;
-            cursor += 3;
-            let raw_mode = u32::from_str_radix(utf8(mode)?, 16)
+            let raw_mode = u32::from_str_radix(utf8(&mode)?, 16)
                 .map_err(|_| protocol_error("stat mode is invalid"))?;
-            let (mtime_seconds, mtime_nanoseconds) = parse_mtime(mtime)?;
+            let (mtime_seconds, mtime_nanoseconds) = parse_mtime(&mtime)?;
             entries.push(StatEntry::Success {
                 actual_path,
                 relative_path,
                 metadata: RemoteMetadata {
                     kind: kind_from_mode(raw_mode),
-                    size: parse_u64(size)?,
+                    size: parse_u64(&size)?,
                     mode: raw_mode & 0o7777,
                     mtime_seconds,
                     mtime_nanoseconds,
@@ -231,11 +329,11 @@ pub(super) async fn stat(
             entries.push(StatEntry::Error {
                 actual_path,
                 relative_path,
-                error: entry_error(status)?,
+                error: entry_error(&status)?,
             });
         }
     }
-    if cursor != fields.len() {
+    if cursor.next_field(limits.max_frame_bytes).await?.is_some() {
         return Err(protocol_error("stat response has trailing fields"));
     }
     Ok(StatResult {
@@ -248,14 +346,15 @@ pub(super) async fn stat(
     })
 }
 
-fn relative<'a>(root: &[u8], actual: &'a [u8]) -> BridgeResult<&'a [u8]> {
-    if actual == root {
-        return Ok(&[]);
+fn join_raw(base: &[u8], relative: &[u8]) -> Vec<u8> {
+    let mut joined =
+        Vec::with_capacity(base.len() + usize::from(!base.is_empty()) + relative.len());
+    joined.extend_from_slice(base);
+    if !base.is_empty() {
+        joined.push(b'/');
     }
-    actual
-        .strip_prefix(root)
-        .and_then(|rest| rest.strip_prefix(b"/"))
-        .ok_or_else(|| protocol_error("remote path escaped the requested root"))
+    joined.extend_from_slice(relative);
+    joined
 }
 
 fn decoded_sort_key(value: &super::EncodedValue) -> Vec<u8> {

@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -10,14 +9,24 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedRunRequest, SshRunner};
+use crate::ssh::FixedRunRequest;
 
-use super::protocol::{context, encode_bytes, protocol_error, read_stream};
-use super::{ResolvedSearch, SearchEngine, SearchMatch, SearchResult};
+use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
+use super::{RemoteBridge, ResolvedSearch, SearchEngine, SearchMatch, SearchResult, compile_glob};
 
 const CANDIDATE_SCRIPT: &str = r#"
 root=$1
 limit=$2
+if ! find -H . -mindepth 1 -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=find_nul\000' >&2
+    exit 0
+fi
+if ! command -v mktemp >/dev/null 2>&1 ||
+   ! command -v mkfifo >/dev/null 2>&1 ||
+   ! command -v head >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
+    exit 0
+fi
 if [ ! -e "$root" ] && [ ! -L "$root" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
 if [ ! -d "$root" ]; then printf 'NOT_DIRECTORY\000' >&2; exit 0; fi
 if [ ! -r "$root" ]; then printf 'PERMISSION_DENIED\000' >&2; exit 0; fi
@@ -34,11 +43,18 @@ mkfifo "$fifo" || exit 2
     printf '%s' "$?" >"$status"
 ) &
 producer=$!
-head -c "$limit" <"$fifo" >"$data" || exit 2
-wait "$producer" || true
+exec 3<"$fifo"
+head -c "$limit" <&3 >"$data"
+head_status=$?
+cat <&3 >/dev/null
+drain_status=$?
+exec 3<&-
+wait "$producer" 2>/dev/null
+wait_status=$?
 bytes=$(wc -c <"$data")
 producer_status=$(cat "$status" 2>/dev/null || printf 2)
-if [ "$bytes" -lt "$limit" ] && [ "$producer_status" -ne 0 ]; then exit 2; fi
+if [ "$head_status" -ne 0 ] || [ "$drain_status" -ne 0 ] ||
+   [ "$wait_status" -ne 0 ] || [ "$producer_status" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
 "#;
@@ -47,6 +63,22 @@ const RG_SCRIPT: &str = r#"
 query=$1
 binary=$2
 limit=$3
+rg --json --fixed-strings --hidden --no-ignore -- codex-ssh-probe-no-match /dev/null >/dev/null 2>&1
+rg_probe=$?
+if [ "$rg_probe" -ne 1 ]; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=rg_json\000' >&2
+    exit 0
+fi
+if ! printf 'x\000' | xargs -0 -r sh -c 'exit 0' codex-ssh-rg-probe >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2
+    exit 0
+fi
+if ! command -v mktemp >/dev/null 2>&1 ||
+   ! command -v mkfifo >/dev/null 2>&1 ||
+   ! command -v head >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
+    exit 0
+fi
 umask 077
 scratch=$(mktemp -d /tmp/codex-ssh-search.XXXXXX) || exit 2
 cleanup() { rm -rf -- "$scratch"; }
@@ -73,12 +105,19 @@ exit "$status"
 printf '%s' "$?" >"$status"
 ) &
 producer=$!
-head -c "$limit" <"$fifo" >"$data" || exit 2
-wait "$producer" || true
+exec 3<"$fifo"
+head -c "$limit" <&3 >"$data"
+head_status=$?
+cat <&3 >/dev/null
+drain_status=$?
+exec 3<&-
+wait "$producer" 2>/dev/null
+wait_status=$?
 bytes=$(wc -c <"$data")
-if [ -s "$engine_error" ] && [ "$bytes" -lt "$limit" ]; then exit 2; fi
 producer_status=$(cat "$status" 2>/dev/null || printf 2)
-if [ "$bytes" -lt "$limit" ] && [ "$producer_status" -ne 0 ]; then exit 2; fi
+if [ -s "$engine_error" ] || [ "$head_status" -ne 0 ] ||
+   [ "$drain_status" -ne 0 ] || [ "$wait_status" -ne 0 ] ||
+   [ "$producer_status" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
 "#;
@@ -86,6 +125,22 @@ if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
 const GREP_SCRIPT: &str = r#"
 query=$1
 limit=$2
+grep -IHnZ -F -- codex-ssh-probe-no-match /dev/null >/dev/null 2>&1
+grep_probe=$?
+if [ "$grep_probe" -ne 1 ]; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=grep_nul\000' >&2
+    exit 0
+fi
+if ! printf 'x\000' | xargs -0 -r sh -c 'exit 0' codex-ssh-grep-probe >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2
+    exit 0
+fi
+if ! command -v mktemp >/dev/null 2>&1 ||
+   ! command -v mkfifo >/dev/null 2>&1 ||
+   ! command -v head >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
+    exit 0
+fi
 umask 077
 scratch=$(mktemp -d /tmp/codex-ssh-search.XXXXXX) || exit 2
 cleanup() { rm -rf -- "$scratch"; }
@@ -111,25 +166,33 @@ exit "$status"
 printf '%s' "$?" >"$status"
 ) &
 producer=$!
-head -c "$limit" <"$fifo" >"$data" || exit 2
-wait "$producer" || true
+exec 3<"$fifo"
+head -c "$limit" <&3 >"$data"
+head_status=$?
+cat <&3 >/dev/null
+drain_status=$?
+exec 3<&-
+wait "$producer" 2>/dev/null
+wait_status=$?
 bytes=$(wc -c <"$data")
-if [ -s "$engine_error" ] && [ "$bytes" -lt "$limit" ]; then exit 2; fi
 producer_status=$(cat "$status" 2>/dev/null || printf 2)
-if [ "$bytes" -lt "$limit" ] && [ "$producer_status" -ne 0 ]; then exit 2; fi
+if [ -s "$engine_error" ] || [ "$head_status" -ne 0 ] ||
+   [ "$drain_status" -ne 0 ] || [ "$wait_status" -ne 0 ] ||
+   [ "$producer_status" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
 "#;
 
 pub(super) async fn search(
-    runner: &Arc<SshRunner>,
+    bridge: &RemoteBridge,
     request: ResolvedSearch,
     cancel: CancellationToken,
 ) -> BridgeResult<SearchResult> {
+    let runner = &bridge.runner;
     let limits = runner.config().host(&request.host)?.limits;
     let owner = InternalSpoolOwner::new();
-    let candidates_result = runner
-        .execute_fixed(
+    let candidates_result = bridge
+        .execute_readonly_fixed(
             FixedRunRequest {
                 host: request.host.clone(),
                 script: CANDIDATE_SCRIPT,
@@ -147,7 +210,7 @@ pub(super) async fn search(
             cancel.clone(),
         )
         .await?;
-    let stderr = read_stream(&candidates_result.output, StreamKind::Stderr, 1024).await?;
+    let stderr = read_small_stream(&candidates_result.output, StreamKind::Stderr, 1024).await?;
     let candidate_capped = stderr == b"CAPPED\0";
     if !stderr.is_empty() && !candidate_capped {
         return match stderr.as_slice() {
@@ -157,53 +220,51 @@ pub(super) async fn search(
             _ => Err(protocol_error("search candidate control record is invalid")),
         };
     }
-    let mut raw = read_stream(
+    let mut cursor = SpoolCursor::new(
         &candidates_result.output,
         StreamKind::Stdout,
         limits.max_frame_bytes + 1,
-    )
-    .await?;
-    if candidate_capped {
-        let Some(last) = raw.iter().rposition(|byte| *byte == 0) else {
-            return Err(protocol_error("search candidate record is oversized"));
-        };
-        raw.truncate(last + 1);
-    } else if !raw.is_empty() && raw.last() != Some(&0) {
-        return Err(protocol_error("search candidate record is incomplete"));
-    }
+    )?;
     let mut builder = GlobSetBuilder::new();
     for glob in &request.globs {
-        builder.add(
-            globset::Glob::new(glob)
-                .map_err(|_| BridgeError::invalid_argument("search glob is invalid"))?,
-        );
+        builder.add(compile_glob(glob)?);
     }
     let globs = builder
         .build()
         .map_err(|_| BridgeError::invalid_argument("search glob is invalid"))?;
     let configured_root = runner.config().host(&request.host)?.profile.root.as_bytes();
-    let mut candidates = Vec::new();
-    for path in raw
-        .strip_suffix(&[0])
-        .unwrap_or_default()
-        .split(|byte| *byte == 0)
-    {
+    let mut candidates = Vec::with_capacity(10_001);
+    let mut candidate_count = 0usize;
+    loop {
+        let path = if candidate_capped {
+            cursor.next_field_capped(limits.max_frame_bytes).await?
+        } else {
+            cursor.next_field(limits.max_frame_bytes).await?
+        };
+        let Some(path) = path else { break };
         if path.is_empty() {
-            continue;
+            return Err(protocol_error("search candidate path is empty"));
         }
-        let relative = relative(configured_root, path)?;
-        if request.globs.is_empty()
-            || globs.is_match(Path::new(&OsString::from_vec(relative.to_vec())))
+        candidate_count = candidate_count
+            .checked_add(1)
+            .ok_or_else(|| protocol_error("search candidate count overflowed"))?;
+        let relative = relative(configured_root, &path)?;
+        if candidates.len() < 10_001
+            && (request.globs.is_empty()
+                || globs.is_match(Path::new(&OsString::from_vec(relative.to_vec()))))
         {
-            candidates.push(path.to_vec());
+            candidates.push(path);
         }
+    }
+    if candidate_capped && cursor.discarded_incomplete() && candidate_count == 0 {
+        return Err(protocol_error("search candidate record is oversized"));
     }
     candidates.sort_by(|left, right| {
         relative(configured_root, left)
             .unwrap_or(left)
             .cmp(relative(configured_root, right).unwrap_or(right))
     });
-    let mut truncated = candidate_capped || candidates.len() > 10_000;
+    let mut truncated = candidate_capped || candidate_count > 10_000 || candidates.len() > 10_000;
     candidates.truncate(10_000);
     let rg = candidates_result.capability.tools.get("rg_json") == Some(&true);
     if request.binary && !rg {
@@ -272,8 +333,8 @@ pub(super) async fn search(
             &["grep_nul", "xargs_nul", "search_bound"],
         )
     };
-    let result = runner
-        .execute_fixed(
+    let result = bridge
+        .execute_readonly_fixed(
             FixedRunRequest {
                 host: request.host.clone(),
                 script,
@@ -288,30 +349,43 @@ pub(super) async fn search(
             cancel,
         )
         .await?;
-    let stderr = read_stream(&result.output, StreamKind::Stderr, 1024).await?;
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
     let content_capped = stderr == b"CAPPED\0";
     if !stderr.is_empty() && !content_capped {
         return Err(protocol_error("search engine control record is invalid"));
     }
-    let mut stdout = read_stream(
+    let mut cursor = SpoolCursor::new(
         &result.output,
         StreamKind::Stdout,
         limits.max_frame_bytes + 1,
-    )
-    .await?;
-    if content_capped {
-        let Some(last) = stdout.iter().rposition(|byte| *byte == b'\n') else {
-            return Err(protocol_error("search event is oversized"));
-        };
-        stdout.truncate(last + 1);
-        truncated = true;
-    }
-    let mut matches = if rg {
-        parse_rg(&stdout, configured_root)?
+    )?;
+    let (mut matches, result_lookahead) = if rg {
+        parse_rg(
+            &mut cursor,
+            configured_root,
+            content_capped,
+            request.max_results.saturating_add(1),
+            limits.max_frame_bytes,
+        )
+        .await?
     } else {
-        parse_grep(&stdout, configured_root, request.query.as_bytes())?
+        parse_grep(
+            &mut cursor,
+            configured_root,
+            request.query.as_bytes(),
+            content_capped,
+            request.max_results.saturating_add(1),
+            limits.max_frame_bytes,
+        )
+        .await?
     };
-    if matches.len() > request.max_results {
+    matches.sort_by(|left, right| {
+        decoded_path(&left.relative_path)
+            .cmp(&decoded_path(&right.relative_path))
+            .then(left.line.cmp(&right.line))
+            .then(left.column.cmp(&right.column))
+    });
+    if content_capped || result_lookahead || matches.len() > request.max_results {
         truncated = true;
         matches.truncate(request.max_results);
     }
@@ -327,21 +401,35 @@ pub(super) async fn search(
     })
 }
 
-fn parse_rg(bytes: &[u8], root: &[u8]) -> BridgeResult<Vec<SearchMatch>> {
-    let mut matches = Vec::new();
-    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if line.last() != Some(&b'\n') {
-            return Err(protocol_error("rg JSON event is incomplete"));
-        }
-        let value: serde_json::Value = serde_json::from_slice(&line[..line.len() - 1])
+async fn parse_rg(
+    cursor: &mut SpoolCursor<'_>,
+    root: &[u8],
+    capped: bool,
+    retain: usize,
+    record_limit: usize,
+) -> BridgeResult<(Vec<SearchMatch>, bool)> {
+    let mut matches = Vec::with_capacity(retain.min(1024));
+    let mut lookahead = false;
+    let mut match_records = 0usize;
+    loop {
+        let line = if capped {
+            cursor.next_line_capped(record_limit).await?
+        } else {
+            cursor.next_line(record_limit).await?
+        };
+        let Some(line) = line else { break };
+        let value: serde_json::Value = serde_json::from_slice(&line)
             .map_err(|_| protocol_error("rg JSON event is invalid"))?;
         let event = value
             .get("type")
             .and_then(|value| value.as_str())
             .ok_or_else(|| protocol_error("rg JSON event has no type"))?;
-        if event != "match" {
-            continue;
+        match event {
+            "begin" | "end" | "summary" => continue,
+            "match" => {}
+            _ => return Err(protocol_error("rg JSON event type is unknown")),
         }
+        match_records += 1;
         let data = value
             .get("data")
             .ok_or_else(|| protocol_error("rg match has no data"))?;
@@ -369,15 +457,22 @@ fn parse_rg(bytes: &[u8], root: &[u8]) -> BridgeResult<Vec<SearchMatch>> {
             .and_then(|value| value.as_u64())
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| protocol_error("rg match column is invalid"))?;
-        matches.push(SearchMatch {
-            actual_path: encode_bytes(&actual),
-            relative_path: encode_bytes(relative),
-            line: line_number,
-            column,
-            content: encode_bytes(&content),
-        });
+        if matches.len() < retain {
+            matches.push(SearchMatch {
+                actual_path: encode_bytes(&actual),
+                relative_path: encode_bytes(relative),
+                line: line_number,
+                column,
+                content: encode_bytes(&content),
+            });
+        } else {
+            lookahead = true;
+        }
     }
-    Ok(matches)
+    if capped && cursor.discarded_incomplete() && match_records == 0 {
+        return Err(protocol_error("search event is oversized"));
+    }
+    Ok((matches, lookahead))
 }
 
 fn json_bytes(value: &serde_json::Value) -> BridgeResult<Vec<u8>> {
@@ -392,24 +487,35 @@ fn json_bytes(value: &serde_json::Value) -> BridgeResult<Vec<u8>> {
     Err(protocol_error("rg text/bytes field is missing"))
 }
 
-fn parse_grep(bytes: &[u8], root: &[u8], query: &[u8]) -> BridgeResult<Vec<SearchMatch>> {
-    let mut matches = Vec::new();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        let nul = bytes[cursor..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| protocol_error("grep filename is incomplete"))?
-            + cursor;
-        let actual = &bytes[cursor..nul];
-        cursor = nul + 1;
-        let newline = bytes[cursor..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .ok_or_else(|| protocol_error("grep line is incomplete"))?
-            + cursor;
-        let record = &bytes[cursor..newline];
-        cursor = newline + 1;
+async fn parse_grep(
+    cursor: &mut SpoolCursor<'_>,
+    root: &[u8],
+    query: &[u8],
+    capped: bool,
+    retain: usize,
+    record_limit: usize,
+) -> BridgeResult<(Vec<SearchMatch>, bool)> {
+    let mut matches = Vec::with_capacity(retain.min(1024));
+    let mut lookahead = false;
+    let mut completed_records = 0usize;
+    loop {
+        let actual = if capped {
+            cursor.next_field_capped(record_limit).await?
+        } else {
+            cursor.next_field(record_limit).await?
+        };
+        let Some(actual) = actual else { break };
+        let record = if capped {
+            cursor.next_line_capped(record_limit).await?
+        } else {
+            cursor.next_line(record_limit).await?
+        };
+        let Some(record) = record else {
+            if capped {
+                break;
+            }
+            return Err(protocol_error("grep line is incomplete"));
+        };
         let colon = record
             .iter()
             .position(|byte| *byte == b':')
@@ -422,21 +528,38 @@ fn parse_grep(bytes: &[u8], root: &[u8], query: &[u8]) -> BridgeResult<Vec<Searc
         let column = find_bytes(content, query)
             .and_then(|value| u64::try_from(value + 1).ok())
             .ok_or_else(|| protocol_error("grep result does not contain the query"))?;
-        matches.push(SearchMatch {
-            actual_path: encode_bytes(actual),
-            relative_path: encode_bytes(relative(root, actual)?),
-            line,
-            column,
-            content: encode_bytes(content),
-        });
+        completed_records += 1;
+        if matches.len() < retain {
+            matches.push(SearchMatch {
+                actual_path: encode_bytes(&actual),
+                relative_path: encode_bytes(relative(root, &actual)?),
+                line,
+                column,
+                content: encode_bytes(content),
+            });
+        } else {
+            lookahead = true;
+        }
     }
-    Ok(matches)
+    if capped && cursor.discarded_incomplete() && completed_records == 0 {
+        return Err(protocol_error("search event is oversized"));
+    }
+    Ok((matches, lookahead))
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn decoded_path(value: &super::EncodedValue) -> Vec<u8> {
+    match value.encoding {
+        super::ValueEncoding::Utf8 => value.value.as_bytes().to_vec(),
+        super::ValueEncoding::Base64 => base64::engine::general_purpose::STANDARD
+            .decode(&value.value)
+            .unwrap_or_default(),
+    }
 }
 
 fn relative<'a>(root: &[u8], actual: &'a [u8]) -> BridgeResult<&'a [u8]> {

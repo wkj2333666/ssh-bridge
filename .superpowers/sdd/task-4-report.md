@@ -2,6 +2,24 @@
 
 Date: 2026-07-18
 
+## Formal Review Rework
+
+The first Task 4 implementation commit (`6356179`) was **Not Approved**. The
+approved facade/streaming revision corrected all seven Important findings
+without weakening their acceptance criteria:
+
+1. exact behavioral capability probes and real `local-fixed` probing;
+2. genuine mismatch markers with retry only in the read-only facade;
+3. a 64-KiB paged `SpoolCursor` and successful five-host RSS evidence;
+4. remote list hidden pruning and qualifying max-plus-one counting;
+5. one slash-aware glob builder for validation and matching;
+6. same-FIFO-fd drain with final error precedence and bounded strict search;
+7. final-symlink `NotFound`/`PermissionDenied` read semantics.
+
+The design, plan, and binding clarification list record these superseding
+requirements. The tests below captured RED before each implementation change
+and GREEN afterward.
+
 ## Outcome
 
 Implemented the Rust-only high-level remote read facade: hosts, list, stat,
@@ -30,13 +48,42 @@ launches remain owned by `SshRunner`; `src/remote` launches no process.
 - Capability RED: the old ten-key probe assertion rejected the seven new
   functional keys. The functional probe test now asserts all seven true and
   verifies scratch cleanup.
-- Search cap debugging produced three meaningful REDs: an over-conservative
-  argv reserve, planned SIGPIPE classified as an engine error, and utility
-  stderr entering control framing. Each cause was fixed and its regression test
-  is green.
+- The first implementation's search-cap debugging used planned SIGPIPE. Formal
+  review superseded that design: the rework keeps one parent read fd, drains,
+  waits, and gives every genuine final error priority over the cap.
 - Five-host peak test initially expected `ProtocolError`; it demonstrated the
   stronger correct behavior, `OutputLimit` with no partial result. Its corrected
   assertion passed twice consecutively.
+- Exact-probe RED: each PATH shim was still reported compatible because the
+  synthetic fixture or an availability-only probe masked the incompatible
+  production command form. GREEN independently makes only the shimmed one of
+  all seven flags false, executes the real script in `local-fixed`, and leaves
+  the private scratch empty.
+- Facade-retry RED: retry lived in `SshRunner`, and a fixture-only marker could
+  not prove that a real fixed script detected staleness. GREEN uses a stateful
+  real `find` shim and observes exactly two probes and two list commands. The
+  runner performs one attempt; transport, filesystem, and unknown-marker tests
+  prove zero retry.
+- Streaming RED: the protocol parser collected a whole frame. GREEN exercises
+  NUL fields and JSON lines across 64-KiB pages, plus five successful concurrent
+  8-MiB candidate streams (40 MiB total) with RSS growth below 32 MiB.
+- List RED: more than a frame of hidden entries consumed the local byte cap and
+  incorrectly reported truncation before the visible entries. GREEN prunes
+  remotely and counts only qualifying records, returning all visible entries
+  with `truncated=false`.
+- Glob RED: `*.txt` crossed `/` and selected nested files. GREEN constructs
+  validation and both rg/grep matching with the same
+  `GlobBuilder::literal_separator(true)` semantics for `*`, `?`, classes, and
+  `**`.
+- Search-bound RED: a grep shim emitted a complete capped prefix and then exited
+  2, but the prefix was returned as partial success; rg also ignored an unknown
+  event kind. GREEN drains the same FIFO descriptor, waits for all real final
+  statuses before emitting data, returns the redacted engine error, and rejects
+  the unknown event as `ProtocolError`.
+- Final-symlink RED: a dangling final link did not map to `NotFound`. GREEN
+  follows the final link for existence/readability/type decisions, maps a
+  dangling target to `NotFound`, and maps a deterministically unreadable target
+  to `PermissionDenied` without exposing stderr or path bytes.
 
 ## Bounds and Security Review
 
@@ -52,10 +99,11 @@ launches remain owned by `SshRunner`; `src/remote` launches no process.
   A facade-entry strong owner and capture-side weak registration remove paths
   on success, error, cancellation, late registration, and task abort. TTL is
   not the ordinary cleanup path.
-- Search uses mode-0700 `mktemp` scratch, trapped FIFO cleanup, foreground
-  `head -c remaining+1`, separate producer/engine status files, suppressed
-  utility diagnostics, and no `pipefail`. A hard `OutputLimit` is never partial
-  success.
+- Search and bounded list use mode-0700 `mktemp` scratch, trapped FIFO cleanup,
+  one parent-held FIFO read descriptor, foreground `head -c remaining+1`, a
+  same-descriptor drain, separate producer/engine/xargs status files,
+  suppressed utility diagnostics, and no `pipefail`. Every genuine final error
+  wins over a bounded prefix.
 - Capability retry accepts only the exact exit-zero NUL record naming a key in
   the operation's static required set, invalidates/reprobes once, and rejects an
   unknown key as `ProtocolError`.
@@ -72,8 +120,9 @@ launches remain owned by `SshRunner`; `src/remote` launches no process.
   `ReadConflict`.
 - rg/grep share literal/glob/byte-column semantics; non-UTF-8 paths and binary
   content round-trip with padded Base64.
-- Planned search cap returns a complete prefix with truncation; an oversized
-  first event is `ProtocolError`; a real engine status >1 is fixed/redacted.
+- A search cap returns a complete prefix with truncation only after every real
+  final status succeeds; an oversized first event is `ProtocolError`; a real
+  engine status >1 is fixed/redacted.
 - Five hosts concurrently spooled 40 MiB into ten mode-0600 files, completed
   below the serial timing bound, kept measured RSS growth below 32 MiB, and
   removed every internal file afterward.
@@ -82,8 +131,8 @@ launches remain owned by `SshRunner`; `src/remote` launches no process.
 
 - `cargo fmt --check`: passed
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed
-- `cargo test --test remote_ops -- --nocapture`: 16 passed, 0 failed
-- `cargo test --all-targets`: 106 passed, 0 failed
+- `cargo test --test remote_ops -- --nocapture`: 23 passed, 0 failed
+- `cargo test --all-targets`: 117 passed, 0 failed
 - `git diff --check`: passed
 - `__pycache__`: both pre-existing untracked trees preserved and unstaged
 

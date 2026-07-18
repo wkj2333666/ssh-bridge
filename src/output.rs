@@ -71,6 +71,21 @@ pub(crate) struct InternalCapturedOutput {
 }
 
 impl InternalCapturedOutput {
+    #[cfg(test)]
+    pub(crate) fn for_test(directory: &Path, stdout: &[u8], stderr: &[u8]) -> Self {
+        let stdout_path = directory.join("cursor.stdout");
+        let stderr_path = directory.join("cursor.stderr");
+        std::fs::write(&stdout_path, stdout).expect("write cursor stdout fixture");
+        std::fs::write(&stderr_path, stderr).expect("write cursor stderr fixture");
+        Self {
+            stdout_path,
+            stderr_path,
+            stdout_len: stdout.len() as u64,
+            stderr_len: stderr.len() as u64,
+            aggregate_bytes: (stdout.len() + stderr.len()) as u64,
+        }
+    }
+
     pub(crate) async fn read(
         &self,
         stream: StreamKind,

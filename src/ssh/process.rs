@@ -275,33 +275,6 @@ impl SshRunner {
         request: FixedRunRequest,
         cancel: CancellationToken,
     ) -> BridgeResult<FixedRunResult> {
-        let first = self
-            .execute_fixed_once(request.clone(), cancel.clone())
-            .await?;
-        match fixed_capability_mismatch(&first.output, request.required_capabilities).await? {
-            None => Ok(first),
-            Some(_) => {
-                self.invalidate_capability(&request.host).await;
-                let second = self.execute_fixed_once(request.clone(), cancel).await?;
-                match fixed_capability_mismatch(&second.output, request.required_capabilities)
-                    .await?
-                {
-                    None => Ok(second),
-                    Some(_) => Err(BridgeError::new(
-                        ErrorCode::RemoteCapabilityMissing,
-                        "remote read capability remained unavailable after reprobe",
-                        false,
-                    )),
-                }
-            }
-        }
-    }
-
-    async fn execute_fixed_once(
-        &self,
-        request: FixedRunRequest,
-        cancel: CancellationToken,
-    ) -> BridgeResult<FixedRunResult> {
         let host = self.config.host(&request.host)?;
         let limits = host.limits;
         let root = host.profile.root.clone();
@@ -1017,63 +990,6 @@ fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<S
         command.push_str(&shell_word(argument)?);
     }
     Ok(command)
-}
-
-async fn fixed_capability_mismatch(
-    output: &InternalCapturedOutput,
-    required: &'static [&'static str],
-) -> BridgeResult<Option<String>> {
-    if output.stderr_len == 0 {
-        return Ok(None);
-    }
-    if output.stderr_len > 4096 {
-        return Ok(None);
-    }
-    let page = output.read(StreamKind::Stderr, 0, 4096).await?;
-    const PREFIX: &[u8] = b"CODE=CAPABILITY_MISMATCH\0";
-    if !page.bytes.starts_with(PREFIX) {
-        return Ok(None);
-    }
-    if output.stdout_len != 0 || !page.eof {
-        return Err(BridgeError::new(
-            ErrorCode::ProtocolError,
-            "capability mismatch record is malformed",
-            false,
-        ));
-    }
-    let rest = &page.bytes[PREFIX.len()..];
-    let Some(value) = rest
-        .strip_prefix(b"CAPABILITY=")
-        .and_then(|value| value.strip_suffix(&[0]))
-    else {
-        return Err(BridgeError::new(
-            ErrorCode::ProtocolError,
-            "capability mismatch record is malformed",
-            false,
-        ));
-    };
-    if value.is_empty() || value.contains(&0) {
-        return Err(BridgeError::new(
-            ErrorCode::ProtocolError,
-            "capability mismatch record is malformed",
-            false,
-        ));
-    }
-    let key = std::str::from_utf8(value).map_err(|_| {
-        BridgeError::new(
-            ErrorCode::ProtocolError,
-            "capability mismatch key is invalid",
-            false,
-        )
-    })?;
-    if !required.contains(&key) {
-        return Err(BridgeError::new(
-            ErrorCode::ProtocolError,
-            "capability mismatch named an unexpected key",
-            false,
-        ));
-    }
-    Ok(Some(key.to_owned()))
 }
 
 fn format_timeout_duration(timeout_ms: u64) -> BridgeResult<String> {

@@ -15,6 +15,11 @@ processing, strict framing, and the existing SSH lifecycle/concurrency limits.
 **Tech Stack:** Rust 1.91.1, Tokio, Serde/serde_json, SHA-256, Base64,
 globset, system OpenSSH, POSIX sh, functionally probed Linux utilities.
 
+**Formal-review note:** Tasks 1-8 record the original implementation plan.
+Tasks 9-15 below supersede any earlier step that places mismatch retry in
+`SshRunner`, aggregates a protocol frame in `read_stream`, filters hidden list
+entries locally, or treats planned SIGPIPE as truncation success.
+
 ## Global Constraints
 
 - Work only in `/home/wkj/projects/codex-ssh-bridge/.worktrees/rust-ssh-bridge`
@@ -368,7 +373,7 @@ to observed functional output, not only `command -v`.
 
 Add fake incompatible binaries ahead of `PATH` one at a time for `rg`, `find`,
 `grep`, `stat`, the selected read primitive, `xargs`, `mktemp`, `mkfifo`, and
-`head`. Break the planned FIFO cutoff status separately. Assert only the
+`head`. Break the same-fd drain/final-status behavior separately. Assert only the
 matching functional flag becomes false. Add malformed/duplicate new-key parser
 cases.
 
@@ -387,8 +392,8 @@ Expected: failures show the new keys are missing or rejected as unknown.
 Inside the probe's existing private directory, create fixed sample files and
 test the exact commands chosen by the fixed protocols. For `search_bound`,
 probe mode-0700 scratch creation, FIFO flow, `head -c` byte-plus-one cutoff,
-trap cleanup, sequential NUL xargs, and the exact planned-cutoff aggregate
-status without `pipefail`. Emit only `0` or `1`. Extend `TOOL_NAMES` with the
+trap cleanup, sequential NUL xargs, and final-status precedence after draining
+without `pipefail`. Emit only `0` or `1`. Extend `TOOL_NAMES` with the
 exact seven keys and keep unknown-key rejection.
 
 The fake probe must expose environment switches such as
@@ -725,7 +730,7 @@ positive globs, slash awareness, no descendant symlink follow, regular-file
 only candidates, non-UTF-8 names, raw-byte ordering, 10,001-candidate
 truncation, and an 8-MiB-plus-one enumeration. Cover a single candidate record
 larger than the bound, a trailing partial record after complete records, find
-status 1/2, planned FIFO cutoff status, unexpected producer/xargs status, and
+status 1/2, same-fd FIFO drain, unexpected producer/xargs status, and
 scratch/trap cleanup after success, error, cancellation, and facade abort.
 
 Assert invalid negative/absolute/traversal globs launch no process.
@@ -745,20 +750,20 @@ Expected: search remains unimplemented.
 
 Implement a shared bounded-output shell helper first. It uses a mode-0700
 `mktemp -d`, installs cleanup traps, creates FIFO/status/scratch files, starts
-the fixed producer in the background, and uses foreground `head -c
-(remaining_protocol_bytes + 1)` from FIFO to scratch before `wait`, never above
-`max_frame_bytes + 1`. It emits only the bounded scratch after checking the
-producer status records. POSIX sh does not use `pipefail`. The exact planned
-SIGPIPE/xargs cutoff signature is accepted only when `search_bound` was probed
-and the extra byte was observed; the first genuine producer error remains an
-error even when cutoff also occurs.
+the fixed producer in the background, holds one parent FIFO read fd, and uses
+foreground `head -c (remaining_protocol_bytes + 1)` from that fd to scratch,
+never above `max_frame_bytes + 1`. It then drains the remainder from the same fd
+to `/dev/null`, waits, and emits only bounded scratch after every real
+producer/engine/xargs status is zero. POSIX sh does not use `pipefail` and no
+planned SIGPIPE status is accepted. A genuine producer error remains an error
+even when the extra byte was observed.
 
 The fixed find producer dereferences only the configured search root and emits
-regular-file actual paths with NUL. Rust parses the complete bounded capture,
+regular-file actual paths with NUL. Rust streams the bounded capture,
 retaining at most 10,001 candidates, strips the exact root boundary, builds all
 positive slash-aware globset matchers, matches raw Unix path bytes, and
 preserves a lossless actual/relative pair sorted by raw relative bytes.
-Candidate count or planned byte lookahead sets `truncated=true`. An oversized
+Candidate count or byte lookahead sets `truncated=true`. An oversized
 first record or unexplained partial record is `ProtocolError`.
 
 Build NUL-delimited stdin from the selected raw actual paths with checked total
@@ -770,7 +775,7 @@ Cover literal metacharacters, Unicode query, CR/LF prelaunch rejection,
 one-based byte column, multiple
 matches on one line using the first submatch, JSON text and bytes forms,
 binary=false/true, exit 1 empty, result limit plus one, malformed JSON, missing
-required fields, unknown form, one oversized first event, a planned-cap trailing
+required fields, unknown event kind/form, one oversized first event, a capped trailing
 partial after a complete event, the same partial without a cap proof, and
 remote engine failure redaction. Assert envelope engine `rg` and POSIX-sh
 metadata.
@@ -800,7 +805,8 @@ Maintain one checked aggregate content-protocol byte budget initialized to
 output budget to its helper and subtract its complete bytes before scheduling
 the next batch. Stop after the planned byte cutoff or the
 `max_results + 1`-th match so candidate batching cannot multiply the global
-output bound.
+output bound. The byte cap never stops or reclassifies a producer; the helper
+drains and waits so a later status greater than one wins over a full prefix.
 
 Feed raw rg JSON through the shared FIFO/scratch byte bound. Parse the entire
 bounded event stream incrementally with `serde_json`, accept the documented
@@ -808,8 +814,8 @@ non-match event kinds, require exact supported text/bytes objects for matches,
 use the first submatch start for the one-based byte column, retain only
 `max_results + 1` matches, and never serialize submatches. The first incomplete
 event is `ProtocolError`; a trailing partial is truncation only with the
-explicit planned cutoff proof. Configure the capture hard limit above this
-planned bound and assert an `OutputLimit` aborts instead of returning partial
+explicit byte-cutoff proof. Configure the capture hard limit above this
+bounded scratch limit and assert an `OutputLimit` aborts instead of returning partial
 success.
 
 - [ ] **Step 7: Run rg tests and verify GREEN**
@@ -828,7 +834,7 @@ Disable only `rg_json`. Cover fixed-string no-match/match, filename newline,
 non-UTF-8 filename, line content encoding, first literal byte column, result
 truncation, malformed NUL framing, engine failure redaction, and
 `binary=true -> RemoteCapabilityMissing` before content search. Repeat the
-planned-cutoff, real engine-status, oversized-first-record, partial-suffix, and
+byte-cutoff, real engine-status, oversized-first-record, partial-suffix, and
 cleanup cases for grep framing.
 
 - [ ] **Step 9: Run fallback tests and verify RED**
@@ -850,7 +856,7 @@ before xargs aggregation. Parse raw filename then the line record, derive the
 byte column by searching query bytes locally, and encode content locally. Treat
 exit 1 as empty. Parse all bounded records but retain only
 `max_results + 1`; set truncation for extra match, candidate incompleteness, or
-planned byte cutoff.
+byte cutoff.
 
 Run:
 
@@ -1022,9 +1028,284 @@ the controller in the handoff message.
 
 ---
 
+## Formal Review Rework
+
+### Task 9: Exact Functional Probes and Real `local-fixed`
+
+**Files:**
+- Modify: `src/capability.rs`
+- Modify: `tests/fixtures/fake-ssh.sh`
+- Modify: `tests/ssh_transport.rs`
+
+**Interfaces:**
+- Keeps the seven existing `Capability::tools` keys.
+- Changes each key to certify its production command form independently.
+- Makes `local-fixed` execute `CAPABILITY_PROBE_SCRIPT` instead of synthetic
+  records unless a test explicitly selects another fake mode.
+
+- [ ] **Step 1: Write independent incompatible-PATH RED tests**
+
+Add a table-driven test that prepends one executable shim at a time for the
+exact selected primitive. Each shim behaves incompatibly for the operation
+under test and forwards every unrelated invocation to the system executable.
+Assert `read_slice`, `find_nul`, `stat_printf`, `rg_json`, `grep_nul`,
+`xargs_nul`, and `search_bound` become false one at a time; assert the private
+probe directory is empty after each run. Add explicit fixtures for binary NUL,
+descendant-symlink no-follow, depth, a pre-epoch nanosecond timestamp, child
+status failure, and same-fd FIFO drain.
+
+- [ ] **Step 2: Verify RED**
+
+Run `cargo test --test ssh_transport capability_probe_rejects_each_incompatible_exact_behavior -- --nocapture`.
+Expected: the old shallow probes incorrectly leave one or more flags true.
+
+- [ ] **Step 3: Implement the exact probes and fixture routing**
+
+Use only the existing private probe directory. Exercise the exact option forms
+from list/stat/read/search, check output bytes and statuses, and emit `0` on any
+setup or cleanup failure. Route `local-fixed` probe commands to `/bin/sh -c
+"$remote_command"`; retain synthetic capabilities only for non-local fake
+modes that are explicitly transport-only.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run the RED command plus `cargo test --test ssh_transport fixed_probe_script -- --nocapture`.
+Expected: all exact behaviors and cleanup assertions pass.
+
+### Task 10: Read-Only Facade Retry and Genuine Mismatch Markers
+
+**Files:**
+- Modify: `src/ssh/process.rs`
+- Modify: `src/remote/mod.rs`
+- Modify: `src/remote/{metadata,read,search}.rs`
+- Modify: `tests/remote_ops.rs`
+
+**Interfaces:**
+- `SshRunner::execute_fixed` performs exactly one attempt.
+- `RemoteBridge::execute_readonly_fixed` accepts `FixedRunRequest`, parses one
+  strict exit-zero mismatch, invalidates/reprobes, and retries once.
+- Every fixed read-only script preflights only keys in its static required set
+  and emits `CODE=CAPABILITY_MISMATCH\0CAPABILITY=<key>\0` only on a genuine
+  stale behavior.
+
+- [ ] **Step 1: Write real-execution retry RED tests**
+
+Use `local-fixed` plus stateful PATH shims, not `FAKE_SSH_MISMATCH_FILE`.
+Prove one probe succeeds, the first actual script detects stale behavior and
+emits its own marker, reprobe succeeds, and exactly one second operation runs.
+In separate cases force transport, filesystem, normal nonzero exit, and
+malformed/unknown mismatch; assert one operation attempt and no retry.
+
+- [ ] **Step 2: Verify RED**
+
+Run `cargo test --test remote_ops readonly_real_mismatch -- --nocapture`.
+Expected: current fixture-level injection or runner-global retry violates
+attempt ownership/counting.
+
+- [ ] **Step 3: Move retry and add script preflights**
+
+Remove `fixed_capability_mismatch` calls from `SshRunner`. Put strict parsing
+and exactly-once retry in `RemoteBridge`. Convert every metadata/read/search
+call to that wrapper. Add fixed safe marker helpers inline in each static shell
+script; never copy utility stderr.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run all `readonly_real_mismatch` tests plus existing fixed-runner lifecycle
+tests. Expected: only a genuine required-key stale marker retries once.
+
+### Task 11: Real `SpoolCursor` and Streaming Retention
+
+**Files:**
+- Modify: `src/remote/protocol.rs`
+- Modify: `src/remote/{metadata,read,search}.rs`
+- Modify: `tests/fixtures/fake-ssh.sh`
+- Modify: `tests/remote_ops.rs`
+
+**Interfaces:**
+- `SpoolCursor<'a>` owns stream, offset, length, one 64-KiB page, page index,
+  and a checked record limit.
+- `next_field`, `next_line`, and bounded small-stream/content helpers preserve
+  delimiters split across pages.
+- List/stat/search retain only the incomplete current record and their
+  count-plus-one result ceilings.
+
+- [ ] **Step 1: Write cursor and RSS RED tests**
+
+Create protocol unit captures where a NUL field and an rg JSON newline cross
+the 64-KiB boundary. Add an explicit fake mode that spools 8 MiB of complete,
+valid but glob-rejected candidate records for each of five hosts. All five
+search calls must return successfully, overlap, leave no spools, and grow
+`VmRSS` by less than 32 MiB.
+
+- [ ] **Step 2: Verify RED**
+
+Run `cargo test --lib spool_cursor_ -- --nocapture` and
+`cargo test --test remote_ops five_hosts_successfully_stream_forty_mib_below_rss_bound -- --nocapture`.
+Expected: the former API is absent and the latter exceeds the bound or cannot
+parse the synthetic valid stream.
+
+- [ ] **Step 3: Implement streaming parsers**
+
+Delete whole-frame `read_stream`. Parse list groups, stat's tagged variable
+records, candidates, grep records, and rg lines directly from `SpoolCursor`.
+Continue consuming/validating the bounded stream after the retention ceiling,
+but never retain more than list `max+1`, 10,001 candidates, or search
+`max_results+1`.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run both RED commands twice and the existing 8-MiB-plus-one framing tests.
+Expected: boundary records and five-host success pass with cleanup and the RSS
+ceiling.
+
+### Task 12: Remote List Qualification and Count Lookahead
+
+**Files:**
+- Modify: `src/remote/metadata.rs`
+- Modify: `tests/remote_ops.rs`
+
+**Interfaces:**
+- `LIST_SCRIPT` positional args are root, depth, show-hidden, max-entries, and
+  byte lookahead.
+- Remote find prunes hidden relative components and sequential NUL grouping
+  emits at most `max_entries + 1` qualifying records.
+
+- [ ] **Step 1: Write hidden-flood RED tests**
+
+Create more than the cap in hidden roots and hidden nested directories plus a
+small visible set. With `include_hidden=false`, assert every visible entry is
+returned and `truncated=false`. With `include_hidden=true`, assert exactly cap
+entries and `truncated=true`. Assert a remote command log includes the explicit
+show-hidden and max-entry operands.
+
+- [ ] **Step 2: Verify RED**
+
+Run `cargo test --test remote_ops list_hidden_flood_does_not_consume_remote_cap -- --nocapture`.
+Expected: current local filtering consumes the byte/count budget or truncates.
+
+- [ ] **Step 3: Implement remote qualification/counting**
+
+Use root-relative find output and a hidden-prune expression before metadata
+emission. Feed NUL field groups through bounded sequential xargs with a private
+counter file, emit only max-plus-one groups, and use the same-fd bounded helper
+with final status precedence.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run the RED command and all metadata tests. Expected: hidden flood is invisible
+to both returned count and truncation.
+
+### Task 13: One Slash-Aware Glob Compiler
+
+**Files:**
+- Modify: `src/remote/mod.rs`
+- Modify: `src/remote/search.rs`
+- Modify: `tests/remote_ops.rs`
+
+**Interfaces:**
+- `compile_glob`/`compile_globs` build with
+  `GlobBuilder::literal_separator(true)` in validation and matching.
+
+- [ ] **Step 1: Write nested glob RED tests**
+
+Add nested files that distinguish `*.txt`, `dir/?.txt`, `dir/[ab].txt`, and
+`**/*.txt`. Assert `*`, `?`, and classes never cross `/`, while `**` does.
+
+- [ ] **Step 2: Verify RED**
+
+Run `cargo test --test remote_ops search_globs_are_slash_aware -- --nocapture`.
+Expected: default `Glob::new` matching crosses a separator or validation and
+execution use different builders.
+
+- [ ] **Step 3: Implement one constructor and verify GREEN**
+
+Use the same helper during request validation and raw-byte path matching. Run
+the RED command for both rg and grep fixtures.
+
+### Task 14: Search Final-Status Priority and Strict Bounded Decode
+
+**Files:**
+- Modify: `src/capability.rs`
+- Modify: `src/remote/search.rs`
+- Modify: `tests/remote_ops.rs`
+
+**Interfaces:**
+- Candidate, rg, and grep bounded helpers keep a parent read fd open, capture
+  limit-plus-one to scratch, drain from the same fd, wait, and inspect all final
+  statuses before emitting scratch.
+- Candidate retention is 10,001; match retention is `max_results + 1`.
+- Known rg events are `begin`, `match`, `end`, `summary`; all others fail.
+
+- [ ] **Step 1: Write error-priority/strict-event RED tests**
+
+Use a real PATH engine shim that emits a full valid prefix beyond the byte cap,
+then exits 2. Assert `RemoteExit`, no partial success, and redacted diagnostics.
+Add an unknown syntactically valid rg event and assert `ProtocolError`. Add
+streams far beyond the result/candidate count and assert only lookahead is
+retained while later malformed data is still rejected.
+
+- [ ] **Step 2: Verify RED**
+
+Run `cargo test --test remote_ops search_full_prefix_then_exit_two_is_error -- --nocapture` and
+`cargo test --test remote_ops search_unknown_rg_event_is_protocol_error -- --nocapture`.
+Expected: current cap path reclassifies the later error or ignores the event.
+
+- [ ] **Step 3: Implement same-fd drain and strict streaming decode**
+
+Replace planned-SIGPIPE logic in all three scripts and `search_bound` probe.
+After draining and waiting, make engine-error, xargs-status, and producer-status
+checks precede capped output. Parse every bounded event incrementally while
+limiting retained candidates/matches to their lookahead ceilings.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run all search tests, including rg/grep parity, oversized first event,
+full-prefix-later-error, unknown events, cancellation, and cleanup.
+
+### Task 15: Final-Symlink Read Errors and Completion Gate
+
+**Files:**
+- Modify: `src/remote/read.rs`
+- Modify: `tests/remote_ops.rs`
+- Modify: the Task 4 design, plan, clarifications, and report
+
+- [ ] **Step 1: Write final-symlink RED tests**
+
+Create a dangling final symlink and assert a closed `NotFound` entry. Create an
+existing mode-000 target behind a final symlink and, where the effective uid can
+observe permission denial, assert `PermissionDenied`. Add the deterministic
+parent-directory ambiguity case available on the current platform and assert a
+fixed safe error containing neither stderr nor the path.
+
+- [ ] **Step 2: Verify RED, implement, and verify GREEN**
+
+Run `cargo test --test remote_ops read_final_symlink_errors -- --nocapture`.
+Change the script's first check to following `-e`; classify deterministic
+existing-but-`! -r` separately. Re-run the focused test and all read tests.
+
+- [ ] **Step 3: Fresh completion gate and new commit**
+
+Run in this exact order:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --test remote_ops -- --nocapture
+cargo test --all-targets
+git diff --check
+git status --short
+```
+
+Update `.superpowers/sdd/task-4-report.md` with every observed RED/GREEN and
+fresh count, force-stage the clarification/report because `.superpowers` is
+ignored, preserve both `__pycache__` trees, and create one new commit.
+
+---
+
 ## Plan Self-Review Checklist
 
-- Every clarification item 1-40 maps to at least one task above.
+- Every clarification item 1-47 maps to at least one task above.
 - All production changes follow a named failing test and observed RED.
 - Public type names are defined before later tasks consume them.
 - List/stat/read/search protocols each have explicit field and byte ceilings.
@@ -1032,7 +1313,8 @@ the controller in the handoff message.
 - Stat uses bounded sequential NUL/xargs batches and never relies on `ARG_MAX`.
 - Every internal spool has an abort-safe facade-entry owner; TTL is fallback.
 - Search has explicit global `max_results + 1` retention and
-  `max_frame_bytes + 1` planned-byte lookahead with preserved producer status.
+  `max_frame_bytes + 1` byte lookahead with same-fd drain and final-status
+  precedence.
 - The final gate includes format, clippy, focused tests, all targets, diff, and
   status evidence.
 - Every implementation step is concrete; there are no Python runtime steps,

@@ -3,6 +3,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,13 +43,24 @@ fn fixture_with_options(
             OsString::from("local-fixed"),
         ),
         (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
-        (
-            OsString::from("FAKE_SSH_HAS_RG_JSON"),
-            OsString::from(if rg { "1" } else { "0" }),
-        ),
     ]);
     for (key, value) in extra {
         environment.insert(OsString::from(key), value.clone());
+    }
+    if !rg {
+        let bin = runtime_base.path().join("no-rg-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let rg = bin.join("rg");
+        std::fs::write(&rg, b"#!/bin/sh\nexit 64\n").unwrap();
+        std::fs::set_permissions(&rg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inherited = environment
+            .get(&OsString::from("PATH"))
+            .cloned()
+            .unwrap_or_else(|| OsString::from("/usr/local/bin:/usr/bin:/bin"));
+        environment.insert(
+            OsString::from("PATH"),
+            OsString::from(format!("{}:{}", bin.display(), inherited.to_string_lossy())),
+        );
     }
     let runner = Arc::new(
         SshRunner::with_executable(
@@ -359,14 +371,28 @@ async fn output_read_requires_and_uses_command_provenance() {
 }
 
 #[tokio::test]
-async fn capability_retry_is_exactly_once_for_a_required_key() {
+async fn readonly_real_mismatch_retries_exactly_once_from_the_list_script() {
+    use std::os::unix::fs::PermissionsExt;
+
     let remote = tempfile::TempDir::new().unwrap();
     std::fs::write(remote.path().join("a"), b"x").unwrap();
     let runtime_base = tempfile::TempDir::new().unwrap();
     let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
     let store = Arc::new(OutputStore::new(&runtime).unwrap());
-    let marker = runtime_base.path().join("mismatch-once");
+    let marker = runtime_base.path().join("find-stale-once");
     let log = runtime_base.path().join("ssh.log");
+    let bin = tempfile::TempDir::new().unwrap();
+    let find = bin.path().join("find");
+    std::fs::write(
+        &find,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *codex-probe-find*) exec /usr/bin/find \"$@\";; esac\nif [ ! -e {} ]; then : >{}; exit 64; fi\nexec /usr/bin/find \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&find, std::fs::Permissions::from_mode(0o755)).unwrap();
     let environment = BTreeMap::from([
         (
             OsString::from("FAKE_SSH_MODE"),
@@ -377,12 +403,11 @@ async fn capability_retry_is_exactly_once_for_a_required_key() {
             remote.path().as_os_str().to_owned(),
         ),
         (
-            OsString::from("FAKE_SSH_MISMATCH_FILE"),
-            marker.as_os_str().to_owned(),
-        ),
-        (
-            OsString::from("FAKE_SSH_MISMATCH_KEY"),
-            OsString::from("find_nul"),
+            OsString::from("PATH"),
+            OsString::from(format!(
+                "{}:/usr/local/bin:/usr/bin:/bin",
+                bin.path().display()
+            )),
         ),
         (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
     ]);
@@ -421,10 +446,75 @@ async fn capability_retry_is_exactly_once_for_a_required_key() {
 }
 
 #[tokio::test]
+async fn readonly_filesystem_error_is_not_retried() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let runtime_base = tempfile::TempDir::new().unwrap();
+    let log = runtime_base.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+    let error = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: Some("missing".into()),
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "C").count(), 1);
+}
+
+#[tokio::test]
+async fn readonly_transport_error_is_not_retried() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let runtime_base = tempfile::TempDir::new().unwrap();
+    let log = runtime_base.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("error")),
+            ("FAKE_SSH_PROBE_ERROR", OsString::from("connect-timeout")),
+            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+        ],
+    );
+    let error = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ConnectTimeout);
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(log.lines().filter(|line| *line == "C").count(), 0);
+}
+
+#[tokio::test]
 async fn capability_mismatch_unknown_key_is_protocol_error_without_retry() {
     let remote = tempfile::TempDir::new().unwrap();
     std::fs::write(remote.path().join("a"), b"x").unwrap();
     let marker = remote.path().join("mismatch-marker");
+    let runtime_base = tempfile::TempDir::new().unwrap();
+    let log = runtime_base.path().join("ssh.log");
     let (_runtime, _runner, bridge) = fixture_with_options(
         remote.path(),
         false,
@@ -432,6 +522,7 @@ async fn capability_mismatch_unknown_key_is_protocol_error_without_retry() {
         &[
             ("FAKE_SSH_MISMATCH_FILE", marker.as_os_str().to_owned()),
             ("FAKE_SSH_MISMATCH_KEY", OsString::from("unexpected_key")),
+            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
         ],
     );
     let error = bridge
@@ -448,6 +539,8 @@ async fn capability_mismatch_unknown_key_is_protocol_error_without_retry() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::ProtocolError);
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "C").count(), 1);
 }
 
 #[tokio::test]
@@ -657,7 +750,9 @@ fn spool_files(runtime: &std::path::Path) -> Vec<std::path::PathBuf> {
         })
         .flat_map(|entry| {
             std::fs::read_dir(entry.path())
-                .unwrap()
+                .ok()
+                .into_iter()
+                .flatten()
                 .filter_map(Result::ok)
                 .map(|file| file.path())
                 .collect::<Vec<_>>()
@@ -678,7 +773,7 @@ fn resident_kib() -> u64 {
 }
 
 #[tokio::test]
-async fn five_hosts_overlap_with_forty_mib_spooled_and_bounded_rss() {
+async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
     use codex_ssh_bridge::config::HostProfile;
     use std::os::unix::fs::PermissionsExt;
     let remote = tempfile::TempDir::new().unwrap();
@@ -697,15 +792,11 @@ async fn five_hosts_overlap_with_forty_mib_spooled_and_bounded_rss() {
     let environment = BTreeMap::from([
         (
             OsString::from("FAKE_SSH_MODE"),
-            OsString::from("local-fixed"),
+            OsString::from("large-candidates"),
         ),
         (
             OsString::from("FAKE_SSH_ROOT"),
             remote.path().as_os_str().to_owned(),
-        ),
-        (
-            OsString::from("FAKE_SSH_FIXED_STDOUT_BYTES"),
-            OsString::from((8 * 1024 * 1024).to_string()),
         ),
         (
             OsString::from("FAKE_SSH_FIXED_SLEEP_SECONDS"),
@@ -724,63 +815,78 @@ async fn five_hosts_overlap_with_forty_mib_spooled_and_bounded_rss() {
     );
     let bridge = Arc::new(RemoteBridge::new(runner));
     let baseline_rss = resident_kib();
+    let monitor_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor_peak = Arc::new(std::sync::Mutex::new((0usize, 0u64, baseline_rss, true)));
+    let monitor = {
+        let stop = Arc::clone(&monitor_stop);
+        let peak = Arc::clone(&monitor_peak);
+        let directory = runtime_directory.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let files = spool_files(&directory);
+                let stdout_bytes = files
+                    .iter()
+                    .filter(|path| path.to_string_lossy().ends_with(".stdout"))
+                    .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
+                    .max()
+                    .unwrap_or(0);
+                let rss = resident_kib();
+                let mut observed = peak.lock().unwrap();
+                observed.0 = observed.0.max(files.len());
+                observed.1 = observed.1.max(stdout_bytes);
+                observed.2 = observed.2.max(rss);
+                if files.len() == 10 {
+                    observed.3 &= files.iter().all(|path| {
+                        path.metadata()
+                            .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+                    });
+                }
+                drop(observed);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
     let started = std::time::Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
     for index in 0..5 {
         let bridge = Arc::clone(&bridge);
         tasks.spawn(async move {
             bridge
-                .list(
-                    ListRequest {
+                .search(
+                    SearchRequest {
                         host: format!("h{index}"),
                         path: None,
-                        depth: None,
-                        include_hidden: None,
-                        max_entries: None,
+                        query: "needle".into(),
+                        globs: vec!["accept/**".into()],
+                        max_results: None,
+                        binary: None,
                     },
                     CancellationToken::new(),
                 )
                 .await
         });
     }
-    let mut peak_files = Vec::new();
-    for _ in 0..300 {
-        let files = spool_files(&runtime_directory);
-        if files
-            .iter()
-            .filter(|path| {
-                path.extension().is_some_and(|value| value == "stdout")
-                    && path
-                        .metadata()
-                        .is_ok_and(|metadata| metadata.len() >= 8 * 1024 * 1024)
-            })
-            .count()
-            == 5
-        {
-            peak_files = files;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut completed = 0;
+    while let Some(result) = tasks.join_next().await {
+        let result = result.unwrap().unwrap();
+        assert!(result.matches.is_empty());
+        assert!(result.truncated);
+        completed += 1;
     }
-    assert_eq!(peak_files.len(), 10);
-    assert!(
-        peak_files
-            .iter()
-            .all(|path| path.metadata().unwrap().permissions().mode() & 0o777 == 0o600)
-    );
-    let peak_rss = resident_kib();
+    monitor_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    monitor.join().unwrap();
+    let (observed_files, observed_stdout_bytes, peak_rss, all_secure) =
+        *monitor_peak.lock().unwrap();
+    assert_eq!(observed_files, 10);
+    assert_eq!(observed_stdout_bytes, 8 * 1024 * 1024);
+    assert!(all_secure);
     assert!(
         peak_rss.saturating_sub(baseline_rss) < 32 * 1024,
         "RSS grew {} KiB",
         peak_rss.saturating_sub(baseline_rss)
     );
-    let mut completed = 0;
-    while let Some(result) = tasks.join_next().await {
-        assert_eq!(result.unwrap().unwrap_err().code, ErrorCode::OutputLimit);
-        completed += 1;
-    }
     assert_eq!(completed, 5);
-    assert!(started.elapsed() < Duration::from_millis(1_200));
+    assert!(started.elapsed() < Duration::from_millis(2_400));
     assert_eq!(spool_file_count(&runtime_directory), 0);
 }
 
@@ -827,6 +933,77 @@ async fn metadata_list_stat_preserve_order_kinds_and_hidden_depth() {
     assert!(
         matches!(&stat.entries[1], StatEntry::Success { metadata, .. } if metadata.kind == RemoteFileKind::File && metadata.size == 3)
     );
+}
+
+#[tokio::test]
+async fn list_hidden_flood_does_not_consume_remote_cap() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let hidden = remote.path().join(".hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    for index in 0..200 {
+        std::fs::write(
+            hidden.join(format!("hidden-{index:04}-{}", "x".repeat(64))),
+            b"",
+        )
+        .unwrap();
+    }
+    let visible_dir = remote.path().join("visible-dir");
+    let nested_hidden = visible_dir.join(".nested-hidden");
+    std::fs::create_dir_all(&nested_hidden).unwrap();
+    for index in 0..200 {
+        std::fs::write(
+            nested_hidden.join(format!("hidden-{index:04}-{}", "y".repeat(64))),
+            b"",
+        )
+        .unwrap();
+    }
+    std::fs::write(visible_dir.join("visible-c"), b"").unwrap();
+    std::fs::write(remote.path().join("visible-a"), b"").unwrap();
+    std::fs::write(remote.path().join("visible-b"), b"").unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(remote.path(), false, Some(4096), &[]);
+    let visible = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: Some(3),
+                include_hidden: Some(false),
+                max_entries: Some(4),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        visible
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.value.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "visible-a",
+            "visible-b",
+            "visible-dir",
+            "visible-dir/visible-c"
+        ]
+    );
+    assert!(!visible.truncated);
+
+    let all = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: Some(3),
+                include_hidden: Some(true),
+                max_entries: Some(4),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(all.entries.len(), 4);
+    assert!(all.truncated);
 }
 
 #[tokio::test]
@@ -986,6 +1163,44 @@ async fn read_full_hash_missing_symlink_and_aggregate_truncation() {
 }
 
 #[tokio::test]
+async fn read_final_symlink_errors_are_safe_and_follow_the_target() {
+    use std::os::unix::fs::symlink;
+
+    let remote = tempfile::TempDir::new().unwrap();
+    symlink("missing-target", remote.path().join("dangling")).unwrap();
+    let denied_target = remote.path().join("denied-target");
+    std::fs::write(&denied_target, b"secret").unwrap();
+    symlink("denied-target", remote.path().join("denied-link")).unwrap();
+    std::fs::set_permissions(&denied_target, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+    let result = bridge
+        .read(
+            ReadRequest {
+                host: "dev".into(),
+                paths: vec!["dangling".into(), "denied-link".into()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: Some(64),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(&result.files[0], ReadEntry::Error { error, .. } if error.code == EntryErrorCode::NotFound)
+    );
+    let effective_uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    if effective_uid.stdout != b"0\n" {
+        assert!(
+            matches!(&result.files[1], ReadEntry::Error { error, .. } if error.code == EntryErrorCode::PermissionDenied)
+        );
+    } else {
+        eprintln!("platform skip: unreadable target cannot be asserted as effective uid 0");
+    }
+    std::fs::set_permissions(&denied_target, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
 async fn read_hash_before_after_race_is_a_contentless_read_conflict() {
     use std::io::Write as _;
     let remote = tempfile::TempDir::new().unwrap();
@@ -1093,7 +1308,68 @@ async fn search_rg_and_grep_share_literal_glob_and_byte_column_semantics() {
 }
 
 #[tokio::test]
-async fn search_planned_cap_accepts_complete_prefix_and_rejects_oversized_first_event() {
+async fn search_globs_are_slash_aware_for_star_question_class_and_double_star() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(remote.path().join("nested")).unwrap();
+    for path in [
+        "root.txt",
+        "nested/a.txt",
+        "nested/b.txt",
+        "nested/c.txt",
+        "nested/ab.txt",
+    ] {
+        std::fs::write(remote.path().join(path), b"needle\n").unwrap();
+    }
+    for rg in [false, true] {
+        let (_runtime, _runner, bridge) = fixture(remote.path(), rg);
+        for (glob, expected) in [
+            ("*.txt", vec!["root.txt"]),
+            (
+                "nested/?.txt",
+                vec!["nested/a.txt", "nested/b.txt", "nested/c.txt"],
+            ),
+            ("nested/[ab].txt", vec!["nested/a.txt", "nested/b.txt"]),
+            (
+                "**/*.txt",
+                vec![
+                    "nested/a.txt",
+                    "nested/ab.txt",
+                    "nested/b.txt",
+                    "nested/c.txt",
+                    "root.txt",
+                ],
+            ),
+        ] {
+            let result = bridge
+                .search(
+                    SearchRequest {
+                        host: "dev".into(),
+                        query: "needle".into(),
+                        path: None,
+                        globs: vec![glob.into()],
+                        max_results: Some(20),
+                        binary: Some(false),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result
+                    .matches
+                    .iter()
+                    .map(|matched| matched.relative_path.value.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "engine={:?}, glob={glob}",
+                result.engine
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_byte_cap_accepts_complete_prefix_and_rejects_oversized_first_event() {
     let remote = tempfile::TempDir::new().unwrap();
     let mut many = Vec::new();
     for _ in 0..2_000 {
@@ -1151,7 +1427,7 @@ async fn search_real_engine_failure_is_fixed_and_redacted() {
     let grep = bin.path().join("grep");
     std::fs::write(
         &grep,
-        b"#!/bin/sh\nprintf 'VERY_SECRET_ENGINE_DIAGNOSTIC\\n' >&2\nexit 2\n",
+        b"#!/bin/sh\ncase \" $* \" in *codex-probe-grep*|*/dev/null*) exec /usr/bin/grep \"$@\";; esac\nprintf 'VERY_SECRET_ENGINE_DIAGNOSTIC\\n' >&2\nexit 2\n",
     )
     .unwrap();
     std::fs::set_permissions(&grep, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1175,4 +1451,75 @@ async fn search_real_engine_failure_is_fixed_and_redacted() {
     assert_eq!(error.code, ErrorCode::RemoteExit);
     assert!(!error.message.contains("VERY_SECRET"));
     assert!(!error.message.contains("secret-name"));
+}
+
+#[tokio::test]
+async fn search_full_prefix_then_exit_two_is_error() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("candidate"), b"needle\n").unwrap();
+    let bin = tempfile::TempDir::new().unwrap();
+    let grep = bin.path().join("grep");
+    std::fs::write(
+        &grep,
+        b"#!/bin/sh\ncase \" $* \" in *codex-probe-grep*|*/dev/null*) exec /usr/bin/grep \"$@\";; esac\nfor value do candidate=$value; done\ni=0\nwhile [ \"$i\" -lt 1000 ]; do printf '%s\\000%d:needle\\n' \"$candidate\" \"$((i + 1))\"; i=$((i + 1)); done\nprintf 'VERY_SECRET_LATE_ENGINE_ERROR\\n' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&grep, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        bin.path().display()
+    ));
+    let (_runtime, _runner, bridge) =
+        fixture_with_options(remote.path(), false, Some(4096), &[("PATH", path)]);
+    let error = bridge
+        .search(
+            SearchRequest {
+                host: "dev".into(),
+                query: "needle".into(),
+                path: None,
+                globs: vec![],
+                max_results: Some(10_000),
+                binary: Some(false),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteExit);
+    assert!(!error.message.contains("VERY_SECRET"));
+}
+
+#[tokio::test]
+async fn search_unknown_rg_event_is_protocol_error() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("candidate"), b"needle\n").unwrap();
+    let bin = tempfile::TempDir::new().unwrap();
+    let rg = bin.path().join("rg");
+    std::fs::write(
+        &rg,
+        b"#!/bin/sh\ncase \" $* \" in *codex-probe-rg*|*/dev/null*) exec /usr/bin/rg \"$@\";; esac\nprintf '%s\\n' '{\"type\":\"mystery\",\"data\":{}}'\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&rg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        bin.path().display()
+    ));
+    let (_runtime, _runner, bridge) =
+        fixture_with_options(remote.path(), true, None, &[("PATH", path)]);
+    let error = bridge
+        .search(
+            SearchRequest {
+                host: "dev".into(),
+                query: "needle".into(),
+                path: None,
+                globs: vec![],
+                max_results: None,
+                binary: Some(false),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProtocolError);
 }

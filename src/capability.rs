@@ -104,35 +104,121 @@ tool_grep_nul=0
 tool_xargs_nul=0
 tool_search_bound=0
 if [ -n "$probe_tmp" ]; then
-    printf 'first\nsecond' >"$probe_tmp/read"
-    if [ "$(tail -n +2 -- "$probe_tmp/read" | head -n 1 | head -c 7)" = second ]; then
+    read_file=$probe_tmp/codex-probe-read
+    read_tail=$probe_tmp/read-tail
+    read_lines=$probe_tmp/read-lines
+    read_bytes=$probe_tmp/read-bytes
+    read_last=$probe_tmp/read-last
+    read_expected=$probe_tmp/read-expected
+    printf 'a\000b\nc' >"$read_file"
+    printf 'a\000b\n' >"$read_expected"
+    if tail -n +1 -- "$read_file" >"$read_tail" 2>/dev/null &&
+       head -n 1 "$read_tail" >"$read_lines" 2>/dev/null &&
+       head -c 4 "$read_lines" >"$read_bytes" 2>/dev/null &&
+       tail -c 1 -- "$read_file" >"$read_last" 2>/dev/null &&
+       read_count=$(wc -l <"$read_file") &&
+       cmp -s "$read_expected" "$read_bytes" &&
+       [ "$(cat "$read_last")" = c ] && [ "$read_count" -eq 1 ]; then
         tool_read_slice=1
     fi
-    mkdir "$probe_tmp/find"
+
+    find_actual=$probe_tmp/codex-probe-find
+    find_link=$probe_tmp/codex-probe-find-link
+    find_out=$probe_tmp/find-output
+    mkdir -p "$find_actual/visible/nested" "$find_actual/.hidden" "$probe_tmp/find-outside"
     newline_name='line
 name'
-    : >"$probe_tmp/find/$newline_name"
-    find_bytes=$(find "$probe_tmp/find" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | wc -c)
-    expected_find_bytes=$(printf '%s/find/%s\000' "$probe_tmp" "$newline_name" | wc -c)
-    if [ "$find_bytes" -eq "$expected_find_bytes" ]; then tool_find_nul=1; fi
-    stat_value=$(stat --printf='%f:%s' -- "$probe_tmp/read" 2>/dev/null || true)
-    case "$stat_value" in *:12) tool_stat_printf=1 ;; esac
-    if command -v rg >/dev/null 2>&1 && printf x | rg --json -F x 2>/dev/null | grep -F '"type":"match"' >/dev/null 2>&1; then
-        tool_rg_json=1
+    : >"$find_actual/$newline_name"
+    : >"$find_actual/visible/leaf"
+    : >"$find_actual/visible/nested/too-deep"
+    : >"$find_actual/.hidden/secret"
+    : >"$probe_tmp/find-outside/not-followed"
+    ln -s "$probe_tmp/find-outside" "$find_actual/descendant-link"
+    ln -s "$find_actual" "$find_link"
+    if (cd -- "$probe_tmp" &&
+        find -H codex-probe-find-link -mindepth 1 -maxdepth 2 \
+        \( -path '*/.*' -prune -o -printf '%P\000%y\000%s\000%m\000%T@\000' \)) \
+        >"$find_out" 2>/dev/null; then
+        find_fields=$(tr -cd '\000' <"$find_out" | wc -c)
+        if [ "$find_fields" -eq 25 ]; then tool_find_nul=1; fi
     fi
-    printf x >"$probe_tmp/grep"
-    grep_bytes=$(grep -HnZ -F x "$probe_tmp/grep" 2>/dev/null | wc -c)
-    expected_grep_bytes=$({ printf '%s\000' "$probe_tmp/grep"; printf '1:x\n'; } | wc -c)
-    if [ "$grep_bytes" -eq "$expected_grep_bytes" ]; then tool_grep_nul=1; fi
-    xargs_value=$(printf 'line\nname\000' | xargs -0 sh -c 'printf %s "$1"' bridge 2>/dev/null || true)
-    if [ "$xargs_value" = "$newline_name" ]; then tool_xargs_nul=1; fi
+
+    stat_file=$probe_tmp/codex-probe-stat
+    printf x >"$stat_file"
+    if touch -d '@-1.123456789' -- "$stat_file" 2>/dev/null; then
+        stat_mode=$(stat --printf='%f' -- "$stat_file" 2>/dev/null) || stat_mode=
+        stat_size=$(stat --printf='%s' -- "$stat_file" 2>/dev/null) || stat_size=
+        stat_seconds=$(stat --printf='%Y' -- "$stat_file" 2>/dev/null) || stat_seconds=
+        stat_human=$(stat --printf='%y' -- "$stat_file" 2>/dev/null) || stat_human=
+        stat_fraction=$(printf '%s' "$stat_human" | cut -d. -f2 | cut -d' ' -f1)
+        case "$stat_mode:$stat_size:$stat_seconds:$stat_fraction" in
+            [0-9a-f]*:1:-2:876543211) tool_stat_printf=1 ;;
+        esac
+    fi
+
+    rg_file=$probe_tmp/codex-probe-rg
+    printf 'before\000needle\n' >"$rg_file"
+    if command -v rg >/dev/null 2>&1; then
+        rg_json=$(rg --json --fixed-strings --hidden --no-ignore --text -- needle "$rg_file" 2>/dev/null)
+        rg_status=$?
+        rg --json --fixed-strings --hidden --no-ignore -- absent "$rg_file" >/dev/null 2>&1
+        rg_empty_status=$?
+        case "$rg_json" in
+            *'"type":"begin"'*'"type":"match"'*'"type":"end"'*'"type":"summary"'*)
+                if [ "$rg_status" -eq 0 ] && [ "$rg_empty_status" -eq 1 ]; then tool_rg_json=1; fi
+                ;;
+        esac
+    fi
+
+    grep_file=$probe_tmp/codex-probe-grep
+    grep_binary=$probe_tmp/grep-binary
+    grep_out=$probe_tmp/grep-output
+    grep_expected=$probe_tmp/grep-expected
+    printf 'needle\n' >"$grep_file"
+    printf 'before\000needle\n' >"$grep_binary"
+    if grep -IHnZ -F -- needle "$grep_file" "$grep_binary" >"$grep_out" 2>/dev/null; then
+        { printf '%s\000' "$grep_file"; printf '1:needle\n'; } >"$grep_expected"
+        if cmp -s "$grep_expected" "$grep_out"; then tool_grep_nul=1; fi
+    fi
+
+    xargs_out=$probe_tmp/xargs-output
+    printf 'line\nname\000' |
+        xargs -0 -r sh -c 'printf %s "$1"' codex-ssh-probe-xargs >"$xargs_out" 2>/dev/null
+    xargs_ok=$?
+    printf 'x\000' |
+        xargs -0 -r sh -c 'exit 7' codex-ssh-probe-xargs >/dev/null 2>&1
+    xargs_failure=$?
+    if [ "$xargs_ok" -eq 0 ] && [ "$xargs_failure" -ne 0 ] &&
+       [ "$(cat "$xargs_out")" = "$newline_name" ]; then
+        tool_xargs_nul=1
+    fi
+
     if command -v mkfifo >/dev/null 2>&1; then
-        mkfifo "$probe_tmp/fifo"
-        (printf abc >"$probe_tmp/fifo") &
-        fifo_pid=$!
-        head -c 2 <"$probe_tmp/fifo" >"$probe_tmp/bounded"
-        wait "$fifo_pid" 2>/dev/null || true
-        if [ "$(cat "$probe_tmp/bounded")" = ab ]; then tool_search_bound=1; fi
+        bound_fifo=$probe_tmp/bound-fifo
+        bound_status=$probe_tmp/bound-status
+        bound_out=$probe_tmp/codex-probe-bound
+        mkfifo "$bound_fifo"
+        (
+            printf abcdef >"$bound_fifo"
+            printf '%s' "$?" >"$bound_status"
+        ) &
+        bound_pid=$!
+        exec 3<"$bound_fifo"
+        head -c 3 <&3 >"$bound_out" 2>/dev/null
+        bound_head_status=$?
+        cat <&3 >/dev/null
+        bound_drain_status=$?
+        exec 3<&-
+        wait "$bound_pid" 2>/dev/null
+        bound_wait_status=$?
+        bound_producer_status=$(cat "$bound_status" 2>/dev/null || printf 2)
+        bound_mode=$(stat -c '%a' -- "$probe_tmp" 2>/dev/null || printf 0)
+        if [ "$bound_head_status" -eq 0 ] && [ "$bound_drain_status" -eq 0 ] &&
+           [ "$bound_wait_status" -eq 0 ] &&
+           [ "$bound_producer_status" -eq 0 ] && [ "$bound_mode" = 700 ] &&
+           [ "$(cat "$bound_out")" = abc ]; then
+            tool_search_bound=1
+        fi
     fi
 fi
 

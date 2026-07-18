@@ -794,6 +794,111 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
+#[test]
+fn capability_probe_rejects_each_incompatible_exact_behavior() {
+    let root = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let system_path = "/usr/local/bin:/usr/bin:/bin";
+    let cases = [
+        (
+            "read_slice",
+            "tail",
+            "case \" $* \" in *codex-probe-read*) exit 64;; esac\nexec /usr/bin/tail \"$@\"\n",
+        ),
+        (
+            "find_nul",
+            "find",
+            "case \" $* \" in *codex-probe-find*) exit 64;; esac\nexec /usr/bin/find \"$@\"\n",
+        ),
+        (
+            "stat_printf",
+            "stat",
+            "case \" $* \" in *codex-probe-stat*) exit 64;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        ("rg_json", "rg", "exit 64\n"),
+        (
+            "grep_nul",
+            "grep",
+            "case \" $* \" in *-IHnZ*) exit 64;; esac\nexec /usr/bin/grep \"$@\"\n",
+        ),
+        (
+            "xargs_nul",
+            "xargs",
+            "case \" $* \" in *codex-ssh-probe-xargs*) exit 64;; esac\nexec /usr/bin/xargs \"$@\"\n",
+        ),
+        (
+            "search_bound",
+            "head",
+            "case \" $* \" in *\" -c 3 \"*) exit 64;; esac\nexec /usr/bin/head \"$@\"\n",
+        ),
+    ];
+
+    for (expected_false, tool, body) in cases {
+        let shim = TempDir::new().unwrap();
+        let executable = shim.path().join(tool);
+        fs::write(&executable, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                CAPABILITY_PROBE_SCRIPT,
+                "probe",
+                root.path().to_str().unwrap(),
+            ])
+            .env("PATH", format!("{}:{system_path}", shim.path().display()))
+            .env("TMPDIR", scratch.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{expected_false}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected_root = RemotePath::resolve(root.path().to_str().unwrap(), ".").unwrap();
+        let capability = parse_probe_output(&output.stdout, &expected_root).unwrap();
+        for key in [
+            "read_slice",
+            "find_nul",
+            "stat_printf",
+            "rg_json",
+            "grep_nul",
+            "xargs_nul",
+            "search_bound",
+        ] {
+            assert_eq!(
+                capability.tools.get(key),
+                Some(&(key != expected_false)),
+                "shim={tool}, key={key}"
+            );
+        }
+        assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn local_fixed_executes_the_real_capability_probe() {
+    let root = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let command = format!(
+        "exec sh -c {} codex-ssh-probe {}",
+        codex_ssh_bridge::quote::shell_word(CAPABILITY_PROBE_SCRIPT).unwrap(),
+        codex_ssh_bridge::quote::shell_word(root.path().to_str().unwrap()).unwrap()
+    );
+    let output = Command::new(fake_ssh_path())
+        .args(["dev", &command])
+        .env("FAKE_SSH_MODE", "local-fixed")
+        .env("FAKE_SSH_ROOT", root.path())
+        .env("FAKE_SSH_HAS_READ_SLICE", "0")
+        .env("TMPDIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let expected = RemotePath::resolve(root.path().to_str().unwrap(), ".").unwrap();
+    let capability = parse_probe_output(&output.stdout, &expected).unwrap();
+    assert_eq!(capability.tools.get("read_slice"), Some(&true));
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
 struct RunnerFixture {
     _base: TempDir,
     runtime: RuntimePaths,

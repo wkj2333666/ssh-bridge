@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -6,19 +5,36 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::BridgeResult;
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedRunRequest, SshRunner};
+use crate::ssh::FixedRunRequest;
 
 use super::protocol::{
-    context, encode_bytes, entry_error, nul_fields, parse_u64, protocol_error, read_stream, utf8,
+    context, encode_bytes, entry_error, nul_fields, parse_u64, protocol_error, read_small_stream,
+    utf8,
 };
-use super::{EntryError, EntryErrorCode, ReadEntry, ReadResult, ResolvedRead};
+use super::{EntryError, EntryErrorCode, ReadEntry, ReadResult, RemoteBridge, ResolvedRead};
 
 const READ_SCRIPT: &str = r#"
 path=$1
 start=$2
 lines=$3
 budget=$4
-if [ ! -e "$path" ] && [ ! -L "$path" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
+if ! tail -n +1 -- /dev/null >/dev/null 2>&1 ||
+   ! head -n 1 /dev/null >/dev/null 2>&1 ||
+   ! head -c 1 /dev/null >/dev/null 2>&1 ||
+   ! tail -c 1 -- /dev/null >/dev/null 2>&1 ||
+   ! wc -l </dev/null >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=read_slice\000' >&2
+    exit 0
+fi
+if ! stat --printf='%s' -- /dev/null >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=stat_printf\000' >&2
+    exit 0
+fi
+if ! sha256sum -- /dev/null >/dev/null 2>&1; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=sha256sum\000' >&2
+    exit 0
+fi
+if [ ! -e "$path" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
 if [ ! -r "$path" ]; then printf 'PERMISSION_DENIED\000' >&2; exit 0; fi
 if [ ! -f "$path" ]; then printf 'INVALID_ARGUMENT\000' >&2; exit 0; fi
 size=$(stat --printf='%s' -- "$path" 2>/dev/null) || { printf 'PERMISSION_DENIED\000' >&2; exit 0; }
@@ -39,10 +55,11 @@ printf 'OK\000%s\000%s\000%s\000%s\000' "$size" "$count" "$hash1" "$hash2" >&2
 "#;
 
 pub(super) async fn read(
-    runner: &Arc<SshRunner>,
+    bridge: &RemoteBridge,
     request: ResolvedRead,
     cancel: CancellationToken,
 ) -> BridgeResult<ReadResult> {
+    let runner = &bridge.runner;
     let limits = runner.config().host(&request.host)?.limits;
     let mut remaining = request.max_bytes;
     let mut files = Vec::with_capacity(request.paths.len());
@@ -57,8 +74,8 @@ pub(super) async fn read(
             ));
         }
         let owner = InternalSpoolOwner::new();
-        let result = runner
-            .execute_fixed(
+        let result = bridge
+            .execute_readonly_fixed(
                 FixedRunRequest {
                     host: request.host.clone(),
                     script: READ_SCRIPT,
@@ -87,7 +104,7 @@ pub(super) async fn read(
                 &result.shell,
             ));
         }
-        let stderr = read_stream(&result.output, StreamKind::Stderr, 1024).await?;
+        let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
         let fields = nul_fields(&stderr)?;
         let actual_path = encode_bytes(path.absolute().as_bytes());
         let relative_path = encode_bytes(path.relative().as_bytes());
@@ -116,7 +133,7 @@ pub(super) async fn read(
         if !valid_hash(hash1) || !valid_hash(hash2) {
             return Err(protocol_error("read hash is invalid"));
         }
-        let stdout = read_stream(
+        let stdout = read_small_stream(
             &result.output,
             StreamKind::Stdout,
             remaining.saturating_add(1),

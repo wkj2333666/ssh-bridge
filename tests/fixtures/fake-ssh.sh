@@ -114,9 +114,12 @@ for argument do
 done
 
 case "$remote_command" in
-    *CODEX_SSH_PROBE*)
-        log_call P "$@"
-        if [ -n "${FAKE_SSH_PROBE_ERROR:-}" ]; then
+	*CODEX_SSH_PROBE*)
+		log_call P "$@"
+		if [ "${FAKE_SSH_MODE:-echo-argv}" = local-fixed ]; then
+			exec /bin/sh -c "$remote_command"
+		fi
+		if [ -n "${FAKE_SSH_PROBE_ERROR:-}" ]; then
             emit_fake_error "$FAKE_SSH_PROBE_ERROR"
         fi
         if [ -n "${FAKE_SSH_PROBE_SLEEP_SECONDS:-}" ]; then
@@ -190,15 +193,31 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
     stdin)
         cat
         ;;
-    bytes)
+	bytes)
         (emit_bytes "${FAKE_SSH_STDOUT_BYTES:-0}" stdout) &
         stdout_pid=$!
         (emit_bytes "${FAKE_SSH_STDERR_BYTES:-0}" stderr) &
         stderr_pid=$!
         wait "$stdout_pid"
-        wait "$stderr_pid"
-        ;;
-    sleep)
+		wait "$stderr_pid"
+		;;
+	large-candidates)
+		fake_root=${FAKE_SSH_ROOT:-/srv/project}
+		record_bytes=838
+		leaf_bytes=$((record_bytes - ${#fake_root} - 2))
+		if [ "$leaf_bytes" -le 0 ]; then exit 2; fi
+		leaf=$(dd if=/dev/zero bs=1 count="$leaf_bytes" 2>/dev/null | tr '\000' x)
+		awk -v root="$fake_root" -v leaf="$leaf" 'BEGIN {
+			for (i = 0; i < 10000; i++) printf "%s/%s%c", root, leaf, 0
+		}'
+		lookahead_leaf_bytes=$((8608 - ${#fake_root} - 2))
+		lookahead_leaf=$(dd if=/dev/zero bs=1 count="$lookahead_leaf_bytes" 2>/dev/null | tr '\000' y)
+		printf '%s/%s\000' "$fake_root" "$lookahead_leaf"
+		if [ -n "${FAKE_SSH_FIXED_SLEEP_SECONDS:-}" ]; then
+			run_fake_sleep "$FAKE_SSH_FIXED_SLEEP_SECONDS"
+		fi
+		;;
+	sleep)
         run_fake_sleep "${FAKE_SSH_SLEEP_SECONDS:-1}"
         ;;
     orphan-streams)
