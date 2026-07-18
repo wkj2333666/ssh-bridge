@@ -1,9 +1,9 @@
-use std::ffi::{OsStr, OsString};
+#![deny(unsafe_code)]
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
 
 use codex_ssh_bridge::config::{Config, Limits};
 use codex_ssh_bridge::error::ErrorCode;
@@ -13,51 +13,28 @@ use codex_ssh_bridge::{MAX_FRAME_BYTES, MAX_OUTPUT_BYTES, MAX_READ_BYTES, MAX_WR
 use proptest::prelude::*;
 use tempfile::{NamedTempFile, TempDir};
 
-static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+const LOAD_DEFAULT_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_TEST_LOAD_DEFAULT_CHILD";
 
-struct EnvironmentSandbox {
-    _lock: MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<OsString>)>,
+fn load_default_child(case: &str) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "config_load_default_in_isolated_child_process",
+            "--nocapture",
+        ])
+        .env(LOAD_DEFAULT_CHILD_SENTINEL, case);
+    command
 }
 
-impl EnvironmentSandbox {
-    fn new(names: &[&'static str]) -> Self {
-        let lock = ENVIRONMENT_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let saved = names
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect();
-        Self { _lock: lock, saved }
-    }
-
-    fn set(&self, name: &'static str, value: impl AsRef<OsStr>) {
-        // SAFETY: EnvironmentSandbox holds the process-wide test mutex until
-        // drop and all environment-mutating tests use this helper.
-        unsafe { std::env::set_var(name, value) };
-    }
-
-    fn remove(&self, name: &'static str) {
-        // SAFETY: EnvironmentSandbox holds the process-wide test mutex until
-        // drop and all environment-mutating tests use this helper.
-        unsafe { std::env::remove_var(name) };
-    }
-}
-
-impl Drop for EnvironmentSandbox {
-    fn drop(&mut self) {
-        for (name, value) in self.saved.drain(..) {
-            // SAFETY: restoration happens while the process-wide mutex is
-            // still held, including during unwinding from a failed assertion.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
+fn assert_child_passes(mut command: Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_config(contents: &str) -> NamedTempFile {
@@ -381,6 +358,36 @@ fn config_rejects_unsafe_modes_non_regular_files_and_symlinks() {
     assert_eq!(link_error.code, ErrorCode::InvalidConfig);
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(unsafe_code)]
+fn config_load_rejects_fifo_before_the_deadline() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+
+    let directory = TempDir::new().unwrap();
+    let fifo = directory.path().join("config.fifo");
+    let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo_path is a live NUL-terminated string and mode has the
+    // expected mode_t representation.
+    let result = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) };
+    assert_eq!(
+        result,
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let started = Instant::now();
+    let error = Config::load(&fifo).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "FIFO validation exceeded its one-second deadline"
+    );
+}
+
 #[test]
 fn missing_config_is_a_typed_error_and_is_not_created() {
     let directory = TempDir::new().unwrap();
@@ -395,6 +402,7 @@ fn missing_config_is_a_typed_error_and_is_not_created() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(unsafe_code)]
 fn config_load_never_reads_a_different_inode_after_security_validation() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -471,8 +479,49 @@ fn config_load_never_reads_a_different_inode_after_security_validation() {
 }
 
 #[test]
+fn config_load_default_in_isolated_child_process() {
+    let Ok(case) = std::env::var(LOAD_DEFAULT_CHILD_SENTINEL) else {
+        return;
+    };
+
+    let loaded = Config::load_default().unwrap();
+    match case.as_str() {
+        "override" => {
+            let expected = std::env::var_os("CODEX_SSH_BRIDGE_CONFIG").unwrap();
+            assert_eq!(loaded.source.path, Path::new(&expected));
+            assert!(loaded.source.from_environment);
+            assert!(
+                loaded
+                    .source
+                    .warning
+                    .as_deref()
+                    .unwrap()
+                    .contains("CODEX_SSH_BRIDGE_CONFIG is trusted execution-authority input")
+            );
+            assert!(loaded.config.hosts.is_empty());
+        }
+        "xdg" => {
+            let expected = Path::new(&std::env::var_os("XDG_CONFIG_HOME").unwrap())
+                .join("codex-ssh-bridge/config.toml");
+            assert_eq!(loaded.source.path, expected);
+            assert!(!loaded.source.from_environment);
+            assert_eq!(loaded.source.warning, None);
+            assert!(loaded.config.host("xdg").is_ok());
+        }
+        "home" => {
+            let expected = Path::new(&std::env::var_os("HOME").unwrap())
+                .join(".config/codex-ssh-bridge/config.toml");
+            assert_eq!(loaded.source.path, expected);
+            assert!(!loaded.source.from_environment);
+            assert_eq!(loaded.source.warning, None);
+            assert!(loaded.config.host("home").is_ok());
+        }
+        unexpected => panic!("unexpected child case: {unexpected}"),
+    }
+}
+
+#[test]
 fn environment_config_path_is_marked_as_trusted_execution_authority_input() {
-    let environment = EnvironmentSandbox::new(&["CODEX_SSH_BRIDGE_CONFIG"]);
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("config.toml");
     fs::write(&path, "[hosts]\n").unwrap();
@@ -482,26 +531,16 @@ fn environment_config_path_is_marked_as_trusted_execution_authority_input() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    environment.set("CODEX_SSH_BRIDGE_CONFIG", &path);
-    let loaded = Config::load_default().unwrap();
-
-    assert!(loaded.source.from_environment);
-    assert_eq!(loaded.source.path, path);
-    assert!(
-        loaded
-            .source
-            .warning
-            .as_deref()
-            .unwrap()
-            .contains("CODEX_SSH_BRIDGE_CONFIG is trusted execution-authority input")
-    );
-    assert!(loaded.config.hosts.is_empty());
+    let mut child = load_default_child("override");
+    child
+        .env("CODEX_SSH_BRIDGE_CONFIG", &path)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME");
+    assert_child_passes(child);
 }
 
 #[test]
 fn default_config_path_prefers_xdg_then_falls_back_to_home() {
-    let environment =
-        EnvironmentSandbox::new(&["CODEX_SSH_BRIDGE_CONFIG", "XDG_CONFIG_HOME", "HOME"]);
     let directory = TempDir::new().unwrap();
     let xdg = directory.path().join("xdg");
     let home = directory.path().join("home");
@@ -518,21 +557,19 @@ fn default_config_path_prefers_xdg_then_falls_back_to_home() {
         fs::set_permissions(&home_config, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    environment.remove("CODEX_SSH_BRIDGE_CONFIG");
-    environment.set("HOME", &home);
-    environment.set("XDG_CONFIG_HOME", &xdg);
-    let loaded = Config::load_default().unwrap();
-    assert_eq!(loaded.source.path, xdg_config);
-    assert!(!loaded.source.from_environment);
-    assert_eq!(loaded.source.warning, None);
-    assert!(loaded.config.host("xdg").is_ok());
+    let mut xdg_child = load_default_child("xdg");
+    xdg_child
+        .env_remove("CODEX_SSH_BRIDGE_CONFIG")
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("HOME", &home);
+    assert_child_passes(xdg_child);
 
-    environment.remove("XDG_CONFIG_HOME");
-    let loaded = Config::load_default().unwrap();
-    assert_eq!(loaded.source.path, home_config);
-    assert!(!loaded.source.from_environment);
-    assert_eq!(loaded.source.warning, None);
-    assert!(loaded.config.host("home").is_ok());
+    let mut home_child = load_default_child("home");
+    home_child
+        .env_remove("CODEX_SSH_BRIDGE_CONFIG")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", &home);
+    assert_child_passes(home_child);
 }
 
 #[cfg(unix)]
