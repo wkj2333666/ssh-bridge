@@ -11,6 +11,8 @@ preview_bytes = 262144
 max_output_bytes = 67108864
 global_concurrency = 8
 per_host_concurrency = 2
+global_spool_quota_bytes = 536870912
+retention_serialization_jobs = 2
 
 [hosts.devbox]
 root = "/srv/codex-workspace"

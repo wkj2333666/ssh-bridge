@@ -10,6 +10,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -29,7 +30,7 @@ use crate::error::{
 };
 use crate::output::{
     CaptureLimits, CapturedOutput, InternalCapturedOutput, InternalSpoolRegistration, OutputPage,
-    OutputProvenance, OutputReference, OutputStore, StderrSignals, StreamKind,
+    OutputProvenance, OutputReference, OutputStore, StderrSignals, StoredProvenance, StreamKind,
 };
 use crate::path::RemotePath;
 use crate::quote::{PreparedShellWord, shell_word};
@@ -304,8 +305,19 @@ impl SshRunner {
     pub(crate) async fn output_provenance(
         &self,
         reference: &OutputReference,
-    ) -> BridgeResult<OutputProvenance> {
+    ) -> BridgeResult<StoredProvenance> {
         self.output_store.provenance(reference).await
+    }
+
+    pub(crate) async fn retain_serialized_detail<T: Serialize + Send + 'static>(
+        &self,
+        provenance: StoredProvenance,
+        owned: T,
+        cancel: CancellationToken,
+    ) -> BridgeResult<OutputReference> {
+        self.output_store
+            .retain_serialized_detail(provenance, owned, cancel)
+            .await
     }
 
     pub(crate) async fn execute_fixed_once(

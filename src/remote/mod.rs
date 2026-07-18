@@ -8,11 +8,14 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::capability::{ShellKind, ShellSelection};
 use crate::config::{Config, EffectiveLimits};
 use crate::error::{
     BridgeError, BridgeResult, ErrorCode, ErrorShellMetadata, attach_available_remote_context,
 };
-use crate::output::StreamKind;
+use crate::output::{
+    OutputProvenance, OutputReference, StoredAggregateKind, StoredProvenance, StreamKind,
+};
 use crate::path::RemotePath;
 use crate::ssh::{FixedRunRequest, FixedRunResult, SshRunner};
 
@@ -93,6 +96,29 @@ fn attach_remote_context(mut error: BridgeError, context: &RemoteContext) -> Bri
         Some(&shell),
     );
     error
+}
+
+fn attach_retention_context(error: BridgeError, provenance: &RetentionProvenance) -> BridgeError {
+    match provenance {
+        RetentionProvenance::Remote(context) => attach_remote_context(error, context),
+        RetentionProvenance::Aggregate { .. } => error,
+    }
+}
+
+fn shell_selection_from_metadata(metadata: ShellMetadata) -> BridgeResult<ShellSelection> {
+    let shell = match metadata.kind {
+        ShellName::Bash => ShellKind::Bash {
+            version: metadata.version.ok_or_else(|| {
+                BridgeError::invalid_argument("Bash retention provenance requires a version")
+            })?,
+        },
+        ShellName::Sh => ShellKind::PosixSh,
+        ShellName::Login => ShellKind::Login,
+    };
+    Ok(ShellSelection {
+        shell,
+        fallback: metadata.fallback,
+    })
 }
 
 fn attach_optional_remote_context(
@@ -206,25 +232,56 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<OutputReadResult> {
         let reference = crate::output::OutputReference::parse(&request.output_ref)?;
-        let provenance = self.runner.output_provenance(&reference).await?;
-        let context = RemoteContext {
-            remote: true,
-            host: provenance.host,
-            physical_root: provenance.physical_root,
-            shell: protocol::shell_selection_metadata(&provenance.shell),
+        let provenance = match self.runner.output_provenance(&reference).await? {
+            StoredProvenance::Remote(provenance) => RetentionProvenance::Remote(RemoteContext {
+                remote: true,
+                host: provenance.host,
+                physical_root: provenance.physical_root,
+                shell: protocol::shell_selection_metadata(&provenance.shell),
+            }),
+            StoredProvenance::Aggregate { kind, source_count } => RetentionProvenance::Aggregate {
+                kind: match kind {
+                    StoredAggregateKind::Hosts => AggregateKind::Hosts,
+                },
+                source_count,
+            },
         };
         let page = tokio::select! { biased;
-            () = cancel.cancelled() => return Err(attach_remote_context(BridgeError::new(ErrorCode::Cancelled, "output read was cancelled", false), &context)),
-            page = self.runner.read_output(&reference, request.stream, request.offset, request.max_bytes) => page.map_err(|error| attach_remote_context(error, &context))?,
+            () = cancel.cancelled() => return Err(attach_retention_context(BridgeError::new(ErrorCode::Cancelled, "output read was cancelled", false), &provenance)),
+            page = self.runner.read_output(&reference, request.stream, request.offset, request.max_bytes) => page.map_err(|error| attach_retention_context(error, &provenance))?,
         };
         Ok(OutputReadResult {
-            context,
+            provenance,
             stream: request.stream,
             offset: page.offset,
             next_offset: page.next_offset,
             eof: page.eof,
             data: protocol::encode_bytes(&page.bytes),
         })
+    }
+
+    pub async fn retain_serialized_detail<T: Serialize + Send + 'static>(
+        &self,
+        provenance: RetentionProvenance,
+        owned: T,
+        cancel: CancellationToken,
+    ) -> BridgeResult<OutputReference> {
+        let stored = match provenance {
+            RetentionProvenance::Remote(context) => StoredProvenance::Remote(OutputProvenance {
+                host: context.host,
+                physical_root: context.physical_root,
+                shell: shell_selection_from_metadata(context.shell)?,
+            }),
+            RetentionProvenance::Aggregate { kind, source_count } => StoredProvenance::Aggregate {
+                kind: match kind {
+                    AggregateKind::Hosts => StoredAggregateKind::Hosts,
+                },
+                source_count,
+            },
+        };
+        self.runner
+            .retain_serialized_detail(stored, owned, cancel)
+            .await
     }
 
     async fn execute_readonly_fixed(
@@ -617,6 +674,22 @@ pub struct RemoteContext {
     pub shell: ShellMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggregateKind {
+    Hosts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum RetentionProvenance {
+    Remote(RemoteContext),
+    Aggregate {
+        kind: AggregateKind,
+        source_count: usize,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellMetadata {
     pub kind: ShellName,
@@ -814,8 +887,7 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OutputReadResult {
-    #[serde(flatten)]
-    pub context: RemoteContext,
+    pub provenance: RetentionProvenance,
     pub stream: StreamKind,
     pub offset: u64,
     pub next_offset: u64,

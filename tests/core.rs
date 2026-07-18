@@ -5,7 +5,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile, Limits};
+use codex_ssh_bridge::config::{
+    Config, DEFAULT_GLOBAL_SPOOL_QUOTA_BYTES, DEFAULT_RETENTION_SERIALIZATION_JOBS,
+    HostLimitOverrides, HostProfile, Limits, MAX_GLOBAL_SPOOL_QUOTA_BYTES,
+    MAX_RETENTION_SERIALIZATION_JOBS, MIN_GLOBAL_SPOOL_QUOTA_BYTES,
+};
 use codex_ssh_bridge::error::{BridgeError, ErrorCode};
 use codex_ssh_bridge::path::RemotePath;
 use codex_ssh_bridge::quote::{fixed_command, shell_word};
@@ -241,6 +245,54 @@ fn config_defaults_match_compiled_limits() {
     assert_eq!(limits.max_output_bytes, MAX_OUTPUT_BYTES);
     assert_eq!(limits.global_concurrency, 8);
     assert_eq!(limits.per_host_concurrency, 2);
+}
+
+#[test]
+fn task8_spool_limit_config_defaults_and_exact_bounds_are_frozen() {
+    let limits = Limits::default();
+    assert_eq!(
+        limits.global_spool_quota_bytes,
+        DEFAULT_GLOBAL_SPOOL_QUOTA_BYTES
+    );
+    assert_eq!(
+        limits.retention_serialization_jobs,
+        DEFAULT_RETENTION_SERIALIZATION_JOBS
+    );
+    assert_eq!(DEFAULT_GLOBAL_SPOOL_QUOTA_BYTES, 512 * 1024 * 1024);
+    assert_eq!(MIN_GLOBAL_SPOOL_QUOTA_BYTES, 64 * 1024 * 1024);
+    assert_eq!(MAX_GLOBAL_SPOOL_QUOTA_BYTES, 512 * 1024 * 1024);
+    assert_eq!(DEFAULT_RETENTION_SERIALIZATION_JOBS, 2);
+    assert_eq!(MAX_RETENTION_SERIALIZATION_JOBS, 4);
+
+    for quota in [MIN_GLOBAL_SPOOL_QUOTA_BYTES, MAX_GLOBAL_SPOOL_QUOTA_BYTES] {
+        let file = write_config(&format!(
+            "[limits]\nglobal_spool_quota_bytes = {quota}\nretention_serialization_jobs = 1\n[hosts]\n"
+        ));
+        assert!(Config::load(file.path()).is_ok(), "quota={quota}");
+    }
+}
+
+#[test]
+fn task8_spool_limit_config_rejects_quota_and_job_count_outside_bounds() {
+    for limit in [
+        format!(
+            "global_spool_quota_bytes = {}",
+            MIN_GLOBAL_SPOOL_QUOTA_BYTES - 1
+        ),
+        format!(
+            "global_spool_quota_bytes = {}",
+            MAX_GLOBAL_SPOOL_QUOTA_BYTES + 1
+        ),
+        "retention_serialization_jobs = 0".to_owned(),
+        format!(
+            "retention_serialization_jobs = {}",
+            MAX_RETENTION_SERIALIZATION_JOBS + 1
+        ),
+    ] {
+        let file = write_config(&format!("[limits]\n{limit}\n[hosts]\n"));
+        let error = Config::load(file.path()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidConfig, "{limit}");
+    }
 }
 
 fn config_with_root(root: String) -> Config {
