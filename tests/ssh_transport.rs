@@ -34,6 +34,7 @@ const HARDENED_OPTIONS: &[&str] = &[
     "ControlMaster=auto",
     "ControlPersist=300",
 ];
+const LONG_XDG_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_LONG_XDG_CHILD_EXPECTED";
 
 fn option_is_distinct(argv: &[OsString], expected: &str) -> bool {
     argv.windows(2)
@@ -73,6 +74,18 @@ fn capability(shell: ShellKind) -> Capability {
         bash_version,
         tools: BTreeMap::new(),
     }
+}
+
+fn base_for_control_path_bytes(container: &TempDir, target: usize) -> std::path::PathBuf {
+    const CONTROL_FILENAME_BYTES: usize = 3 + 32;
+    let suffix = 1 + "codex-ssh-bridge".len() + 1 + CONTROL_FILENAME_BYTES;
+    let desired_base_bytes = target.checked_sub(suffix).unwrap();
+    let container_bytes = container.path().as_os_str().as_bytes().len();
+    let component_bytes = desired_base_bytes.checked_sub(container_bytes + 1).unwrap();
+    let base = container.path().join("x".repeat(component_bytes));
+    fs::create_dir(&base).unwrap();
+    assert_eq!(base.as_os_str().as_bytes().len(), desired_base_bytes);
+    base
 }
 
 #[test]
@@ -159,6 +172,99 @@ fn hostile_host_text_is_only_an_operand_after_the_option_separator() {
 }
 
 #[test]
+fn openssh_receives_a_literal_control_path_when_runtime_components_contain_percent_tokens() {
+    let container = TempDir::new().unwrap();
+    let base = container.path().join("literal-%h-%r-%p");
+    fs::create_dir(&base).unwrap();
+    let paths = RuntimePaths::ensure_from_base(&base).unwrap();
+    let config = config_with_host("dev-box", "/srv/project");
+    let policy = policy(&config, &paths, "stable identity");
+    let literal = policy.control_path().to_str().unwrap().to_owned();
+    let argv = build_ssh_argv(&policy, "example.invalid", "");
+    let encoded = argv
+        .iter()
+        .find_map(|argument| {
+            argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("ControlPath="))
+        })
+        .unwrap();
+    assert!(encoded.contains("%%h"));
+    assert!(encoded.contains("%%r"));
+    assert!(encoded.contains("%%p"));
+
+    let output = Command::new("/usr/bin/ssh")
+        .args(["-F", "/dev/null", "-G"])
+        .args(&argv)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ssh -G failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    let actual = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix("controlpath "))
+        .expect("ssh -G controlpath");
+    assert_eq!(encoded.replace("%%", "%"), literal);
+    assert_eq!(actual, literal);
+}
+
+#[test]
+fn control_path_accepts_107_bytes_and_rejects_108_bytes() {
+    let config = config_with_host("dev-box", "/srv/project");
+
+    let accepted_container = TempDir::new().unwrap();
+    let accepted_base = base_for_control_path_bytes(&accepted_container, 107);
+    let accepted_paths = RuntimePaths::ensure_from_base(&accepted_base).unwrap();
+    let accepted = policy(&config, &accepted_paths, "stable identity");
+    assert_eq!(accepted.control_path().as_os_str().as_bytes().len(), 107);
+
+    let rejected_container = TempDir::new().unwrap();
+    let rejected_base = base_for_control_path_bytes(&rejected_container, 108);
+    let rejected_paths = RuntimePaths::ensure_from_base(&rejected_base).unwrap();
+    let error = SshPolicy::for_host(
+        &config,
+        config.host("dev-box").unwrap(),
+        &rejected_paths,
+        "stable identity",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+}
+
+#[test]
+fn discover_long_xdg_fallback_child() {
+    let Some(expected) = std::env::var_os(LONG_XDG_CHILD_SENTINEL) else {
+        return;
+    };
+    let paths = RuntimePaths::discover().unwrap();
+    assert_eq!(paths.directory(), std::path::Path::new(&expected));
+}
+
+#[test]
+fn discover_falls_back_to_short_tmp_runtime_when_xdg_exceeds_control_path_budget() {
+    let container = TempDir::new().unwrap();
+    let long_base = base_for_control_path_bytes(&container, 108);
+    let uid = fs::metadata("/proc/self").unwrap().uid();
+    let expected = format!("/tmp/codex-ssh-bridge-{uid}");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "discover_long_xdg_fallback_child", "--nocapture"])
+        .env(LONG_XDG_CHILD_SENTINEL, &expected)
+        .env("XDG_RUNTIME_DIR", &long_base)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn runtime_paths_refuse_insecure_modes_and_symlinks() {
     let insecure_base = TempDir::new().unwrap();
     let insecure = insecure_base.path().join("codex-ssh-bridge");
@@ -194,6 +300,48 @@ fn runtime_paths_refuse_insecure_modes_and_symlinks() {
     fs::set_permissions(writable_base.path(), fs::Permissions::from_mode(0o770)).unwrap();
     let writable_base_error = RuntimePaths::ensure_from_base(writable_base.path()).unwrap_err();
     assert_eq!(writable_base_error.code, ErrorCode::InvalidConfig);
+}
+
+#[test]
+fn runtime_paths_reject_relative_bases() {
+    let error =
+        RuntimePaths::ensure_from_base(std::path::Path::new("relative/runtime")).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+}
+
+#[test]
+fn runtime_paths_reject_a_symlink_in_the_base_ancestor_chain() {
+    let container = TempDir::new().unwrap();
+    let real_ancestor = container.path().join("real-ancestor");
+    let base = real_ancestor.join("base");
+    fs::create_dir_all(&base).unwrap();
+    let linked_ancestor = container.path().join("linked-ancestor");
+    symlink(&real_ancestor, &linked_ancestor).unwrap();
+
+    let error = RuntimePaths::ensure_from_base(&linked_ancestor.join("base")).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+    assert_eq!(
+        error.details.path.as_deref(),
+        linked_ancestor.to_str(),
+        "must reject the symlink component itself"
+    );
+}
+
+#[test]
+fn runtime_paths_reject_a_world_writable_intermediate_ancestor() {
+    let container = TempDir::new().unwrap();
+    let writable_ancestor = container.path().join("writable-ancestor");
+    let base = writable_ancestor.join("base");
+    fs::create_dir_all(&base).unwrap();
+    fs::set_permissions(&writable_ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let error = RuntimePaths::ensure_from_base(&base).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+    assert_eq!(
+        error.details.path.as_deref(),
+        writable_ancestor.to_str(),
+        "must reject the writable intermediate itself"
+    );
 }
 
 #[test]
@@ -270,6 +418,11 @@ fn shell_selection_records_profile_free_bash_posix_fallback_and_login_semantics(
     let login = select_shell(&sh, ShellRequest::Login).unwrap();
     assert_eq!(login.shell, ShellKind::Login);
     assert!(!login.fallback);
+
+    let reported_login = capability(ShellKind::Login);
+    let automatic_login = select_shell(&reported_login, ShellRequest::Auto).unwrap();
+    assert_eq!(automatic_login.shell, ShellKind::PosixSh);
+    assert!(automatic_login.fallback);
 }
 
 #[tokio::test(flavor = "current_thread")]
