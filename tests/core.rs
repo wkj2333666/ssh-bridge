@@ -14,6 +14,8 @@ use proptest::prelude::*;
 use tempfile::{NamedTempFile, TempDir};
 
 const LOAD_DEFAULT_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_TEST_LOAD_DEFAULT_CHILD";
+#[cfg(unix)]
+const FIFO_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_TEST_FIFO_CHILD_PATH";
 
 fn load_default_child(case: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -360,10 +362,22 @@ fn config_rejects_unsafe_modes_non_regular_files_and_symlinks() {
 
 #[cfg(unix)]
 #[test]
+fn config_load_fifo_in_isolated_child_process() {
+    let Some(fifo) = std::env::var_os(FIFO_CHILD_SENTINEL) else {
+        return;
+    };
+
+    let error = Config::load(Path::new(&fifo)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(unsafe_code)]
 fn config_load_rejects_fifo_before_the_deadline() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     let directory = TempDir::new().unwrap();
@@ -379,13 +393,43 @@ fn config_load_rejects_fifo_before_the_deadline() {
         std::io::Error::last_os_error()
     );
 
-    let started = Instant::now();
-    let error = Config::load(&fifo).unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidConfig);
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "FIFO validation exceeded its one-second deadline"
-    );
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "config_load_fifo_in_isolated_child_process",
+            "--nocapture",
+        ])
+        .env(FIFO_CHILD_SENTINEL, &fifo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "FIFO child failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                break;
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "FIFO child exceeded its one-second deadline\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
 }
 
 #[test]
