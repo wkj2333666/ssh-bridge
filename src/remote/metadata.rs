@@ -16,11 +16,12 @@ use super::{
 };
 
 const LIST_SCRIPT: &str = r#"
-root=$1
-depth=$2
-show_hidden=$3
-max_entries=$4
-limit=$5
+R=$1;D=$2;H=$3;M=$4;L=$5
+lf(){
+ if [ "$3" = 1 ];then find -H "$1" -mindepth 1 -maxdepth "$2" -printf '%P\000%y\000%s\000%m\000%T@\000'
+ else find -H "$1" -mindepth 1 -maxdepth "$2" \( -path './.*' -o -path '*/.*' \) -prune -o -printf '%P\000%y\000%s\000%m\000%T@\000';fi
+}
+lx(){ xargs -0 -r -n 100 "$@"; }
 cs() (
  d=$(mktemp -d /tmp/codex-sentinel-bound.XXXXXX 2>/dev/null)||exit 90
  trap 'rm -rf -- "$d"' 0 1 2 15
@@ -31,23 +32,24 @@ cs() (
  CODEX_SSH_SENTINEL=bound head -c 3 <&3 >"$o" 2>/dev/null;h=$?
  cat <&3 >/dev/null;r=$?;exec 3<&-;wait "$p" 2>/dev/null;w=$?
  [ "$r:$w" = 0:0 ]||exit 90;v=$(cat "$o")||exit 90;[ "$h:$v" = 0:abc ]||exit 11
- a=$d/a;z=$d/z;l=$d/codex-sentinel-list-find
- mkdir "$a" "$z"&&printf x>"$a/f"&&ln -s "$z" "$a/l"&&ln -s "$a" "$l"&&chmod 640 "$a/f"&&touch -d @7.25 "$a/f"&&touch -h -d @8.5 "$a/l"||exit 90
- find -H "$l" -mindepth 1 -maxdepth 1 -name f -type f -printf '%P\000%y\000%s\000%m\000%T@\000' >"$o" 2>/dev/null||exit 90
- find -H "$l" -mindepth 1 -maxdepth 1 -name l -type l -printf '%P\000%y\000%s\000%m\000%T@\000' >>"$o" 2>/dev/null||exit 90
- { printf 'f\000f\0001\000640\0007.2500000000\000';printf 'l\000l\000%s\000777\0008.5000000000\000' "${#z}"; }>"$d/e"||exit 90
+ b=$d/codex-sentinel-list-production;z=$d/z;ft=$b/ft;fr=$b/fr;lr=$b/lr;hr=$b/hr
+ mkdir -p "$ft" "$lr" "$hr" "$z"&&ln -s "$ft" "$fr"&&printf x>"$ft/f"&&ln -s "$z" "$lr/l"||exit 90
+ if [ "$H" = 1 ];then n=.h;else n=v;printf x>"$hr/.x"||exit 90;fi
+ printf x>"$hr/$n"&&chmod 640 "$ft/f"&&chmod 600 "$hr/$n"&&touch -d @7.25 "$ft/f"&&touch -h -d @8.5 "$lr/l"&&touch -d @9.25 "$hr/$n"||exit 90
+ lf "$fr" "$D" "$H">"$o" 2>/dev/null&&lf "$lr" "$D" "$H">>"$o" 2>/dev/null&&lf "$hr" "$D" "$H">>"$o" 2>/dev/null||exit 90
+ { printf 'f\000f\0001\000640\0007.2500000000\000';printf 'l\000l\000%s\000777\0008.5000000000\000' "${#z}";printf '%s\000f\0001\000600\0009.2500000000\000' "$n"; }>"$d/e"||exit 90
  cmp -s "$d/e" "$o"||exit 12
- x=$(printf 'a\nb\000'|xargs -0 -r sh -c 'printf %s "$1"' codex-sentinel-list-xargs 2>/dev/null);s=$?
- printf x\000|xargs -0 -r sh -c 'exit 7' codex-sentinel-list-xargs >/dev/null 2>&1;q=$?
+ x=$(printf 'a\nb\000'|lx sh -c 'printf %s "$1"' codex-sentinel-list-xargs 2>/dev/null);s=$?
+ printf x\000|lx sh -c 'exit 7' codex-sentinel-list-xargs >/dev/null 2>&1;q=$?
  [ "$s" -eq 0 ]&&[ "$q" -ne 0 ]&&[ "$x" = 'a
 b' ]||exit 13
 )
 cs;s=$?
 case $s in 0);;11)printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2;exit 0;;12)printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=find_nul\000' >&2;exit 0;;13)printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2;exit 0;;*)exit 2;;esac
-if [ ! -e "$root" ] && [ ! -L "$root" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
-if [ ! -d "$root" ]; then printf 'NOT_DIRECTORY\000' >&2; exit 0; fi
-if [ ! -r "$root" ]; then printf 'PERMISSION_DENIED\000' >&2; exit 0; fi
-cd -- "$root" 2>/dev/null || { printf 'PERMISSION_DENIED\000' >&2; exit 0; }
+if [ ! -e "$R" ]&&[ ! -L "$R" ];then printf 'NOT_FOUND\000' >&2;exit 0;fi
+if [ ! -d "$R" ];then printf 'NOT_DIRECTORY\000' >&2;exit 0;fi
+if [ ! -r "$R" ];then printf 'PERMISSION_DENIED\000' >&2;exit 0;fi
+cd -- "$R" 2>/dev/null||{ printf 'PERMISSION_DENIED\000' >&2;exit 0;}
 umask 077
 scratch=$(mktemp -d /tmp/codex-ssh-list.XXXXXX) || exit 2
 cleanup() { rm -rf -- "$scratch"; }
@@ -61,30 +63,26 @@ count_file=$scratch/count
 printf 0 >"$count_file"
 mkfifo "$raw_fifo" "$out_fifo" || exit 2
 (
-if [ "$show_hidden" = 1 ];then
-find -H . -mindepth 1 -maxdepth "$depth" -printf '%P\000%y\000%s\000%m\000%T@\000' 2>/dev/null
-else
-find -H . -mindepth 1 -maxdepth "$depth" \( -path './.*' -o -path '*/.*' \) -prune -o -printf '%P\000%y\000%s\000%m\000%T@\000' 2>/dev/null
-fi >"$raw_fifo"
+lf . "$D" "$H" 2>/dev/null >"$raw_fifo"
 printf '%s' "$?" >"$find_status"
 ) &
 find_pid=$!
 (
-xargs -0 -r -n 100 sh -c '
-count_file=$1;max_entries=$2;shift 2
+lx sh -c '
+count_file=$1;m=$2;shift 2
 count=$(cat "$count_file")||exit 65
 while [ "$#" -ge 5 ];do
-if [ "$count" -lt $((max_entries+1)) ];then count=$((count+1));printf "%s\000%s\000%s\000%s\000%s\000" "$1" "$2" "$3" "$4" "$5";fi
+if [ "$count" -lt $((m+1)) ];then count=$((count+1));printf "%s\000%s\000%s\000%s\000%s\000" "$1" "$2" "$3" "$4" "$5";fi
 shift 5
 done
 [ "$#" -eq 0 ]||exit 65
 printf %s "$count">"$count_file"
-' codex-ssh-list "$count_file" "$max_entries" <"$raw_fifo" >"$out_fifo" 2>/dev/null
+' codex-ssh-list "$count_file" "$M" <"$raw_fifo" >"$out_fifo" 2>/dev/null
 printf '%s' "$?" >"$xargs_status"
 ) &
 xargs_pid=$!
 exec 3<"$out_fifo"
-head -c "$limit" <&3 >"$data"
+head -c "$L" <&3 >"$data"
 head_status=$?
 cat <&3 >/dev/null
 drain_status=$?
@@ -100,7 +98,7 @@ if [ "$head_status" -ne 0 ] || [ "$drain_status" -ne 0 ] ||
    [ "$xargs_wait" -ne 0 ] || [ "$find_wait" -ne 0 ] ||
    [ "$xargs_final" -ne 0 ] || [ "$find_final" -ne 0 ]; then exit 2; fi
 cat "$data"
-if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
+if [ "$bytes" -eq "$L" ];then printf 'CAPPED\000' >&2;fi
 "#;
 
 const STAT_SCRIPT: &str = r#"
