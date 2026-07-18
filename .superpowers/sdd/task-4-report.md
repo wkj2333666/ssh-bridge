@@ -128,11 +128,11 @@ The ten stateful stale-sentinel cases completed in 1.348 seconds locally.
 After warming the capability cache, five local-fixed samples per operation
 reported these integration-level totals (sentinel included, no network RTT):
 
-- list: p50 21.96 ms, range 21.30–22.70 ms;
-- stat: p50 16.54 ms, range 16.34–17.19 ms;
-- read: p50 17.85 ms, range 17.45–21.52 ms;
-- rg search: p50 42.36 ms, range 39.28–43.54 ms;
-- grep search: p50 32.69 ms, range 30.74–38.60 ms.
+- list: p50 23.93 ms, range 23.31–24.14 ms;
+- stat: p50 16.03 ms, range 15.91–16.30 ms;
+- read: p50 17.36 ms, range 17.22–17.55 ms;
+- rg search: p50 42.22 ms, range 41.84–47.30 ms;
+- grep search: p50 31.37 ms, range 30.69–36.47 ms.
 
 The latency test records evidence without a timing threshold, so host load does
 not turn it into a flaky correctness gate. Sentinels execute inside the one
@@ -158,6 +158,43 @@ edge cases. Each received an observed RED and focused GREEN:
 The review's cleanup recommendation also added an incompatible `rm` shim: the
 exact `search_bound` flag becomes false and the outer probe still removes its
 private directory.
+
+## Third Formal Review Rework
+
+The R3 review left one Important list-specific gap: the sentinel used a fixed
+depth-one find without the real hidden-prune branch, and its xargs checks did
+not use production's `-n 100`. A stale utility could therefore pass the full
+probe and sentinel, fail only the caller-data form, and return `RemoteExit`
+without invalidation.
+
+The new `readonly_stale_list_production_forms_retry_exactly_once` table first
+observed that RED for caller depth 3: the stateful find shim produced
+`RemoteExit` on the first production command with no refresh. Equivalent shims
+cover both hidden-prune operands and xargs `-n 100`. The implementation now
+defines compact `lf(root, depth, hidden)` and `lx(...)` functions once inside
+`LIST_SCRIPT`; the controlled sentinel and caller-data producer invoke only
+those shared forms.
+
+GREEN evidence covers all three one-shot semantic corruptions with exactly two
+probes/two list commands, a persistent dynamic-depth corruption as
+`RemoteCapabilityMissing` after exactly two probes/two commands, and an
+ordinary missing list root as `NotFound` with one probe/one command. Existing
+stale, persistent, setup-error, hidden-flood, and root-slash regressions remain
+green. Compact internal operands keep the list script at 3,763 source bytes and
+a representative complete rendering at 4,011 bytes; the real hidden-flood
+fixture still executes with `max_frame_bytes=4096`.
+
+A follow-up review proposed repeating depth-`D`/`D+1` fixtures and more than
+100 xargs operands inside every warm list sentinel. That recommendation was
+rejected after checking the binding responsibility split: clarification 48's
+full capability probe owns exhaustive depth, prune, NUL grouping, and child
+failure semantics; clarification 49 requires the per-operation sentinel to be
+cheap; and clarification 51 requires the sentinel and producer to call the
+same full functions with the caller's dynamic options. Rebuilding those large
+fixtures per operation would duplicate the cached probe and undermine the
+documented warm-path goal. The retained tests instead isolate the three
+production-only forms after a successful full probe and prove their exact
+one-refresh behavior.
 
 ## Bounds and Security Review
 
@@ -205,9 +242,9 @@ private directory.
 
 - `cargo fmt --check`: passed
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed
-- `cargo test --test remote_ops -- --nocapture`: 30 passed, 0 failed
-- `cargo test --all-targets`: 124 passed, 0 failed (12 lib, 25 core,
-  30 remote operations, 57 SSH transport)
+- `cargo test --test remote_ops -- --nocapture`: 31 passed, 0 failed
+- `cargo test --all-targets`: 125 passed, 0 failed (12 lib, 25 core,
+  31 remote operations, 57 SSH transport)
 - `git diff --check`: passed
 - `__pycache__`: both pre-existing untracked trees preserved and unstaged
 

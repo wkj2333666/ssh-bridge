@@ -386,7 +386,7 @@ async fn readonly_real_mismatch_retries_exactly_once_from_the_list_script() {
     std::fs::write(
         &find,
         format!(
-            "#!/bin/sh\ncase \" $* \" in *codex-probe-find*) exec /usr/bin/find \"$@\";; *codex-sentinel-list-find*) if [ ! -e {} ]; then : >{}; printf 'corrupt\\000'; exit 0; fi;; esac\nexec /usr/bin/find \"$@\"\n",
+            "#!/bin/sh\ncase \" $* \" in *codex-probe-find*) exec /usr/bin/find \"$@\";; *codex-sentinel-list-production*) if [ ! -e {} ]; then : >{}; printf 'corrupt\\000'; exit 0; fi;; esac\nexec /usr/bin/find \"$@\"\n",
             codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
             codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
         ),
@@ -460,12 +460,12 @@ async fn readonly_stale_sentinel_retries_each_production_form_exactly_once() {
     let cases = [
         Case {
             tool: "find",
-            sentinel: "codex-sentinel-list-find",
+            sentinel: "codex-sentinel-list-production",
             failure: "printf 'corrupt\\000'; exit 0",
             operation: "list",
             rg: true,
             expected_commands: 2,
-            expected_sentinel_invocations: 4,
+            expected_sentinel_invocations: 6,
         },
         Case {
             tool: "xargs",
@@ -673,6 +673,150 @@ async fn readonly_stale_sentinel_retries_each_production_form_exactly_once() {
 }
 
 #[tokio::test]
+async fn readonly_stale_list_production_forms_retry_exactly_once() {
+    struct Case {
+        name: &'static str,
+        tool: &'static str,
+        detect: &'static str,
+        failure: &'static str,
+        persistent: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "dynamic-depth",
+            tool: "find",
+            detect: "p=; for a do [ \"$p\" = -maxdepth ] && [ \"$a\" = 3 ] && hit=1; p=$a; done",
+            failure: "printf 'corrupt\\000'; exit 0",
+            persistent: false,
+        },
+        Case {
+            name: "hidden-prune",
+            tool: "find",
+            detect: "a=0; b=0; for v do [ \"$v\" = './.*' ] && a=1; [ \"$v\" = '*/.*' ] && b=1; done; [ \"$a:$b\" = 1:1 ] && hit=1",
+            failure: "printf 'corrupt\\000'; exit 0",
+            persistent: false,
+        },
+        Case {
+            name: "xargs-n100",
+            tool: "xargs",
+            detect: "p=; for a do [ \"$p\" = -n ] && [ \"$a\" = 100 ] && hit=1; p=$a; done",
+            failure: "exit 64",
+            persistent: false,
+        },
+        Case {
+            name: "persistent-dynamic-depth",
+            tool: "find",
+            detect: "p=; for a do [ \"$p\" = -maxdepth ] && [ \"$a\" = 3 ] && hit=1; p=$a; done",
+            failure: "printf 'corrupt\\000'; exit 0",
+            persistent: true,
+        },
+    ];
+
+    for case in cases {
+        let remote = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(remote.path().join("visible")).unwrap();
+        std::fs::write(remote.path().join("visible/leaf"), b"x").unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let marker = state.path().join("failed-once");
+        let log = state.path().join("ssh.log");
+        let bin = tempfile::TempDir::new().unwrap();
+        let executable = bin.path().join(case.tool);
+        let failure_guard = if case.persistent {
+            case.failure.to_owned()
+        } else {
+            format!(
+                "if [ ! -e {} ]; then : >{}; {}; fi",
+                codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+                codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+                case.failure,
+            )
+        };
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nhit=0; {}\nif [ \"$hit\" = 1 ]; then {}; fi\nexec /usr/bin/{} \"$@\"\n",
+                case.detect, failure_guard, case.tool,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:/usr/local/bin:/usr/bin:/bin",
+            bin.path().display()
+        ));
+        let (_runtime, _runner, bridge) = fixture_with_options(
+            remote.path(),
+            true,
+            None,
+            &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+        );
+        let result = bridge
+            .list(
+                ListRequest {
+                    host: "dev".into(),
+                    path: None,
+                    depth: Some(3),
+                    include_hidden: Some(false),
+                    max_entries: Some(10),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        if case.persistent {
+            assert_eq!(
+                result.unwrap_err().code,
+                ErrorCode::RemoteCapabilityMissing,
+                "{}",
+                case.name
+            );
+        } else {
+            result.unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
+        }
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            log.lines().filter(|line| *line == "P").count(),
+            2,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            log.lines().filter(|line| *line == "C").count(),
+            2,
+            "{}",
+            case.name
+        );
+    }
+
+    let remote = tempfile::TempDir::new().unwrap();
+    let state = tempfile::TempDir::new().unwrap();
+    let log = state.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        true,
+        None,
+        &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+    let error = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: Some("missing".into()),
+                depth: Some(3),
+                include_hidden: Some(false),
+                max_entries: Some(10),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(log.lines().filter(|line| *line == "C").count(), 1);
+}
+
+#[tokio::test]
 async fn readonly_warm_operation_sentinel_latency_evidence() {
     fn report(name: &str, samples: &mut [Duration]) {
         samples.sort_unstable();
@@ -822,7 +966,7 @@ async fn readonly_stale_sentinel_that_remains_bad_is_capability_missing() {
     let find = bin.path().join("find");
     std::fs::write(
         &find,
-        b"#!/bin/sh\ncase \" $* \" in *codex-sentinel-list-find*) printf 'corrupt\\000'; exit 0;; esac\nexec /usr/bin/find \"$@\"\n",
+        b"#!/bin/sh\ncase \" $* \" in *codex-sentinel-list-production*) printf 'corrupt\\000'; exit 0;; esac\nexec /usr/bin/find \"$@\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&find, std::fs::Permissions::from_mode(0o755)).unwrap();

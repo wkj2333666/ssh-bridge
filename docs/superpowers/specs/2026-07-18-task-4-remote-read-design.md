@@ -2,7 +2,7 @@
 
 Date: 2026-07-18
 
-Status: Second formal-review revision implemented; verification in progress
+Status: Third formal-review revision implemented; verification in progress
 
 ## Formal Review Revision
 
@@ -34,6 +34,27 @@ not from a heuristic reserve. Both list and search retain verified operation at
 engine error. If the rendered engine command alone leaves no room for one NUL
 candidate, search returns `RequestTooLarge` instead of claiming an empty
 truncated search.
+
+### Third formal-review revision
+
+List's stale-operation sentinel and its real producer share two compact POSIX
+shell functions. `lf(root, depth, show_hidden)` owns the complete GNU
+find form, including the caller's dynamic `maxdepth` and the hidden-component
+prune expression. `lx` owns the sequential `xargs -0 -r -n 100` form.
+Both sentinel fixtures and caller-data production invoke these functions, so a
+future edit cannot change one form without changing the other.
+
+The cheap sentinel fixture passes the caller's actual depth and hidden flag,
+compares complete controlled metadata output, and executes the shared xargs
+form, including `-n 100` and child-failure propagation. The initial full probe
+continues to own exhaustive depth/prune/NUL grouping semantics; the warm
+sentinel owns exact production-form identity without repeating those expensive
+fixtures on every operation. A stateful shim that passes the full probe but
+corrupts only one current list form must cause exactly one
+invalidation/reprobe/retry. The same corruption after retry is
+`RemoteCapabilityMissing`; ordinary missing-list-root handling remains a
+single command with no retry. The compact script must continue to fit and
+execute with `max_frame_bytes=4096`.
 
 ## 1. Scope
 

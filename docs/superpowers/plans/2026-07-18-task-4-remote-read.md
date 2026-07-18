@@ -1438,11 +1438,51 @@ remains a genuine `search_bound` mismatch.
 Run the four focused tests, stale table, exact capability cleanup table, both
 4-KiB regressions, then every completion gate before committing.
 
+### Task 20: R3 Share Exact List Production Forms
+
+**Files:**
+- Modify: `src/remote/metadata.rs`
+- Modify: `tests/remote_ops.rs`
+- Modify: Task 4 design, plan, clarifications, and report
+
+- [x] **Step 1: Add the production-form stale RED table**
+
+Add `readonly_stale_list_production_forms_retry_exactly_once`. Stateful PATH
+shims pass the real capability probe, then corrupt only the list sentinel call
+using caller depth, the hidden prune expression, or `xargs -n 100`. Assert the
+first stale behavior gives exactly two probes and two list commands. Also cover
+a persistent semantic mismatch as `RemoteCapabilityMissing` and an ordinary
+missing list root as `NotFound` with one probe/one command.
+
+- [x] **Step 2: Verify RED**
+
+Run the exact new test. Expected: the current fixed-depth/non-pruning sentinel
+misses all three production-only corruptions, so list returns `RemoteExit` and
+the log remains `P=1/C=1`.
+
+- [x] **Step 3: Share compact production functions**
+
+Define one compact POSIX find function consuming root, dynamic depth, and
+hidden flag, plus one compact sequential NUL xargs function containing
+`-n 100`. Invoke only those functions from both the controlled sentinel and
+real producer. Preserve setup-error classification and strict mismatch keys.
+
+- [x] **Step 4: Verify GREEN and the 4-KiB boundary**
+
+Run the exact RED test, existing stale/setup/error tests, hidden-flood and root
+list tests with the 4-KiB fixture, then record source/rendered size evidence.
+
+- [x] **Step 5: Fresh completion gate and commit**
+
+Update the binding clarification and report. Run format, strict clippy,
+`remote_ops`, all targets, diff check, and status. Preserve both user-owned
+`__pycache__` directories and create one R3 commit.
+
 ---
 
 ## Plan Self-Review Checklist
 
-- Every clarification item 1-50 maps to at least one task above.
+- Every clarification item 1-51 maps to at least one task above.
 - All production changes follow a named failing test and observed RED.
 - Public type names are defined before later tasks consume them.
 - List/stat/read/search protocols each have explicit field and byte ceilings.

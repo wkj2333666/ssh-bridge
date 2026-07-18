@@ -283,3 +283,15 @@ These decisions are binding Task 4 requirements and supplement the Task 4 brief.
     NUL stdin candidates; if the command alone leaves no room for one candidate
     it returns `RequestTooLarge`. The total command-plus-stdin frame limit
     remains unchanged.
+
+## L. Third formal-review correction
+
+51. The list operation sentinel and caller-data producer must invoke the same
+    compact shell functions for the complete find and xargs command forms. The
+    find function consumes the caller's dynamic depth and hidden flag and owns
+    the exact hidden-component prune expression. The xargs function owns
+    sequential `-0 -r -n 100`. A stale semantic shim that corrupts only any one
+    of these production forms triggers exactly one read-only reprobe/retry; a
+    repeated mismatch is `RemoteCapabilityMissing`, while an ordinary list
+    filesystem error never retries. The shared script must retain the 4-KiB
+    request regression.
