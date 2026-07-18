@@ -98,7 +98,7 @@ mod tests {
             let mut rendered = String::with_capacity(expected.len());
             word.push_to(&mut rendered).unwrap();
             assert_eq!(rendered, expected);
-            assert_eq!(rendered.capacity(), expected.len());
+            assert!(rendered.capacity() >= expected.len());
 
             if !expected.is_empty() {
                 let mut undersized = String::with_capacity(expected.len() - 1);

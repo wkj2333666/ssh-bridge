@@ -168,3 +168,124 @@ fn encode_preview(preview: OutputPreview) -> EncodedOutputPreview {
         truncated: preview.truncated,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    use super::{RunStdin, WriteEncoding, decode_stdin};
+
+    #[test]
+    fn task78_base64_admission_release_rss() {
+        run_base64_admission_release_rss();
+    }
+
+    fn run_base64_admission_release_rss() {
+        const CHILD_ENV: &str = "CODEX_SSH_BRIDGE_BASE64_RSS_CHILD";
+        const TEST_NAME: &str = "remote::run::tests::task78_base64_admission_release_rss";
+        if cfg!(debug_assertions) {
+            eprintln!("Base64 admission RSS assertion is release-only");
+            return;
+        }
+        if std::env::var_os(CHILD_ENV).is_some() {
+            base64_admission_rss_child();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "fresh Base64 RSS child failed");
+    }
+
+    fn base64_admission_rss_child() {
+        const WORKERS: usize = 5;
+        const RSS_DELTA_CEILING_KIB: u64 = 32 * 1024;
+
+        let inputs: Vec<_> = (0..WORKERS)
+            .map(|_| RunStdin {
+                encoding: WriteEncoding::Base64,
+                value: maximum_zero_base64(),
+            })
+            .collect();
+        let warmed = inputs
+            .iter()
+            .flat_map(|input| input.value.as_bytes().iter().step_by(4096))
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        std::hint::black_box(warmed);
+
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+        let finish = Arc::new(Barrier::new(WORKERS + 1));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::with_capacity(WORKERS);
+        for input in inputs {
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let completed = Arc::clone(&completed);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let decoded = decode_stdin(Some(input), crate::MAX_WRITE_BYTES)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(decoded.len(), crate::MAX_WRITE_BYTES);
+                assert!(decoded.iter().all(|byte| *byte == 0));
+                completed.fetch_add(1, Ordering::Release);
+                finish.wait();
+                decoded.len()
+            }));
+        }
+
+        let baseline = resident_kib_for_rss_test();
+        let mut peak = baseline;
+        start.wait();
+        while completed.load(Ordering::Acquire) != WORKERS {
+            peak = peak.max(resident_kib_for_rss_test());
+            std::thread::sleep(Duration::from_micros(250));
+        }
+        for _ in 0..20 {
+            peak = peak.max(resident_kib_for_rss_test());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        finish.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), crate::MAX_WRITE_BYTES);
+        }
+        let delta = peak.saturating_sub(baseline);
+        eprintln!(
+            "Base64 admission release RSS: baseline={baseline} KiB peak={peak} KiB delta={delta} KiB ceiling={RSS_DELTA_CEILING_KIB} KiB"
+        );
+        assert!(
+            delta < RSS_DELTA_CEILING_KIB,
+            "Base64 admission RSS baseline={baseline} peak={peak} delta={delta}"
+        );
+    }
+
+    fn maximum_zero_base64() -> String {
+        let encoded_length = crate::MAX_WRITE_BYTES.div_ceil(3) * 4;
+        let mut value = "A".repeat(encoded_length);
+        match crate::MAX_WRITE_BYTES % 3 {
+            0 => {}
+            1 => value.replace_range(encoded_length - 2.., "=="),
+            2 => value.replace_range(encoded_length - 1.., "="),
+            _ => unreachable!(),
+        }
+        value
+    }
+
+    fn resident_kib_for_rss_test() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap()
+    }
+}
