@@ -192,11 +192,11 @@ async fn task78_remote_run_is_bridge_owned_and_reports_explicit_shell() {
 
     assert_eq!(result.context.shell.kind, ShellName::Sh);
     assert!(!result.context.shell.fallback);
-    assert!(
-        result
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("[[ ]]"))
+    assert_eq!(
+        result.warnings,
+        [
+            "selected POSIX sh does not support Bash arrays, [[ ]], source, pipefail, or Bash substitutions; use POSIX syntax, or request Bash and ensure it is installed"
+        ]
     );
     assert_eq!(result.exit_status, 0);
     assert_eq!(
@@ -267,11 +267,24 @@ async fn task78_remote_run_requires_canonical_bounded_base64_before_command_chil
 
     let remote = tempfile::TempDir::new().unwrap();
     let oversized = STANDARD.encode(vec![0; codex_ssh_bridge::MAX_WRITE_BYTES + 1]);
-    for (name, value) in [
-        ("whitespace", "AAEJ\n".to_owned()),
-        ("missing-padding", "AAE".to_owned()),
-        ("url-safe", "__8=".to_owned()),
-        ("decoded-over-limit", oversized),
+    for (name, value, expected) in [
+        (
+            "whitespace",
+            "AAEJ\n".to_owned(),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "missing-padding",
+            "AAE".to_owned(),
+            ErrorCode::InvalidArgument,
+        ),
+        ("url-safe", "__8=".to_owned(), ErrorCode::InvalidArgument),
+        (
+            "trailing-bits",
+            "AB==".to_owned(),
+            ErrorCode::InvalidArgument,
+        ),
+        ("decoded-over-limit", oversized, ErrorCode::RequestTooLarge),
     ] {
         let log_dir = tempfile::TempDir::new().unwrap();
         let log = log_dir.path().join(format!("{name}.log"));
@@ -298,13 +311,7 @@ async fn task78_remote_run_requires_canonical_bounded_base64_before_command_chil
             )
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                error.code,
-                ErrorCode::InvalidArgument | ErrorCode::RequestTooLarge
-            ),
-            "{name}: {error:?}"
-        );
+        assert_eq!(error.code, expected, "{name}: {error:?}");
         assert_eq!(command_call_count(&log), 0, "{name}");
     }
 }
@@ -334,14 +341,25 @@ async fn task78_remote_run_auto_fallback_and_missing_bash_are_explicit() {
         .unwrap();
     assert_eq!(result.context.shell.kind, ShellName::Sh);
     assert!(result.context.shell.fallback);
-    assert!(
-        result
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("[[ ]]"))
+    assert_eq!(
+        result.warnings,
+        [
+            "selected POSIX sh does not support Bash arrays, [[ ]], source, pipefail, or Bash substitutions; use POSIX syntax, or request Bash and ensure it is installed"
+        ]
     );
 
-    let error = bridge
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("missing-bash.log");
+    let (_runtime, _runner, missing_bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("echo-command")),
+            ("FAKE_SSH_LOG", log.clone().into_os_string()),
+        ],
+    );
+    let error = missing_bridge
         .run(
             RemoteRunRequest {
                 host: "dev".to_owned(),
@@ -356,6 +374,97 @@ async fn task78_remote_run_auto_fallback_and_missing_bash_are_explicit() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+    assert_eq!(command_call_count(&log), 0);
+}
+
+#[tokio::test]
+async fn task78_remote_run_early_stdin_close_preserves_actual_exit() {
+    let remote = tempfile::TempDir::new().unwrap();
+    for (command, expected_status) in [("exit 0", 0), ("exit 7", 7)] {
+        let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+        let request = RemoteRunRequest {
+            host: "dev".to_owned(),
+            command: command.to_owned(),
+            cwd: None,
+            shell: RunShell::Sh,
+            timeout_ms: Some(2_000),
+            stdin: Some(RunStdin {
+                encoding: WriteEncoding::Utf8,
+                value: "x".repeat(codex_ssh_bridge::MAX_WRITE_BYTES),
+            }),
+        };
+        if expected_status == 0 {
+            let result = bridge.run(request, CancellationToken::new()).await.unwrap();
+            assert_eq!(result.exit_status, 0);
+            assert_eq!(result.context.shell.kind, ShellName::Sh);
+            assert_eq!(
+                result.context.physical_root,
+                remote.path().to_str().unwrap()
+            );
+        } else {
+            let error = bridge
+                .run(request, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::RemoteExit);
+            assert_eq!(error.details.exit_status, Some(expected_status));
+            assert_eq!(error.details.host.as_deref(), Some("dev"));
+            assert_eq!(
+                error.details.physical_root.as_deref(),
+                remote.path().to_str()
+            );
+            assert_eq!(
+                error
+                    .details
+                    .shell
+                    .as_ref()
+                    .map(|shell| shell.kind.as_str()),
+                Some("sh")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn task78_remote_run_facade_timeout_retains_selected_context() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("sleep")),
+            ("FAKE_SSH_SLEEP_SECONDS", OsString::from("5")),
+        ],
+    );
+    let error = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "sleep 5".to_owned(),
+                cwd: None,
+                shell: RunShell::Sh,
+                timeout_ms: Some(30),
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::CommandTimeout);
+    assert_eq!(error.details.host.as_deref(), Some("dev"));
+    assert_eq!(
+        error.details.physical_root.as_deref(),
+        remote.path().to_str()
+    );
+    assert_eq!(
+        error
+            .details
+            .shell
+            .as_ref()
+            .map(|shell| shell.kind.as_str()),
+        Some("sh")
+    );
 }
 
 #[tokio::test]
@@ -406,25 +515,28 @@ async fn task78_remote_run_treats_hostile_cwd_bytes_as_literal_data() {
     );
     std::fs::create_dir_all(remote.path().join(&component)).unwrap();
     let (_runtime, _runner, bridge) = fixture(remote.path(), false);
-    let result = bridge
-        .run(
-            RemoteRunRequest {
-                host: "dev".to_owned(),
-                command: "pwd".to_owned(),
-                cwd: Some(component.clone()),
-                shell: RunShell::Sh,
-                timeout_ms: Some(2_000),
-                stdin: None,
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        result.stdout.head.value,
-        format!("{}\n", remote.path().join(&component).display())
-    );
-    assert!(!sentinel.exists());
+    for shell in [RunShell::Sh, RunShell::Bash, RunShell::Login] {
+        let result = bridge
+            .run(
+                RemoteRunRequest {
+                    host: "dev".to_owned(),
+                    command: "pwd".to_owned(),
+                    cwd: Some(component.clone()),
+                    shell,
+                    timeout_ms: Some(2_000),
+                    stdin: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.stdout.head.value,
+            format!("{}\n", remote.path().join(&component).display()),
+            "{shell:?}"
+        );
+        assert!(!sentinel.exists(), "{shell:?}");
+    }
 }
 
 #[test]

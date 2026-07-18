@@ -32,7 +32,7 @@ use crate::output::{
     OutputProvenance, OutputReference, OutputStore, StderrSignals, StreamKind,
 };
 use crate::path::RemotePath;
-use crate::quote::shell_word;
+use crate::quote::{PreparedShellWord, shell_word};
 
 const DEFAULT_SSH_EXECUTABLE: &str = "/usr/bin/ssh";
 const RESOLVED_STDOUT_LIMIT: u64 = 1024 * 1024;
@@ -214,14 +214,8 @@ impl SshRunner {
                 &shell.shell,
                 remote_timeout,
                 timeout_ms,
+                limits.max_frame_bytes,
             )?;
-            if remote_command.len() > limits.max_frame_bytes {
-                return Err(BridgeError::new(
-                    ErrorCode::RequestTooLarge,
-                    "rendered command exceeds the configured frame limit",
-                    false,
-                ));
-            }
             let local_deadline = if remote_timeout {
                 request
                     .timeout
@@ -1011,9 +1005,10 @@ impl Phase {
     fn accepts_early_stdin_close(self) -> bool {
         matches!(
             self,
-            Self::Fixed {
-                kind: FixedOperationKind::Mutation
-            }
+            Self::Command { .. }
+                | Self::Fixed {
+                    kind: FixedOperationKind::Mutation
+                }
         )
     }
 
@@ -1099,9 +1094,22 @@ fn render_remote_command(
     shell: &ShellKind,
     remote_timeout: bool,
     timeout_ms: u64,
+    max_frame_bytes: usize,
 ) -> BridgeResult<String> {
     if matches!(shell, ShellKind::Login) {
-        return Ok(format!("cd -- {} || exit 126\n{command}", shell_word(cwd)?));
+        const PREFIX: &str = "cd -- ";
+        const MIDDLE: &str = " || exit 126\n";
+        let cwd = PreparedShellWord::new(cwd)?;
+        let length =
+            checked_rendered_length([PREFIX.len(), cwd.len(), MIDDLE.len(), command.len()])?;
+        ensure_rendered_bound(length, max_frame_bytes)?;
+        let mut rendered = String::with_capacity(length);
+        rendered.push_str(PREFIX);
+        cwd.push_to(&mut rendered)?;
+        rendered.push_str(MIDDLE);
+        rendered.push_str(command);
+        debug_assert_eq!(rendered.len(), length);
+        return Ok(rendered);
     }
     const BASH_SCRIPT: &str = r#"set -u
 [ "$#" -eq 3 ] || exit 2
@@ -1127,13 +1135,56 @@ exec sh -c "$2""#;
     } else {
         String::new()
     };
-    Ok(format!(
-        "exec sh -c {} codex-ssh-bridge-run {} {} {}",
-        shell_word(script)?,
-        shell_word(cwd)?,
-        shell_word(command)?,
-        shell_word(&duration)?,
-    ))
+    const PREFIX: &str = "exec sh -c ";
+    const ARG0: &str = " codex-ssh-bridge-run ";
+    const SEPARATOR: &str = " ";
+    let script = PreparedShellWord::new(script)?;
+    let cwd = PreparedShellWord::new(cwd)?;
+    let command = PreparedShellWord::new(command)?;
+    let duration = PreparedShellWord::new(&duration)?;
+    let length = checked_rendered_length([
+        PREFIX.len(),
+        script.len(),
+        ARG0.len(),
+        cwd.len(),
+        SEPARATOR.len(),
+        command.len(),
+        SEPARATOR.len(),
+        duration.len(),
+    ])?;
+    ensure_rendered_bound(length, max_frame_bytes)?;
+    let mut rendered = String::with_capacity(length);
+    rendered.push_str(PREFIX);
+    script.push_to(&mut rendered)?;
+    rendered.push_str(ARG0);
+    cwd.push_to(&mut rendered)?;
+    rendered.push_str(SEPARATOR);
+    command.push_to(&mut rendered)?;
+    rendered.push_str(SEPARATOR);
+    duration.push_to(&mut rendered)?;
+    debug_assert_eq!(rendered.len(), length);
+    Ok(rendered)
+}
+
+fn checked_rendered_length(lengths: impl IntoIterator<Item = usize>) -> BridgeResult<usize> {
+    lengths.into_iter().try_fold(0usize, |total, length| {
+        total.checked_add(length).ok_or_else(rendered_too_large)
+    })
+}
+
+fn ensure_rendered_bound(length: usize, maximum: usize) -> BridgeResult<()> {
+    if length > maximum {
+        return Err(rendered_too_large());
+    }
+    Ok(())
+}
+
+fn rendered_too_large() -> BridgeError {
+    BridgeError::new(
+        ErrorCode::RequestTooLarge,
+        "rendered command exceeds the configured frame limit",
+        false,
+    )
 }
 
 pub(crate) fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<String> {
@@ -1348,7 +1399,9 @@ mod tests {
 
     #[test]
     fn remote_timeout_uses_gnu_decimal_seconds() {
-        let command = render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 123).unwrap();
+        let command =
+            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 123, usize::MAX)
+                .unwrap();
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &command])
             .env("PATH", "/usr/bin")
@@ -1362,24 +1415,86 @@ mod tests {
         );
         assert!(command.contains(" codex-ssh-bridge-run '/' 'exit 0' '0.123s'"));
         assert_eq!(
-            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 1000)
+            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 1000, usize::MAX,)
                 .unwrap()
                 .rsplit(' ')
                 .next(),
             Some("'1.000s'")
         );
         assert_eq!(
-            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, u64::MAX)
-                .unwrap()
-                .rsplit(' ')
-                .next(),
+            render_remote_command(
+                "exit 0",
+                "/",
+                &ShellKind::PosixSh,
+                true,
+                u64::MAX,
+                usize::MAX,
+            )
+            .unwrap()
+            .rsplit(' ')
+            .next(),
             Some("'18446744073709551.615s'")
         );
         assert_eq!(
-            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 0)
+            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 0, usize::MAX,)
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn task78_run_render_accepts_exact_bound_rejects_minus_one_without_quote_expansion() {
+        let command = "'".repeat(4 * 1024);
+        let rendered = render_remote_command(
+            &command,
+            "/srv/quote'root",
+            &ShellKind::PosixSh,
+            false,
+            1000,
+            usize::MAX,
+        )
+        .unwrap();
+        let exact = rendered.len();
+        assert_eq!(rendered.capacity(), exact);
+        assert_eq!(
+            render_remote_command(
+                &command,
+                "/srv/quote'root",
+                &ShellKind::PosixSh,
+                false,
+                1000,
+                exact,
+            )
+            .unwrap(),
+            rendered
+        );
+        assert_eq!(
+            render_remote_command(
+                &command,
+                "/srv/quote'root",
+                &ShellKind::PosixSh,
+                false,
+                1000,
+                exact - 1,
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::RequestTooLarge
+        );
+        let hostile = "'".repeat(crate::MAX_FRAME_BYTES);
+        assert_eq!(
+            render_remote_command(
+                &hostile,
+                "/srv/quote'root",
+                &ShellKind::PosixSh,
+                false,
+                1000,
+                512,
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::RequestTooLarge
         );
     }
 
@@ -1632,13 +1747,10 @@ mod tests {
             remote_timeout_wrapped: false,
         };
         ordinary.stdin = Some(vec![b'x'; 4 * 1024 * 1024]);
-        let error = runner
+        runner
             .run_child(ordinary, &CancellationToken::new(), "dev")
             .await
-            .err()
             .unwrap();
-        assert_eq!(error.code, ErrorCode::Io);
-        assert_eq!(error.details.mutation_may_have_applied, None);
 
         let mut readonly = task5_child(
             "exit 0",

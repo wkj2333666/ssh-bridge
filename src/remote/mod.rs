@@ -40,6 +40,8 @@ const DEFAULT_START_LINE: u64 = 1;
 const DEFAULT_MAX_LINES: u64 = 2_000;
 const MAX_LINES: u64 = 100_000;
 
+pub(crate) const POSIX_SH_WARNING: &str = "selected POSIX sh does not support Bash arrays, [[ ]], source, pipefail, or Bash substitutions; use POSIX syntax, or request Bash and ensure it is installed";
+
 pub struct RemoteBridge {
     runner: Arc<SshRunner>,
 }
