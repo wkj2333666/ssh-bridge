@@ -929,6 +929,11 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
         (
             "safe_write",
             "stat",
+            "case \" $* \" in *\" --printf=%f:%u:%a:%s:%d:%i:%h\\n -- \"*codex-probe-safe-write*) line=$(/usr/bin/stat \"$@\") || exit $?; old_ifs=$IFS; IFS=:; set -- $line; IFS=$old_ifs; printf '%s:%s:%s:%s:18446744073709551616:18446744073709551616:%s\\n' \"$1\" \"$2\" \"$3\" \"$4\" \"$7\"; exit 0;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "stat",
             "case \" $* \" in *\" --printf=%f:%u:%a:%s:%d:%i:%h\\n -- \"*codex-probe-safe-write/dd-link*) printf '8180:0:600:7:1:2:1\\n'; exit 0;; esac\nexec /usr/bin/stat \"$@\"\n",
         ),
         (

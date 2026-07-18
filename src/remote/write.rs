@@ -73,7 +73,19 @@ codex_mutation_remove() {
 
 codex_mutation_decimal_valid() {
     case "$1" in ''|*[!0-9]*) return 1 ;; esac
-    [ "${#1}" -le 20 ]
+    [ "${#1}" -le 20 ] || return 1
+    [ "${#1}" -lt 20 ] && return 0
+    codex_decimal_value=$1
+    codex_decimal_limit=18446744073709551615
+    while [ -n "$codex_decimal_value" ]; do
+        codex_decimal_digit=${codex_decimal_value%"${codex_decimal_value#?}"}
+        codex_decimal_limit_digit=${codex_decimal_limit%"${codex_decimal_limit#?}"}
+        [ "$codex_decimal_digit" -lt "$codex_decimal_limit_digit" ] && return 0
+        [ "$codex_decimal_digit" -gt "$codex_decimal_limit_digit" ] && return 1
+        codex_decimal_value=${codex_decimal_value#?}
+        codex_decimal_limit=${codex_decimal_limit#?}
+    done
+    return 0
 }
 
 codex_mutation_stat_parse() {
@@ -333,10 +345,14 @@ emit_one() {
 codex_classify_unreachable_parent() {
     codex_parent_candidate=$parent
     codex_parent_unresolved=0
+    codex_parent_classification_steps=0
     while :; do
+        [ "$codex_parent_classification_steps" -lt 32 ] || return 1
+        codex_parent_classification_steps=$((codex_parent_classification_steps + 1))
         codex_parent_lstat_status=0
         codex_mutation_stat_valid "$codex_parent_candidate" || codex_parent_lstat_status=$?
-        if [ "$codex_parent_lstat_status" -eq 0 ]; then
+        case "$codex_parent_lstat_status" in
+        0)
             case "$CODEX_STAT_TYPE" in
                 4???)
                     if [ ! -x "$codex_parent_candidate" ]; then emit_one PERMISSION_DENIED; fi
@@ -358,7 +374,10 @@ codex_classify_unreachable_parent() {
                     ;;
                 *) [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_DIRECTORY; return 1 ;;
             esac
-        fi
+            ;;
+        9) ;;
+        *) return 1 ;;
+        esac
         [ "$codex_parent_candidate" = / ] && return 1
         codex_parent_candidate=${codex_parent_candidate%/*}
         [ -n "$codex_parent_candidate" ] || codex_parent_candidate=/
@@ -539,7 +558,19 @@ codex_mutation_remove() {
 
 codex_mutation_decimal_valid() {
     case "$1" in ''|*[!0-9]*) return 1 ;; esac
-    [ "${#1}" -le 20 ]
+    [ "${#1}" -le 20 ] || return 1
+    [ "${#1}" -lt 20 ] && return 0
+    codex_decimal_value=$1
+    codex_decimal_limit=18446744073709551615
+    while [ -n "$codex_decimal_value" ]; do
+        codex_decimal_digit=${codex_decimal_value%"${codex_decimal_value#?}"}
+        codex_decimal_limit_digit=${codex_decimal_limit%"${codex_decimal_limit#?}"}
+        [ "$codex_decimal_digit" -lt "$codex_decimal_limit_digit" ] && return 0
+        [ "$codex_decimal_digit" -gt "$codex_decimal_limit_digit" ] && return 1
+        codex_decimal_value=${codex_decimal_value#?}
+        codex_decimal_limit=${codex_decimal_limit#?}
+    done
+    return 0
 }
 
 codex_mutation_stat_parse() {
@@ -742,10 +773,14 @@ emit_one() {
 codex_classify_unreachable_parent() {
     codex_parent_candidate=$parent
     codex_parent_unresolved=0
+    codex_parent_classification_steps=0
     while :; do
+        [ "$codex_parent_classification_steps" -lt 32 ] || return 1
+        codex_parent_classification_steps=$((codex_parent_classification_steps + 1))
         codex_parent_lstat_status=0
         codex_mutation_stat_valid "$codex_parent_candidate" || codex_parent_lstat_status=$?
-        if [ "$codex_parent_lstat_status" -eq 0 ]; then
+        case "$codex_parent_lstat_status" in
+        0)
             case "$CODEX_STAT_TYPE" in
                 4???)
                     if [ ! -x "$codex_parent_candidate" ]; then emit_one PERMISSION_DENIED; fi
@@ -767,7 +802,10 @@ codex_classify_unreachable_parent() {
                     ;;
                 *) [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_DIRECTORY; return 1 ;;
             esac
-        fi
+            ;;
+        9) ;;
+        *) return 1 ;;
+        esac
         [ "$codex_parent_candidate" = / ] && return 1
         codex_parent_candidate=${codex_parent_candidate%/*}
         [ -n "$codex_parent_candidate" ] || codex_parent_candidate=/
@@ -1723,6 +1761,133 @@ mod tests {
             assert!(script.contains("codex_mutation_decimal_valid \"$5\" || return 1"));
             assert!(script.contains("codex_mutation_decimal_valid \"$6\" || return 1"));
             assert!(script.contains("codex_mutation_decimal_valid \"$7\" || return 1"));
+        }
+    }
+
+    #[test]
+    fn task5_unreachable_parent_classification_has_a_strict_stat_call_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CLASSIFIER_STAT_CALL_LIMIT: usize = 33;
+
+        let fixture = tempfile::TempDir::new().unwrap();
+        let shim_directory = fixture.path().join("shim");
+        std::fs::create_dir(&shim_directory).unwrap();
+        let missing_prefix = fixture.path().join("missing-root");
+        let deep_parent = (0..128).fold(missing_prefix.clone(), |path, _| path.join("child"));
+        let marker = fixture.path().join("stat-count");
+        let stat = shim_directory.join("stat");
+        std::fs::write(
+            &stat,
+            format!(
+                "#!/bin/sh\nlast=\nfor last do :; done\ncase \"$last\" in\n  {prefix}|{prefix}/*) count=$(/usr/bin/cat {marker} 2>/dev/null || printf 0); count=$((count + 1)); printf %s \"$count\" >{marker}; exit 1;;\nesac\nexec /usr/bin/stat \"$@\"\n",
+                prefix = crate::quote::shell_word(missing_prefix.to_str().unwrap()).unwrap(),
+                marker = crate::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/local/bin:/usr/bin:/bin", shim_directory.display());
+        let hash = "0".repeat(64);
+
+        for (script, arguments) in [
+            (
+                super::WRITE_SCRIPT,
+                vec![
+                    deep_parent.to_str().unwrap(),
+                    "target",
+                    "CREATE",
+                    "0",
+                    &hash,
+                    "0",
+                    "",
+                ],
+            ),
+            (
+                super::GUARDED_DELETE_SCRIPT,
+                vec![deep_parent.to_str().unwrap(), "target", &hash],
+            ),
+        ] {
+            let _ = std::fs::remove_file(&marker);
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("codex-ssh-bridge-op")
+                .args(arguments)
+                .env("PATH", &path)
+                .env("TMPDIR", fixture.path())
+                .output()
+                .unwrap();
+            let calls = std::fs::read_to_string(&marker)
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(3), "stdout={:?}", output.stdout);
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+            assert!(
+                calls <= CLASSIFIER_STAT_CALL_LIMIT,
+                "classifier launched {calls} stat commands"
+            );
+        }
+    }
+
+    #[test]
+    fn task5_unreachable_parent_malformed_lstat_stops_classification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().unwrap();
+        let shim_directory = fixture.path().join("shim");
+        std::fs::create_dir(&shim_directory).unwrap();
+        let missing_prefix = fixture.path().join("missing-root");
+        let deep_parent = (0..8).fold(missing_prefix.clone(), |path, _| path.join("child"));
+        let marker = fixture.path().join("lstat-count");
+        let stat = shim_directory.join("stat");
+        std::fs::write(
+            &stat,
+            format!(
+                "#!/bin/sh\nlast=\nfor last do :; done\ncase \"$last\" in\n  {prefix}|{prefix}/*)\n    case \" $* \" in *\" -L \"*) exit 1;; esac\n    count=$(/usr/bin/cat {marker} 2>/dev/null || printf 0)\n    count=$((count + 1))\n    printf %s \"$count\" >{marker}\n    if [ \"$count\" -eq 1 ]; then printf 'malformed\\n'; exit 0; fi\n    exit 1;;\nesac\nexec /usr/bin/stat \"$@\"\n",
+                prefix = crate::quote::shell_word(missing_prefix.to_str().unwrap()).unwrap(),
+                marker = crate::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/local/bin:/usr/bin:/bin", shim_directory.display());
+        let hash = "0".repeat(64);
+
+        for (script, arguments) in [
+            (
+                super::WRITE_SCRIPT,
+                vec![
+                    deep_parent.to_str().unwrap(),
+                    "target",
+                    "CREATE",
+                    "0",
+                    &hash,
+                    "0",
+                    "",
+                ],
+            ),
+            (
+                super::GUARDED_DELETE_SCRIPT,
+                vec![deep_parent.to_str().unwrap(), "target", &hash],
+            ),
+        ] {
+            let _ = std::fs::remove_file(&marker);
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("codex-ssh-bridge-op")
+                .args(arguments)
+                .env("PATH", &path)
+                .env("TMPDIR", fixture.path())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1");
         }
     }
 

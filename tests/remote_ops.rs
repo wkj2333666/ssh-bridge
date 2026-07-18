@@ -3324,6 +3324,33 @@ fn resident_kib() -> u64 {
         .unwrap()
 }
 
+fn stage_metadata_sample_is_secure(metadata: std::io::Result<std::fs::Metadata>) -> bool {
+    match metadata {
+        Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o777 == 0o600,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+#[test]
+fn task5_stage_sampler_ignores_only_entries_removed_during_metadata_lookup() {
+    let disappeared = std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert!(stage_metadata_sample_is_secure(Err(disappeared)));
+
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!stage_metadata_sample_is_secure(Err(denied)));
+
+    let fixture = tempfile::TempDir::new().unwrap();
+    let stage = fixture.path().join("stage");
+    std::fs::write(&stage, b"payload").unwrap();
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(stage_metadata_sample_is_secure(std::fs::metadata(&stage)));
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o640)).unwrap();
+    assert!(!stage_metadata_sample_is_secure(std::fs::metadata(&stage)));
+    assert!(!stage_metadata_sample_is_secure(std::fs::metadata(
+        fixture.path()
+    )));
+}
+
 #[tokio::test]
 async fn task5_five_hosts_write_four_mib_with_bounded_rss_and_complete_cleanup() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -3441,11 +3468,9 @@ async fn task5_five_hosts_write_four_mib_with_bounded_rss_and_complete_cleanup()
                 sample.0 = sample.0.max(rss);
                 sample.1 = sample.1.max(stages.len());
                 sample.2 = sample.2.max(spool_count);
-                sample.3 &= stages.iter().all(|entry| {
-                    entry.metadata().is_ok_and(|metadata| {
-                        metadata.is_file() && metadata.permissions().mode() & 0o777 == 0o600
-                    })
-                });
+                sample.3 &= stages
+                    .iter()
+                    .all(|entry| stage_metadata_sample_is_secure(entry.metadata()));
                 drop(sample);
                 std::thread::sleep(Duration::from_millis(2));
             }

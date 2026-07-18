@@ -341,7 +341,19 @@ name'
 
     codex_mutation_decimal_valid() {
         case "$1" in ''|*[!0-9]*) return 1 ;; esac
-        [ "${#1}" -le 20 ]
+        [ "${#1}" -le 20 ] || return 1
+        [ "${#1}" -lt 20 ] && return 0
+        codex_decimal_value=$1
+        codex_decimal_limit=18446744073709551615
+        while [ -n "$codex_decimal_value" ]; do
+            codex_decimal_digit=${codex_decimal_value%"${codex_decimal_value#?}"}
+            codex_decimal_limit_digit=${codex_decimal_limit%"${codex_decimal_limit#?}"}
+            [ "$codex_decimal_digit" -lt "$codex_decimal_limit_digit" ] && return 0
+            [ "$codex_decimal_digit" -gt "$codex_decimal_limit_digit" ] && return 1
+            codex_decimal_value=${codex_decimal_value#?}
+            codex_decimal_limit=${codex_decimal_limit#?}
+        done
+        return 0
     }
 
     codex_mutation_stat_parse() {
