@@ -477,6 +477,11 @@ completion, clean/partial EOF, serializer-zero-write overflow, partial-write-
 then-error, healthy one-byte writes, forever-pending writer, and token-ignoring
 futures. No sleep is test synchronization.
 
+The idle regression tests one factored async `next_owner_event` select
+iteration directly: with empty JoinSet and pending input/writer it remains
+pending, then returns input after input is supplied. Never run an intentionally
+unguarded outer owner loop under the same-runtime timeout.
+
 Assert malformed envelope/lifecycle/unknown-name cases are `calls=0, polls=0,
 bridge_ops=0`; known-tool invalid arguments are `calls=1, polls=1,
 bridge_ops=0`.
@@ -525,11 +530,18 @@ matching an active task returns `-32600 Duplicate request id` with `id=null`
 after envelope/legal-ID validation but before lifecycle, params, name, and
 saturation, never overwriting the active entry. Remove the ID at task join
 before response queuing; reuse is allowed while that response remains queued.
-The biased select orders writer result, input, then tool completion and guards
+Factor one loop iteration into async `next_owner_event` with no internal loop.
+Its biased select orders writer result, input, then tool completion and guards
 the join branch with `if !join_set.is_empty()`, so buffered cancellation wins
 without idle spinning or starving writer faults; after every processed frame,
 one guarded `try_join_next_with_id` prevents a notification flood from starving
 completions.
+
+Cleanup unit tests use cooperative and token-ignoring-but-yielding tool futures
+and injected writer-shutdown failure. Do not inject a non-returning poll into a
+current-thread runtime; it freezes deadlines. Keep the defensive production
+abort-drain timeout and defer a separately watched non-yielding process case to
+adversarial Task 8/11.
 
 Negotiate exactly `2025-11-25` and `2025-06-18` from one constant and return server name/version/capabilities. Supported versions validate their requested shape: name/title/version for 2025-06-18 and those plus icons/description/websiteUrl for 2025-11-25. An unsupported version validates the bounded current 2025-11 union before selecting latest; latest-only fields pass there while fields outside the union fail. Use bounded absolute URIs and fixed non-echoing errors. For the six supported methods, negotiated June shapes collect and discard bounded additional top-level params, while November applies the project's closed validator to official fields; both keep object `_meta` and client capabilities open. Reject unnegotiated `task` and unknown fields in tool arguments at the tools layer.
 

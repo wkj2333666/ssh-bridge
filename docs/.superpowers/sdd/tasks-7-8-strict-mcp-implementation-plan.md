@@ -1413,9 +1413,14 @@ already buffered/ready before the owner polls either. Assert cancellation wins,
 the call response is suppressed, and registry/slot are released. Then stream a
 bounded sequence of continuously ready notifications while one completion is
 ready and prove the completion is reaped within a fixed number of owner
-iterations. Add an idle-Ready server with an empty `JoinSet`: under a current-
-thread runtime, a timeout-wrapped sibling yield/heartbeat must progress and a
-later ping must succeed, proving the owner does not busy-loop on `None`. Run
+iterations. Factor exactly one biased select iteration into async
+`next_owner_event(...)`; the outer owner loop calls it once, handles the event,
+and repeats. Test the helper directly with an empty `JoinSet` plus pending input
+and writer: a short timeout must observe that this single helper future remains
+pending, then a fresh call returns the input event after input is supplied. This
+bounded check is safe because the helper itself has no continue loop. Without
+the guard the helper returns immediate `JoinEmpty`/`None`, so the test fails
+instead of starving its own timeout. Run
 `cargo test --test mcp_protocol task7_cancellation_ -- --nocapture` and verify
 RED from missing shape/race behavior, not a timeout.
 
@@ -1436,8 +1441,8 @@ struct CompletedCall {
 }
 ```
 
-Use a biased select ordered writer-result first, input second, and tool
-completion third. Guard the join branch exactly with
+Implement `next_owner_event` as exactly one biased select ordered writer-result
+first, input second, and tool completion third. It contains no loop. Guard the join branch exactly with
 `if !join_set.is_empty()` because `join_next_with_id()` on an empty set returns
 `None` immediately and otherwise creates a busy loop. The writer can therefore
 never be starved by input, while input still wins over a simultaneously ready
@@ -1509,8 +1514,12 @@ completion already ready in the `JoinSet` when Closing begins.
 
 For clean EOF, test zero calls plus cooperative and token-ignoring active calls:
 the server returns success whenever cancellation, bounded task reap/abort-drain,
-and writer drain/shutdown all finish healthily. Inject a task-drain or writer-
-shutdown failure and require fixed MCP transport failure. For partial EOF,
+and writer drain/shutdown all finish healthily. Inject writer-shutdown failure
+and require fixed MCP transport failure. Do not attempt to inject a non-returning
+tool poll: on a current-thread runtime it freezes the runtime and its deadlines.
+The token-ignoring fixture must keep yielding so abort/drain is observable; the
+defensive production abort-drain timeout remains, while an external-process
+watchdog case may be deferred to adversarial Task 8/11. For partial EOF,
 assert fixed ProtocolError only after the parse-error control response has been
 healthily written and writer shutdown completes; a full/closed writer channel,
 later write error, shutdown error, or writer timeout takes precedence as fixed
@@ -1632,7 +1641,7 @@ cargo test --test mcp_protocol task7_eof_ -- --nocapture
 cargo test --test mcp_protocol -- --nocapture
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-rg -n 'tokio::spawn|JoinSet|join_next_with_id|suppress_call_responses|MCP_TASK_CLEANUP_GRACE|MCP_WRITER_SHUTDOWN_GRACE' src/mcp tests/mcp_protocol.rs
+rg -n 'tokio::spawn|JoinSet|next_owner_event|if !join_set.is_empty\(\)|join_next_with_id|suppress_call_responses|MCP_TASK_CLEANUP_GRACE|MCP_WRITER_SHUTDOWN_GRACE' src/mcp tests/mcp_protocol.rs
 ```
 
 Expected: lifecycle, version, strict-shape, framing, concurrency, cancellation,

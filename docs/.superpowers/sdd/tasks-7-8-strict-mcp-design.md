@@ -861,8 +861,10 @@ discards other bounded top-level params; November rejects them. Unnegotiated
 specific closure are validated before any registry lookup or token trigger.
 Reason is borrow-validated in place and never cloned.
 
-The biased select orders writer result first, input second, and tool completion
-third. Its join branch is guarded by `if !join_set.is_empty()`; otherwise
+Exactly one biased select iteration is factored into async
+`next_owner_event`; the outer owner loop invokes it once per iteration.
+The helper orders writer result first, input second, and tool completion third.
+Its join branch is guarded by `if !join_set.is_empty()`; otherwise
 `join_next_with_id()` returns immediate `None` and busy-loops on an idle server.
 Writer failure cannot be input-starved, and an already-buffered
 cancellation wins over its simultaneously ready completion. Immediately after
@@ -886,6 +888,13 @@ healthily. Failure to enqueue or later write/drain/shutdown failure takes
 precedence as fixed MCP transport failure. `SshRunner`
 remains responsible for terminating process groups and reporting whether a
 remote process may continue.
+
+Unit tests cover cooperative tasks, a token-ignoring but yielding task that is
+aborted/drained, and writer-shutdown failure. They do not inject a non-returning
+future poll into the current-thread runtime because that would freeze both the
+owner and its timeout. The defensive task abort-drain timeout remains in
+production; a truly non-yielding case belongs in a separately watched process
+in adversarial Task 8/11.
 
 ## 9. Exact Nine-Tool Surface
 
@@ -1273,7 +1282,10 @@ whole-product acceptance.
 - buffered-cancel priority plus one `try_join_next_with_id` after every handled
   frame, preventing notification starvation; and
 - an empty-JoinSet idle-server regression proving the guarded join branch does
-  not spin;
+  not spin: test one `next_owner_event` directly with pending input/writer,
+  observe it remains pending, then supply input and observe that event. The
+  helper contains no outer loop, so the bounded pending check cannot starve its
+  own timeout;
 - serializer overflow producing zero transport bytes, partial-write-then-error
   closing without a next frame, and healthy one-byte writes preserving
   noninterleaving;
