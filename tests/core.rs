@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use codex_ssh_bridge::config::{Config, Limits};
+use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile, Limits};
 use codex_ssh_bridge::error::{BridgeError, ErrorCode};
 use codex_ssh_bridge::path::RemotePath;
 use codex_ssh_bridge::quote::{fixed_command, shell_word};
@@ -241,6 +241,47 @@ fn config_defaults_match_compiled_limits() {
     assert_eq!(limits.max_output_bytes, MAX_OUTPUT_BYTES);
     assert_eq!(limits.global_concurrency, 8);
     assert_eq!(limits.per_host_concurrency, 2);
+}
+
+fn config_with_root(root: String) -> Config {
+    Config {
+        version: 1,
+        limits: Limits::default(),
+        hosts: std::collections::BTreeMap::from([(
+            "dev".to_owned(),
+            HostProfile {
+                root,
+                description: None,
+                read_only: false,
+                limits: HostLimitOverrides::default(),
+            },
+        )]),
+    }
+}
+
+#[test]
+fn task78_configured_root_byte_bound_ascii_is_enforced_after_normalization() {
+    let exact = format!("/{}", "a".repeat(65_535));
+    assert_eq!(exact.len(), 65_536);
+    assert!(config_with_root(exact.clone()).host("dev").is_ok());
+
+    let error = config_with_root(format!("{exact}a"))
+        .host("dev")
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+}
+
+#[test]
+fn task78_configured_root_byte_bound_utf8_is_enforced_by_bytes() {
+    let exact = format!("/{}a", "é".repeat(32_767));
+    assert_eq!(exact.len(), 65_536);
+    assert!(exact.chars().count() < 65_536);
+    assert!(config_with_root(exact.clone()).host("dev").is_ok());
+
+    let error = config_with_root(format!("{exact}a"))
+        .host("dev")
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
 }
 
 #[test]

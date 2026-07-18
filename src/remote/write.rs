@@ -13,7 +13,7 @@ use crate::ssh::{FixedOperationKind, FixedRunRequest, FixedRunResult, render_fix
 use super::protocol::{context, encode_bytes, read_small_stream};
 use super::{
     GuardedDeleteRequest, GuardedDeleteResult, MAX_INPUT_PATH_BYTES, RemoteBridge, WriteEncoding,
-    WriteMode, WriteOperation, WriteRequest, WriteResult,
+    WriteMode, WriteOperation, WriteRequest, WriteResult, attach_fixed_result_context,
 };
 
 const WRITE_PROTOCOL_LIMIT: u64 = 512;
@@ -984,7 +984,8 @@ pub(super) async fn execute_preflighted_write(
 
     let protocol = parse_write_protocol(&result, &resolved)
         .await
-        .map_err(|_| BridgeError::mutation_outcome_unknown())?;
+        .map_err(|_| BridgeError::mutation_outcome_unknown())
+        .map_err(|error| attach_fixed_result_context(error, &resolved.host, &result))?;
     match protocol {
         WriteProtocol::Success {
             operation,
@@ -1005,13 +1006,21 @@ pub(super) async fn execute_preflighted_write(
             mode,
             temporary_cleanup_confirmed: true,
         }),
-        WriteProtocol::Domain(code) => Err(domain_error(code)),
+        WriteProtocol::Domain(code) => Err(attach_fixed_result_context(
+            domain_error(code),
+            &resolved.host,
+            &result,
+        )),
         WriteProtocol::CapabilityMismatch => {
             bridge.runner.invalidate_capability(&resolved.host).await;
-            Err(BridgeError::new(
-                ErrorCode::RemoteCapabilityMissing,
-                "remote safe-write capability is unavailable",
-                false,
+            Err(attach_fixed_result_context(
+                BridgeError::new(
+                    ErrorCode::RemoteCapabilityMissing,
+                    "remote safe-write capability is unavailable",
+                    false,
+                ),
+                &resolved.host,
+                &result,
             ))
         }
     }
@@ -1051,7 +1060,8 @@ pub(super) async fn execute_preflighted_delete(
 
     let protocol = parse_delete_protocol(&result, &resolved)
         .await
-        .map_err(|_| BridgeError::mutation_outcome_unknown())?;
+        .map_err(|_| BridgeError::mutation_outcome_unknown())
+        .map_err(|error| attach_fixed_result_context(error, &resolved.host, &result))?;
     match protocol {
         DeleteProtocol::Success { sha256 } => Ok((
             GuardedDeleteResult {
@@ -1066,13 +1076,21 @@ pub(super) async fn execute_preflighted_delete(
                 &result.shell,
             ),
         )),
-        DeleteProtocol::Domain(code) => Err(delete_domain_error(code)),
+        DeleteProtocol::Domain(code) => Err(attach_fixed_result_context(
+            delete_domain_error(code),
+            &resolved.host,
+            &result,
+        )),
         DeleteProtocol::CapabilityMismatch => {
             bridge.runner.invalidate_capability(&resolved.host).await;
-            Err(BridgeError::new(
-                ErrorCode::RemoteCapabilityMissing,
-                "remote guarded-delete capability is unavailable",
-                false,
+            Err(attach_fixed_result_context(
+                BridgeError::new(
+                    ErrorCode::RemoteCapabilityMissing,
+                    "remote guarded-delete capability is unavailable",
+                    false,
+                ),
+                &resolved.host,
+                &result,
             ))
         }
     }

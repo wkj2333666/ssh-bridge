@@ -30,10 +30,21 @@ pub enum ErrorCode {
     Io,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ErrorShellMetadata {
+    pub kind: String,
+    pub version: Option<String>,
+    pub fallback: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ErrorDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ErrorShellMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +69,23 @@ pub struct ErrorDetails {
     pub not_changed_paths: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_unknown_paths: Option<Vec<String>>,
+}
+
+pub fn attach_available_remote_context(
+    error: &mut BridgeError,
+    host: Option<&str>,
+    physical_root: Option<&str>,
+    shell: Option<&ErrorShellMetadata>,
+) {
+    if error.details.host.is_none() {
+        error.details.host = host.map(str::to_owned);
+    }
+    if error.details.physical_root.is_none() {
+        error.details.physical_root = physical_root.map(str::to_owned);
+    }
+    if error.details.shell.is_none() {
+        error.details.shell = shell.cloned();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

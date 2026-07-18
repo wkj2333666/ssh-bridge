@@ -24,7 +24,9 @@ use crate::capability::{
     parse_probe_output, select_shell,
 };
 use crate::config::{Config, EffectiveLimits};
-use crate::error::{BridgeError, BridgeResult, ErrorCode};
+use crate::error::{
+    BridgeError, BridgeResult, ErrorCode, ErrorShellMetadata, attach_available_remote_context,
+};
 use crate::output::{
     CaptureLimits, CapturedOutput, InternalCapturedOutput, InternalSpoolRegistration, OutputPage,
     OutputProvenance, OutputReference, OutputStore, StderrSignals, StreamKind,
@@ -65,6 +67,7 @@ pub struct RunResult {
     pub status: i32,
     pub elapsed_ms: u64,
     pub shell: ShellSelection,
+    pub physical_root: String,
     pub output: CapturedOutput,
     pub remote_process_may_continue: bool,
 }
@@ -190,7 +193,16 @@ impl SshRunner {
         if cancel.is_cancelled() {
             return Err(cancelled_error(false, 0));
         }
-        let shell = select_shell(&capability, request.shell)?;
+        let shell = select_shell(&capability, request.shell).map_err(|mut error| {
+            attach_available_remote_context(
+                &mut error,
+                Some(&request.host),
+                Some(&capability.physical_root),
+                None,
+            );
+            error
+        })?;
+        let shell_context = error_shell_metadata(&shell);
         let timeout_ms = u64::try_from(request.timeout.as_millis())
             .map_err(|_| BridgeError::invalid_argument("command timeout is too large"))?;
         let remote_timeout = !matches!(shell.shell, ShellKind::Login)
@@ -224,9 +236,26 @@ impl SshRunner {
                 &cancel,
                 &request.host,
             )
-            .await?;
+            .await
+            .map_err(|mut error| {
+                attach_available_remote_context(
+                    &mut error,
+                    Some(&request.host),
+                    Some(&capability.physical_root),
+                    Some(&shell_context),
+                );
+                error
+            })?;
 
-        let output = outcome.output.into_public()?;
+        let output = outcome.output.into_public().map_err(|mut error| {
+            attach_available_remote_context(
+                &mut error,
+                Some(&request.host),
+                Some(&capability.physical_root),
+                Some(&shell_context),
+            );
+            error
+        })?;
         self.output_store
             .set_provenance(
                 &output,
@@ -241,6 +270,7 @@ impl SshRunner {
             status: 0,
             elapsed_ms: elapsed_ms(operation_started.elapsed()),
             shell,
+            physical_root: capability.physical_root.clone(),
             output,
             remote_process_may_continue: false,
         })
@@ -340,19 +370,27 @@ impl SshRunner {
             .initialize_host(&request.host, &root, limits.connect_timeout_ms, &cancel)
             .await?;
         drop(initialize_guard);
-        for key in request.required_capabilities {
-            if capability.tools.get(*key) != Some(&true) {
-                return Err(BridgeError::new(
-                    ErrorCode::RemoteCapabilityMissing,
-                    "remote host lacks a required capability",
-                    false,
-                ));
-            }
-        }
         let shell = ShellSelection {
             shell: ShellKind::PosixSh,
             fallback: false,
         };
+        let shell_context = error_shell_metadata(&shell);
+        for key in request.required_capabilities {
+            if capability.tools.get(*key) != Some(&true) {
+                let mut error = BridgeError::new(
+                    ErrorCode::RemoteCapabilityMissing,
+                    "remote host lacks a required capability",
+                    false,
+                );
+                attach_available_remote_context(
+                    &mut error,
+                    Some(&request.host),
+                    Some(&capability.physical_root),
+                    Some(&shell_context),
+                );
+                return Err(error);
+            }
+        }
         let outcome = self
             .run_child(
                 ChildSpec {
@@ -369,17 +407,42 @@ impl SshRunner {
                 &cancel,
                 &request.host,
             )
-            .await?;
+            .await
+            .map_err(|mut error| {
+                attach_available_remote_context(
+                    &mut error,
+                    Some(&request.host),
+                    Some(&capability.physical_root),
+                    Some(&shell_context),
+                );
+                error
+            })?;
         let output = outcome
             .output
             .into_internal()
-            .map_err(|error| request.kind.after_spawn_error(error))?;
+            .map_err(|error| request.kind.after_spawn_error(error))
+            .map_err(|mut error| {
+                attach_available_remote_context(
+                    &mut error,
+                    Some(&request.host),
+                    Some(&capability.physical_root),
+                    Some(&shell_context),
+                );
+                error
+            })?;
         if output.stdout_len > request.stdout_limit || output.stderr_len > request.stderr_limit {
-            return Err(request.kind.after_spawn_error(BridgeError::new(
+            let mut error = request.kind.after_spawn_error(BridgeError::new(
                 ErrorCode::OutputLimit,
                 "fixed output exceeded its stream limit",
                 false,
-            )));
+            ));
+            attach_available_remote_context(
+                &mut error,
+                Some(&request.host),
+                Some(&capability.physical_root),
+                Some(&shell_context),
+            );
+            return Err(error);
         }
         Ok(FixedRunResult {
             capability,
@@ -836,11 +899,26 @@ enum ChildCaptured {
 fn mutation_unknown(mut source: BridgeError) -> BridgeError {
     let mut error = BridgeError::mutation_outcome_unknown();
     error.details.host = source.details.host.take();
+    error.details.physical_root = source.details.physical_root.take();
+    error.details.shell = source.details.shell.take();
     error.details.elapsed_ms = source.details.elapsed_ms;
     error.details.exit_status = source.details.exit_status;
     error.details.bytes_seen = source.details.bytes_seen;
     error.details.remote_process_may_continue = source.details.remote_process_may_continue;
     error
+}
+
+fn error_shell_metadata(shell: &ShellSelection) -> ErrorShellMetadata {
+    let (kind, version) = match &shell.shell {
+        ShellKind::Bash { version } => ("bash", Some(version.clone())),
+        ShellKind::PosixSh => ("sh", None),
+        ShellKind::Login => ("login", None),
+    };
+    ErrorShellMetadata {
+        kind: kind.to_owned(),
+        version,
+        fallback: shell.fallback,
+    }
 }
 
 impl FixedOperationKind {

@@ -23,6 +23,8 @@ const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
 const MAX_GLOBAL_CONCURRENCY: usize = 32;
 const MAX_PER_HOST_CONCURRENCY: usize = 8;
 
+pub const MAX_REMOTE_CONTEXT_ROOT_BYTES: usize = 65_536;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -214,9 +216,14 @@ impl Config {
                     "invalid host alias: {alias}"
                 )));
             }
-            RemotePath::resolve(&profile.root, ".").map_err(|_| {
+            let normalized_root = RemotePath::resolve(&profile.root, ".").map_err(|_| {
                 BridgeError::invalid_config(format!("host {alias} has an invalid root"))
             })?;
+            if normalized_root.absolute().len() > MAX_REMOTE_CONTEXT_ROOT_BYTES {
+                return Err(BridgeError::invalid_config(format!(
+                    "host {alias} root exceeds {MAX_REMOTE_CONTEXT_ROOT_BYTES} UTF-8 bytes"
+                )));
+            }
             validate_host_limits(alias, &profile.limits, &self.limits)?;
         }
         Ok(())

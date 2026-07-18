@@ -65,6 +65,13 @@ fn bash_probe(requested: &str, physical: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn bash_probe_with_version(requested: &str, physical: &str, version: &str) -> Vec<u8> {
+    format!(
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0SHELL_KIND=bash\0BASH_VERSION={version}\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
+    )
+    .into_bytes()
+}
+
 fn sh_probe(requested: &str, physical: &str) -> Vec<u8> {
     format!(
         "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0SHELL_KIND=sh\0BASH_VERSION=\0TOOL_rg=0\0"
@@ -486,6 +493,14 @@ fn shell_selection_records_profile_free_bash_posix_fallback_and_login_semantics(
     assert_eq!(automatic_sh.shell, ShellKind::PosixSh);
     assert!(automatic_sh.fallback);
 
+    let explicit_sh = select_shell(&bash, ShellRequest::Sh).unwrap();
+    assert_eq!(explicit_sh.shell, ShellKind::PosixSh);
+    assert!(!explicit_sh.fallback);
+
+    let explicit_sh_without_bash = select_shell(&sh, ShellRequest::Sh).unwrap();
+    assert_eq!(explicit_sh_without_bash.shell, ShellKind::PosixSh);
+    assert!(!explicit_sh_without_bash.fallback);
+
     let missing = select_shell(&sh, ShellRequest::Bash).unwrap_err();
     assert_eq!(missing.code, ErrorCode::RemoteCapabilityMissing);
 
@@ -497,6 +512,65 @@ fn shell_selection_records_profile_free_bash_posix_fallback_and_login_semantics(
     let automatic_login = select_shell(&reported_login, ShellRequest::Auto).unwrap();
     assert_eq!(automatic_login.shell, ShellKind::PosixSh);
     assert!(automatic_login.fallback);
+}
+
+#[test]
+fn task78_physical_root_byte_bound_ascii_and_utf8_are_enforced_before_context() {
+    let expected = RemotePath::resolve("/srv/project", ".").unwrap();
+    for exact in [
+        format!("/{}", "a".repeat(65_535)),
+        format!("/{}a", "é".repeat(32_767)),
+    ] {
+        assert_eq!(exact.len(), 65_536);
+        let capability =
+            parse_probe_output(&sh_probe(expected.absolute(), &exact), &expected).unwrap();
+        assert_eq!(capability.physical_root, exact);
+
+        let over = format!("{exact}a");
+        assert_eq!(over.len(), 65_537);
+        let error =
+            parse_probe_output(&sh_probe(expected.absolute(), &over), &expected).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolError);
+        assert_eq!(error.details.physical_root, None);
+    }
+}
+
+#[test]
+fn task78_physical_root_byte_bound_bash_version_and_spoofed_values_are_enforced() {
+    let expected = RemotePath::resolve("/srv/project", ".").unwrap();
+    for exact in ["v".repeat(256), format!("{}aa", "é".repeat(127))] {
+        assert_eq!(exact.len(), 256);
+        let capability = parse_probe_output(
+            &bash_probe_with_version(expected.absolute(), "/srv/project", &exact),
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(capability.bash_version.as_deref(), Some(exact.as_str()));
+        assert_eq!(
+            capability.shell,
+            ShellKind::Bash {
+                version: exact.clone()
+            }
+        );
+
+        let over = format!("{exact}a");
+        assert_eq!(over.len(), 257);
+        let error = parse_probe_output(
+            &bash_probe_with_version(expected.absolute(), "/srv/project", &over),
+            &expected,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolError);
+        assert_eq!(error.details.shell, None);
+    }
+
+    let spoofed = "$(touch /tmp/codex-ssh-bridge-must-not-run)";
+    let capability = parse_probe_output(
+        &bash_probe_with_version(expected.absolute(), "/srv/project", spoofed),
+        &expected,
+    )
+    .unwrap();
+    assert_eq!(capability.bash_version.as_deref(), Some(spoofed));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1706,6 +1780,115 @@ async fn local_deadline_and_gnu_timeout_status_are_command_timeouts() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::CommandTimeout);
+}
+
+fn assert_task78_selected_context(error: &BridgeError, expected_code: ErrorCode) {
+    assert_eq!(error.code, expected_code, "{error:?}");
+    assert_eq!(error.details.host.as_deref(), Some("dev"));
+    assert_eq!(error.details.physical_root.as_deref(), Some("/srv/project"));
+    let shell = error
+        .details
+        .shell
+        .as_ref()
+        .expect("selected shell metadata");
+    assert_eq!(shell.kind, "sh");
+    assert_eq!(shell.version, None);
+    assert!(shell.fallback);
+}
+
+#[tokio::test]
+async fn task78_selected_remote_context_is_attached_to_exit_timeout_cancel_and_output_limit() {
+    let exited = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "error".to_owned()),
+            ("FAKE_SSH_ERROR", "remote".to_owned()),
+        ],
+    );
+    let error = exited
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_task78_selected_context(&error, ErrorCode::RemoteExit);
+
+    let timed_out = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "2".to_owned()),
+        ],
+    );
+    let error = timed_out
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_millis(50)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_task78_selected_context(&error, ErrorCode::CommandTimeout);
+
+    let cancel_log_dir = TempDir::new().unwrap();
+    let cancel_log = cancel_log_dir.path().join("calls.log");
+    let cancelled = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "sleep".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "2".to_owned()),
+            ("FAKE_SSH_LOG", cancel_log.display().to_string()),
+        ],
+    );
+    let token = CancellationToken::new();
+    let operation = {
+        let runner = Arc::clone(&cancelled.runner);
+        let token = token.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+                    token,
+                )
+                .await
+        })
+    };
+    wait_for_log_marker(&cancel_log, "C").await;
+    token.cancel();
+    let error = operation.await.unwrap().unwrap_err();
+    assert_task78_selected_context(&error, ErrorCode::Cancelled);
+
+    let output_limits = Limits {
+        max_output_bytes: 1_024,
+        preview_bytes: 512,
+        ..Limits::default()
+    };
+    let limited = task3_runner(
+        &["dev"],
+        output_limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "bytes".to_owned()),
+            ("FAKE_SSH_STDOUT_BYTES", "2048".to_owned()),
+        ],
+    );
+    let error = limited
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_task78_selected_context(&error, ErrorCode::OutputLimit);
 }
 
 #[tokio::test]

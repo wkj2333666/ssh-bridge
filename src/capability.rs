@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, OnceCell, watch};
 
+use crate::config::MAX_REMOTE_CONTEXT_ROOT_BYTES;
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::path::RemotePath;
 
@@ -633,10 +634,13 @@ pub struct Capability {
     pub tools: BTreeMap<String, bool>,
 }
 
+pub const MAX_SHELL_VERSION_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellRequest {
     Auto,
     Bash,
+    Sh,
     Login,
 }
 
@@ -672,6 +676,10 @@ pub fn select_shell(
                 false,
             )),
         },
+        ShellRequest::Sh => Ok(ShellSelection {
+            shell: ShellKind::PosixSh,
+            fallback: false,
+        }),
         ShellRequest::Login => Ok(ShellSelection {
             shell: ShellKind::Login,
             fallback: false,
@@ -713,6 +721,11 @@ pub fn parse_probe_output(
     }
 
     let physical_root = required(&records, "ROOT")?;
+    if physical_root.len() > MAX_REMOTE_CONTEXT_ROOT_BYTES {
+        return Err(protocol_error(
+            "physical root exceeds the safe context limit",
+        ));
+    }
     if !physical_root.starts_with('/') {
         return Err(protocol_error("physical root is not absolute"));
     }
@@ -723,6 +736,11 @@ pub fn parse_probe_output(
     }
 
     let bash_version = required(&records, "BASH_VERSION")?;
+    if bash_version.len() > MAX_SHELL_VERSION_BYTES {
+        return Err(protocol_error(
+            "shell version exceeds the safe metadata limit",
+        ));
+    }
     let (shell, bash_version) = match required(&records, "SHELL_KIND")? {
         "bash" if !bash_version.is_empty() => (
             ShellKind::Bash {

@@ -140,6 +140,159 @@ fn value(value: &str) -> EncodedValue {
     }
 }
 
+#[test]
+fn task78_remote_run_public_shapes_are_closed() {
+    use codex_ssh_bridge::remote::{RemoteRunRequest, RunShell, RunStdin, WriteEncoding};
+
+    let request = RemoteRunRequest {
+        host: "dev".to_owned(),
+        command: "printf ok".to_owned(),
+        cwd: Some("sub dir".to_owned()),
+        shell: RunShell::Sh,
+        timeout_ms: Some(1_250),
+        stdin: Some(RunStdin {
+            encoding: WriteEncoding::Base64,
+            value: "AAE=".to_owned(),
+        }),
+    };
+    assert_eq!(request.shell, RunShell::Sh);
+    assert_eq!(request.timeout_ms, Some(1_250));
+}
+
+#[test]
+fn task78_error_shell_metadata_is_closed() {
+    let mut error = BridgeError::new(ErrorCode::RemoteExit, "remote command failed", false);
+    error.details.shell = Some(codex_ssh_bridge::error::ErrorShellMetadata {
+        kind: "sh".to_owned(),
+        version: None,
+        fallback: true,
+    });
+    error.details.physical_root = Some("/srv/app".to_owned());
+    assert_eq!(
+        serde_json::to_value(&error).unwrap()["details"]["shell"],
+        serde_json::json!({"kind":"sh","version":null,"fallback":true})
+    );
+    assert_eq!(
+        serde_json::to_value(&error).unwrap()["details"]["physical_root"],
+        "/srv/app"
+    );
+
+    let pre_probe = BridgeError::new(ErrorCode::AuthRequired, "authentication required", false);
+    let serialized = serde_json::to_value(pre_probe).unwrap();
+    assert!(serialized["details"].get("physical_root").is_none());
+    assert!(serialized["details"].get("shell").is_none());
+}
+
+#[test]
+fn task78_domain_error_remote_context_helper_fills_only_missing_safe_fields() {
+    use codex_ssh_bridge::error::{ErrorShellMetadata, attach_available_remote_context};
+
+    let shell = ErrorShellMetadata {
+        kind: "bash".to_owned(),
+        version: Some("5.2".to_owned()),
+        fallback: false,
+    };
+    let mut error = BridgeError::new(ErrorCode::WriteConflict, "conflict", false);
+    error.details.host = Some("original".to_owned());
+    attach_available_remote_context(
+        &mut error,
+        Some("replacement"),
+        Some("/srv/app"),
+        Some(&shell),
+    );
+    assert_eq!(error.code, ErrorCode::WriteConflict);
+    assert_eq!(error.details.host.as_deref(), Some("original"));
+    assert_eq!(error.details.physical_root.as_deref(), Some("/srv/app"));
+    assert_eq!(error.details.shell.as_ref(), Some(&shell));
+}
+
+fn assert_task78_fixed_context(error: &BridgeError, root: &std::path::Path) {
+    assert_eq!(error.details.host.as_deref(), Some("dev"), "{error:?}");
+    assert_eq!(
+        error.details.physical_root.as_deref(),
+        root.to_str(),
+        "{error:?}"
+    );
+    let shell = error.details.shell.as_ref().expect("fixed shell context");
+    assert_eq!(shell.kind, "sh");
+    assert_eq!(shell.version, None);
+    assert!(!shell.fallback);
+}
+
+#[tokio::test]
+async fn task78_domain_error_remote_context_is_attached_after_fixed_exit_zero() {
+    let read_root = tempfile::TempDir::new().unwrap();
+    std::fs::write(read_root.path().join("read.txt"), b"safe\n").unwrap();
+    let (_runtime, _runner, read_bridge) = fixture_with_options(
+        read_root.path(),
+        false,
+        None,
+        &[("FAKE_SSH_LOCAL_FIXED_POST", OsString::from("stderr"))],
+    );
+    let read_error = read_bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["read.txt".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(read_error.code, ErrorCode::ProtocolError);
+    assert_task78_fixed_context(&read_error, read_root.path());
+
+    let write_root = tempfile::TempDir::new().unwrap();
+    std::fs::write(write_root.path().join("exists"), b"old").unwrap();
+    let (_runtime, _runner, write_bridge) = fixture(write_root.path(), false);
+    let write_error = write_bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "exists".to_owned(),
+                content: "new".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(write_error.code, ErrorCode::WriteConflict);
+    assert_task78_fixed_context(&write_error, write_root.path());
+
+    let patch_root = tempfile::TempDir::new().unwrap();
+    std::fs::write(patch_root.path().join("target"), b"old\n").unwrap();
+    let (_runtime, _runner, patch_bridge) = fixture_with_options(
+        patch_root.path(),
+        false,
+        None,
+        &[("FAKE_SSH_LOCAL_FIXED_POST", OsString::from("stderr"))],
+    );
+    let patch_error = patch_bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: "--- a/target\n+++ b/target\n@@ -1 +1 @@\n-old\n+new\n".to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(patch_error.code, ErrorCode::ProtocolError);
+    assert_eq!(patch_error.details.failed_path.as_deref(), Some("target"));
+    assert_eq!(patch_error.details.changed_paths, Some(Vec::new()));
+    assert_eq!(
+        patch_error.details.not_changed_paths,
+        Some(vec!["target".to_owned()])
+    );
+    assert_eq!(patch_error.details.outcome_unknown_paths, Some(Vec::new()));
+    assert_task78_fixed_context(&patch_error, patch_root.path());
+}
+
 fn metadata() -> RemoteMetadata {
     RemoteMetadata {
         kind: RemoteFileKind::File,
