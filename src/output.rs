@@ -8,13 +8,15 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::capability::ShellSelection;
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::ssh::RuntimePaths;
 use crate::{MAX_FRAME_BYTES, MAX_OUTPUT_BYTES, MAX_READ_BYTES};
@@ -24,7 +26,8 @@ const DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const UNKNOWN_REFERENCE: &str = "output reference is unknown or expired";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     Stdout,
     Stderr,
@@ -58,6 +61,67 @@ pub struct OutputPage {
     pub eof: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InternalCapturedOutput {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    pub(crate) stdout_len: u64,
+    pub(crate) stderr_len: u64,
+    pub(crate) aggregate_bytes: u64,
+}
+
+impl InternalCapturedOutput {
+    pub(crate) async fn read(
+        &self,
+        stream: StreamKind,
+        offset: u64,
+        max_bytes: usize,
+    ) -> BridgeResult<OutputPage> {
+        if max_bytes == 0 || max_bytes > MAX_FRAME_BYTES + 1 {
+            return Err(BridgeError::invalid_argument(
+                "internal output page size is invalid",
+            ));
+        }
+        let (path, length) = match stream {
+            StreamKind::Stdout => (&self.stdout_path, self.stdout_len),
+            StreamKind::Stderr => (&self.stderr_path, self.stderr_len),
+        };
+        if offset > length {
+            return Err(BridgeError::invalid_argument(
+                "output offset exceeds stream length",
+            ));
+        }
+        let wanted = usize::try_from((length - offset).min(max_bytes as u64)).map_err(|_| {
+            BridgeError::new(
+                ErrorCode::ProtocolError,
+                "internal output length is invalid",
+                false,
+            )
+        })?;
+        let mut bytes = vec![0; wanted];
+        if wanted != 0 {
+            let mut file = tokio::fs::File::open(path).await.map_err(BridgeError::io)?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(BridgeError::io)?;
+            file.read_exact(&mut bytes).await.map_err(BridgeError::io)?;
+        }
+        let next_offset = offset.checked_add(bytes.len() as u64).ok_or_else(|| {
+            BridgeError::new(
+                ErrorCode::ProtocolError,
+                "internal output offset overflowed",
+                false,
+            )
+        })?;
+        Ok(OutputPage {
+            bytes,
+            offset,
+            next_offset,
+            eof: next_offset == length,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputPreview {
     pub head: Vec<u8>,
@@ -88,6 +152,93 @@ pub struct CaptureLimits {
     pub max_output_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputProvenance {
+    pub host: String,
+    pub physical_root: String,
+    pub shell: ShellSelection,
+}
+
+#[derive(Debug, Default)]
+struct CleanupState {
+    closed: bool,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InternalSpoolOwner {
+    state: Arc<StdMutex<CleanupState>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InternalSpoolRegistration {
+    state: Weak<StdMutex<CleanupState>>,
+}
+
+impl InternalSpoolOwner {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(CleanupState::default())),
+        }
+    }
+
+    pub(crate) fn registration(&self) -> InternalSpoolRegistration {
+        InternalSpoolRegistration {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+}
+
+impl Drop for InternalSpoolOwner {
+    fn drop(&mut self) {
+        let paths = match self.state.lock() {
+            Ok(mut state) => {
+                state.closed = true;
+                std::mem::take(&mut state.paths)
+            }
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.closed = true;
+                std::mem::take(&mut state.paths)
+            }
+        };
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl InternalSpoolRegistration {
+    pub(crate) fn register(&self, path: PathBuf) -> BridgeResult<()> {
+        let Some(state) = self.state.upgrade() else {
+            let _ = std::fs::remove_file(&path);
+            return Err(BridgeError::new(
+                ErrorCode::Cancelled,
+                "internal output owner was dropped",
+                false,
+            ));
+        };
+        let mut state = state.lock().map_err(|_| {
+            BridgeError::new(
+                ErrorCode::Io,
+                "internal output cleanup lock poisoned",
+                false,
+            )
+        })?;
+        if state.closed {
+            drop(state);
+            let _ = std::fs::remove_file(&path);
+            return Err(BridgeError::new(
+                ErrorCode::Cancelled,
+                "internal output owner was dropped",
+                false,
+            ));
+        }
+        state.paths.push(path);
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct SpoolEntry {
     stdout_path: PathBuf,
@@ -95,6 +246,7 @@ struct SpoolEntry {
     stdout_len: u64,
     stderr_len: u64,
     expires_at: Instant,
+    provenance: Option<OutputProvenance>,
 }
 
 #[derive(Debug)]
@@ -158,6 +310,51 @@ impl OutputStore {
         Stdout: AsyncRead + Unpin + Send + 'static,
         Stderr: AsyncRead + Unpin + Send + 'static,
     {
+        let sink = self
+            .capture_sink(stdout, stderr, limits, cancel, output_limit, None)
+            .await?;
+        sink.finish(self).await
+    }
+
+    pub(crate) async fn capture_internal<Stdout, Stderr>(
+        &self,
+        stdout: Stdout,
+        stderr: Stderr,
+        limits: CaptureLimits,
+        cancel: CancellationToken,
+        output_limit: CancellationToken,
+        registration: InternalSpoolRegistration,
+    ) -> BridgeResult<InternalCapturedOutput>
+    where
+        Stdout: AsyncRead + Unpin + Send + 'static,
+        Stderr: AsyncRead + Unpin + Send + 'static,
+    {
+        let sink = self
+            .capture_sink(
+                stdout,
+                stderr,
+                limits,
+                cancel,
+                output_limit,
+                Some(registration),
+            )
+            .await?;
+        sink.finish_internal().await
+    }
+
+    async fn capture_sink<Stdout, Stderr>(
+        &self,
+        stdout: Stdout,
+        stderr: Stderr,
+        limits: CaptureLimits,
+        cancel: CancellationToken,
+        output_limit: CancellationToken,
+        registration: Option<InternalSpoolRegistration>,
+    ) -> BridgeResult<OutputSink>
+    where
+        Stdout: AsyncRead + Unpin + Send + 'static,
+        Stderr: AsyncRead + Unpin + Send + 'static,
+    {
         if limits.preview_bytes == 0
             || limits.preview_bytes > MAX_FRAME_BYTES
             || limits.max_output_bytes == 0
@@ -176,6 +373,14 @@ impl OutputStore {
             tokio::spawn(drain_stream(stdout, StreamKind::Stdout, sender.clone()));
         let mut stderr_task = tokio::spawn(drain_stream(stderr, StreamKind::Stderr, sender));
         let mut sink = OutputSink::new(limits.preview_bytes, limits.max_output_bytes);
+        if let Some(registration) = registration {
+            sink.start_spooling(self.spool_directory.path()).await?;
+            let RetainedOutput::Spool(spool) = &sink.retained else {
+                unreachable!()
+            };
+            registration.register(spool.stdout_path.clone())?;
+            registration.register(spool.stderr_path.clone())?;
+        }
         let mut finished_streams = 0;
 
         while finished_streams != 2 {
@@ -223,7 +428,7 @@ impl OutputStore {
             sink.cleanup_incomplete();
             return Err(join_error(error));
         }
-        sink.finish(self).await
+        Ok(sink)
     }
 
     pub async fn read(
@@ -294,6 +499,30 @@ impl OutputStore {
         if let Some(entry) = entry {
             remove_entry_files(&entry).await;
         }
+    }
+
+    pub(crate) async fn set_provenance(
+        &self,
+        captured: &CapturedOutput,
+        provenance: OutputProvenance,
+    ) {
+        if let Some(reference) = &captured.reference
+            && let Some(entry) = self.entries.lock().await.get_mut(reference.as_str())
+        {
+            entry.provenance = Some(provenance);
+        }
+    }
+
+    pub(crate) async fn provenance(
+        &self,
+        reference: &OutputReference,
+    ) -> BridgeResult<OutputProvenance> {
+        self.entries
+            .lock()
+            .await
+            .get(reference.as_str())
+            .and_then(|entry| entry.provenance.clone())
+            .ok_or_else(unknown_reference)
     }
 }
 
@@ -511,6 +740,7 @@ impl OutputSink {
                         stdout_len: self.stdout.bytes_seen,
                         stderr_len: self.stderr.bytes_seen,
                         expires_at,
+                        provenance: None,
                     },
                 );
                 spool.armed = false;
@@ -525,6 +755,34 @@ impl OutputSink {
             aggregate_bytes: self.aggregate_bytes,
             stderr_signals: self.stderr_scanner.signals,
         })
+    }
+
+    async fn finish_internal(mut self) -> BridgeResult<InternalCapturedOutput> {
+        self.stderr_scanner.finish_pending_line();
+        let RetainedOutput::Spool(spool) = &mut self.retained else {
+            return Err(BridgeError::new(
+                ErrorCode::Io,
+                "internal output was not spooled",
+                false,
+            ));
+        };
+        spool.stdout.flush().await.map_err(BridgeError::io)?;
+        spool
+            .stderr
+            .as_mut()
+            .expect("completed pending spool")
+            .flush()
+            .await
+            .map_err(BridgeError::io)?;
+        let output = InternalCapturedOutput {
+            stdout_path: spool.stdout_path.clone(),
+            stderr_path: spool.stderr_path.clone(),
+            stdout_len: self.stdout.bytes_seen,
+            stderr_len: self.stderr.bytes_seen,
+            aggregate_bytes: self.aggregate_bytes,
+        };
+        spool.armed = false;
+        Ok(output)
     }
 }
 
@@ -814,7 +1072,7 @@ fn is_single_diagnostic_field(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingSpool, create_private_file, create_spool};
+    use super::{InternalSpoolOwner, PendingSpool, create_private_file, create_spool};
 
     #[test]
     fn dropping_an_unregistered_spool_removes_both_files() {
@@ -854,5 +1112,28 @@ mod tests {
             std::fs::read(&stderr_path).unwrap(),
             b"pre-existing sentinel"
         );
+    }
+
+    #[test]
+    fn internal_spool_owner_unlinks_registered_paths_on_drop() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("internal");
+        std::fs::write(&path, b"data").unwrap();
+        let owner = InternalSpoolOwner::new();
+        owner.registration().register(path.clone()).unwrap();
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn late_internal_registration_unlinks_immediately() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("late");
+        let owner = InternalSpoolOwner::new();
+        let registration = owner.registration();
+        drop(owner);
+        std::fs::write(&path, b"data").unwrap();
+        assert!(registration.register(path.clone()).is_err());
+        assert!(!path.exists());
     }
 }

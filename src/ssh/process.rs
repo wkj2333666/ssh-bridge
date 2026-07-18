@@ -25,7 +25,10 @@ use crate::capability::{
 };
 use crate::config::{Config, EffectiveLimits};
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
-use crate::output::{CaptureLimits, CapturedOutput, OutputStore, StderrSignals};
+use crate::output::{
+    CaptureLimits, CapturedOutput, InternalCapturedOutput, InternalSpoolRegistration, OutputPage,
+    OutputProvenance, OutputReference, OutputStore, StderrSignals, StreamKind,
+};
 use crate::path::RemotePath;
 use crate::quote::shell_word;
 
@@ -64,6 +67,25 @@ pub struct RunResult {
     pub shell: ShellSelection,
     pub output: CapturedOutput,
     pub remote_process_may_continue: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct FixedRunRequest {
+    pub host: String,
+    pub script: &'static str,
+    pub args: Vec<String>,
+    pub stdin: Option<Vec<u8>>,
+    pub required_capabilities: &'static [&'static str],
+    pub stdout_limit: u64,
+    pub stderr_limit: u64,
+    pub timeout: Duration,
+    pub cleanup: InternalSpoolRegistration,
+}
+
+pub(crate) struct FixedRunResult {
+    pub capability: Arc<Capability>,
+    pub shell: ShellSelection,
+    pub output: InternalCapturedOutput,
 }
 
 pub struct SshRunner {
@@ -190,18 +212,198 @@ impl SshRunner {
                     phase: Phase::Command {
                         remote_timeout_wrapped: remote_timeout,
                     },
+                    internal_registration: None,
                 },
                 &cancel,
                 &request.host,
             )
             .await?;
 
+        let output = outcome.output.into_public()?;
+        self.output_store
+            .set_provenance(
+                &output,
+                OutputProvenance {
+                    host: request.host.clone(),
+                    physical_root: capability.physical_root.clone(),
+                    shell: shell.clone(),
+                },
+            )
+            .await;
         Ok(RunResult {
             status: 0,
             elapsed_ms: elapsed_ms(operation_started.elapsed()),
             shell,
-            output: outcome.output,
+            output,
             remote_process_may_continue: false,
+        })
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) async fn cached_capability(&self, host: &str) -> Option<Arc<Capability>> {
+        self.capabilities.get(host).await
+    }
+
+    pub(crate) async fn invalidate_capability(&self, host: &str) -> bool {
+        self.capabilities.invalidate(host).await
+    }
+
+    pub(crate) async fn read_output(
+        &self,
+        reference: &OutputReference,
+        stream: StreamKind,
+        offset: u64,
+        max_bytes: usize,
+    ) -> BridgeResult<OutputPage> {
+        self.output_store
+            .read(reference, stream, offset, max_bytes)
+            .await
+    }
+
+    pub(crate) async fn output_provenance(
+        &self,
+        reference: &OutputReference,
+    ) -> BridgeResult<OutputProvenance> {
+        self.output_store.provenance(reference).await
+    }
+
+    pub(crate) async fn execute_fixed(
+        &self,
+        request: FixedRunRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<FixedRunResult> {
+        let first = self
+            .execute_fixed_once(request.clone(), cancel.clone())
+            .await?;
+        match fixed_capability_mismatch(&first.output, request.required_capabilities).await? {
+            None => Ok(first),
+            Some(_) => {
+                self.invalidate_capability(&request.host).await;
+                let second = self.execute_fixed_once(request.clone(), cancel).await?;
+                match fixed_capability_mismatch(&second.output, request.required_capabilities)
+                    .await?
+                {
+                    None => Ok(second),
+                    Some(_) => Err(BridgeError::new(
+                        ErrorCode::RemoteCapabilityMissing,
+                        "remote read capability remained unavailable after reprobe",
+                        false,
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn execute_fixed_once(
+        &self,
+        request: FixedRunRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<FixedRunResult> {
+        let host = self.config.host(&request.host)?;
+        let limits = host.limits;
+        let root = host.profile.root.clone();
+        if request.timeout.is_zero()
+            || request.timeout > Duration::from_millis(limits.command_timeout_ms)
+        {
+            return Err(BridgeError::invalid_argument(
+                "fixed command timeout is outside the configured limit",
+            ));
+        }
+        let remote_command = render_fixed_command(request.script, &request.args)?;
+        let transport_bytes = remote_command
+            .len()
+            .checked_add(request.stdin.as_ref().map_or(0, Vec::len))
+            .ok_or_else(|| {
+                BridgeError::new(
+                    ErrorCode::RequestTooLarge,
+                    "fixed request exceeds the configured frame limit",
+                    false,
+                )
+            })?;
+        if transport_bytes > limits.max_frame_bytes
+            || request.stdout_limit == 0
+            || request.stderr_limit == 0
+        {
+            return Err(BridgeError::new(
+                ErrorCode::RequestTooLarge,
+                "fixed request exceeds the configured frame limit",
+                false,
+            ));
+        }
+        let capture_limit = request
+            .stdout_limit
+            .checked_add(request.stderr_limit)
+            .ok_or_else(|| {
+                BridgeError::new(
+                    ErrorCode::RequestTooLarge,
+                    "fixed output limit overflowed",
+                    false,
+                )
+            })?;
+        if capture_limit > limits.max_output_bytes {
+            return Err(BridgeError::new(
+                ErrorCode::RequestTooLarge,
+                "fixed output exceeds the configured limit",
+                false,
+            ));
+        }
+
+        let initializer = self.initializer(&request.host).await;
+        let initialize_guard = tokio::select! { biased; () = cancel.cancelled() => return Err(cancelled_error(false, 0)), guard = initializer.lock() => guard };
+        let _reservation = self
+            .acquire_operation(&request.host, limits.per_host_concurrency, &cancel)
+            .await?;
+        let (policy, capability) = self
+            .initialize_host(&request.host, &root, limits.connect_timeout_ms, &cancel)
+            .await?;
+        drop(initialize_guard);
+        for key in request.required_capabilities {
+            if capability.tools.get(*key) != Some(&true) {
+                return Err(BridgeError::new(
+                    ErrorCode::RemoteCapabilityMissing,
+                    "remote host lacks a required read capability",
+                    false,
+                ));
+            }
+        }
+        let shell = ShellSelection {
+            shell: ShellKind::PosixSh,
+            fallback: false,
+        };
+        let outcome = self
+            .run_child(
+                ChildSpec {
+                    argv: build_ssh_argv(&policy, &request.host, &remote_command),
+                    stdin: request.stdin,
+                    capture_limits: CaptureLimits {
+                        preview_bytes: 1,
+                        max_output_bytes: capture_limit,
+                    },
+                    deadline: request.timeout,
+                    phase: Phase::Command {
+                        remote_timeout_wrapped: false,
+                    },
+                    internal_registration: Some(request.cleanup),
+                },
+                &cancel,
+                &request.host,
+            )
+            .await?;
+        let output = outcome.output.into_internal()?;
+        if output.stdout_len > request.stdout_limit || output.stderr_len > request.stderr_limit {
+            return Err(BridgeError::new(
+                ErrorCode::OutputLimit,
+                "fixed output exceeded its stream limit",
+                false,
+            ));
+        }
+        Ok(FixedRunResult {
+            capability,
+            shell,
+            output,
         })
     }
 
@@ -277,6 +479,7 @@ impl SshRunner {
                     },
                     deadline: Duration::from_millis(connect_timeout_ms),
                     phase: Phase::Resolve,
+                    internal_registration: None,
                 },
                 cancel,
                 host,
@@ -293,18 +496,19 @@ impl SshRunner {
                     error
                 }
             })?;
-        if outcome.output.stdout.bytes_seen > RESOLVED_STDOUT_LIMIT
-            || outcome.output.stderr.bytes_seen > RESOLVED_STDERR_LIMIT
+        let output = outcome.output.into_public()?;
+        if output.stdout.bytes_seen > RESOLVED_STDOUT_LIMIT
+            || output.stderr.bytes_seen > RESOLVED_STDERR_LIMIT
         {
-            self.output_store.discard(&outcome.output).await;
+            self.output_store.discard(&output).await;
             return Err(BridgeError::new(
                 ErrorCode::ProtocolError,
                 "resolved SSH configuration exceeded its stream limit",
                 false,
             ));
         }
-        let stdout = joined_preview(&outcome.output.stdout);
-        self.output_store.discard(&outcome.output).await;
+        let stdout = joined_preview(&output.stdout);
+        self.output_store.discard(&output).await;
         let digest = Sha256::digest(stdout);
         Ok(hex_digest(&digest))
     }
@@ -331,14 +535,16 @@ impl SshRunner {
                     },
                     deadline: Duration::from_millis(connect_timeout_ms),
                     phase: Phase::Probe,
+                    internal_registration: None,
                 },
                 cancel,
                 host,
             )
             .await?;
-        let stdout = joined_preview(&outcome.output.stdout);
+        let output = outcome.output.into_public()?;
+        let stdout = joined_preview(&output.stdout);
         let parsed = parse_probe_output(&stdout, &requested_root);
-        self.output_store.discard(&outcome.output).await;
+        self.output_store.discard(&output).await;
         parsed
     }
 
@@ -435,15 +641,29 @@ impl SshRunner {
             let output_limit_signal = output_limit.clone();
             let capture_cancel = cancel.clone();
             tokio::spawn(async move {
-                store
-                    .capture_with_limit_signal(
-                        stdout,
-                        stderr,
-                        spec.capture_limits,
-                        capture_cancel,
-                        output_limit_signal,
-                    )
-                    .await
+                match spec.internal_registration.clone() {
+                    Some(registration) => store
+                        .capture_internal(
+                            stdout,
+                            stderr,
+                            spec.capture_limits,
+                            capture_cancel,
+                            output_limit_signal,
+                            registration,
+                        )
+                        .await
+                        .map(ChildCaptured::Internal),
+                    None => store
+                        .capture_with_limit_signal(
+                            stdout,
+                            stderr,
+                            spec.capture_limits,
+                            capture_cancel,
+                            output_limit_signal,
+                        )
+                        .await
+                        .map(ChildCaptured::Public),
+                }
             })
         };
         let mut wait_task = tokio::spawn(async move { child.wait().await });
@@ -526,7 +746,7 @@ impl SshRunner {
                 let bytes_seen = capture
                     .as_ref()
                     .ok()
-                    .map(|output| output.aggregate_bytes)
+                    .map(ChildCaptured::aggregate_bytes)
                     .or_else(|| {
                         capture
                             .as_ref()
@@ -534,7 +754,7 @@ impl SshRunner {
                             .and_then(|error| error.details.bytes_seen)
                     })
                     .unwrap_or(0);
-                if let Ok(output) = &capture {
+                if let Ok(ChildCaptured::Public(output)) = &capture {
                     self.output_store.discard(output).await;
                 }
                 let stopped_for_output_limit = matches!(&stop, Stop::OutputLimit);
@@ -566,7 +786,7 @@ impl SshRunner {
     async fn classify_exit(
         &self,
         status: ExitStatus,
-        output: CapturedOutput,
+        output: ChildCaptured,
         phase: Phase,
         host: &str,
         elapsed: Duration,
@@ -578,7 +798,7 @@ impl SshRunner {
         let error_code = if phase.remote_timeout_wrapped() && code == 124 {
             ErrorCode::CommandTimeout
         } else if code == 255 && phase.allows_transport_classification() {
-            classify_ssh_255(output.stderr_signals)
+            classify_ssh_255(output.stderr_signals())
         } else {
             ErrorCode::RemoteExit
         };
@@ -595,13 +815,15 @@ impl SshRunner {
         error.details.host = Some(host.to_owned());
         error.details.elapsed_ms = Some(elapsed_ms(elapsed));
         error.details.exit_status = Some(code);
-        error.details.bytes_seen = Some(output.aggregate_bytes);
+        error.details.bytes_seen = Some(output.aggregate_bytes());
         if error_code == ErrorCode::CommandTimeout
             || (code == 255 && matches!(phase, Phase::Command { .. }))
         {
             error.details.remote_process_may_continue = Some(true);
         }
-        self.output_store.discard(&output).await;
+        if let ChildCaptured::Public(output) = &output {
+            self.output_store.discard(output).await;
+        }
         Err(error)
     }
 }
@@ -612,7 +834,47 @@ struct OperationReservation {
 }
 
 struct ChildOutcome {
-    output: CapturedOutput,
+    output: ChildCaptured,
+}
+
+enum ChildCaptured {
+    Public(CapturedOutput),
+    Internal(InternalCapturedOutput),
+}
+
+impl ChildCaptured {
+    fn aggregate_bytes(&self) -> u64 {
+        match self {
+            Self::Public(output) => output.aggregate_bytes,
+            Self::Internal(output) => output.aggregate_bytes,
+        }
+    }
+    fn stderr_signals(&self) -> StderrSignals {
+        match self {
+            Self::Public(output) => output.stderr_signals,
+            Self::Internal(_) => StderrSignals::default(),
+        }
+    }
+    fn into_public(self) -> BridgeResult<CapturedOutput> {
+        match self {
+            Self::Public(output) => Ok(output),
+            Self::Internal(_) => Err(BridgeError::new(
+                ErrorCode::Io,
+                "internal capture used by public command",
+                false,
+            )),
+        }
+    }
+    fn into_internal(self) -> BridgeResult<InternalCapturedOutput> {
+        match self {
+            Self::Internal(output) => Ok(output),
+            Self::Public(_) => Err(BridgeError::new(
+                ErrorCode::Io,
+                "public capture used by fixed command",
+                false,
+            )),
+        }
+    }
 }
 
 struct ChildSpec {
@@ -621,6 +883,7 @@ struct ChildSpec {
     capture_limits: CaptureLimits,
     deadline: Duration,
     phase: Phase,
+    internal_registration: Option<InternalSpoolRegistration>,
 }
 
 #[derive(Clone, Copy)]
@@ -747,6 +1010,72 @@ fn render_remote_command(
     }
 }
 
+fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<String> {
+    let mut command = format!("exec sh -c {} codex-ssh-bridge-op", shell_word(script)?);
+    for argument in args {
+        command.push(' ');
+        command.push_str(&shell_word(argument)?);
+    }
+    Ok(command)
+}
+
+async fn fixed_capability_mismatch(
+    output: &InternalCapturedOutput,
+    required: &'static [&'static str],
+) -> BridgeResult<Option<String>> {
+    if output.stderr_len == 0 {
+        return Ok(None);
+    }
+    if output.stderr_len > 4096 {
+        return Ok(None);
+    }
+    let page = output.read(StreamKind::Stderr, 0, 4096).await?;
+    const PREFIX: &[u8] = b"CODE=CAPABILITY_MISMATCH\0";
+    if !page.bytes.starts_with(PREFIX) {
+        return Ok(None);
+    }
+    if output.stdout_len != 0 || !page.eof {
+        return Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "capability mismatch record is malformed",
+            false,
+        ));
+    }
+    let rest = &page.bytes[PREFIX.len()..];
+    let Some(value) = rest
+        .strip_prefix(b"CAPABILITY=")
+        .and_then(|value| value.strip_suffix(&[0]))
+    else {
+        return Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "capability mismatch record is malformed",
+            false,
+        ));
+    };
+    if value.is_empty() || value.contains(&0) {
+        return Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "capability mismatch record is malformed",
+            false,
+        ));
+    }
+    let key = std::str::from_utf8(value).map_err(|_| {
+        BridgeError::new(
+            ErrorCode::ProtocolError,
+            "capability mismatch key is invalid",
+            false,
+        )
+    })?;
+    if !required.contains(&key) {
+        return Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "capability mismatch named an unexpected key",
+            false,
+        ));
+    }
+    Ok(Some(key.to_owned()))
+}
+
 fn format_timeout_duration(timeout_ms: u64) -> BridgeResult<String> {
     if timeout_ms == 0 {
         return Err(BridgeError::invalid_argument(
@@ -804,8 +1133,8 @@ async fn finish_stdin_bounded(mut task: JoinHandle<std::io::Result<()>>) -> Brid
 }
 
 fn joined_capture(
-    result: Result<BridgeResult<CapturedOutput>, tokio::task::JoinError>,
-) -> BridgeResult<CapturedOutput> {
+    result: Result<BridgeResult<ChildCaptured>, tokio::task::JoinError>,
+) -> BridgeResult<ChildCaptured> {
     result.map_err(|error| BridgeError::new(ErrorCode::Io, error.to_string(), false))?
 }
 
@@ -822,8 +1151,8 @@ async fn finish_wait(task: JoinHandle<std::io::Result<ExitStatus>>) -> BridgeRes
 }
 
 async fn finish_capture_bounded(
-    mut task: JoinHandle<BridgeResult<CapturedOutput>>,
-) -> BridgeResult<CapturedOutput> {
+    mut task: JoinHandle<BridgeResult<ChildCaptured>>,
+) -> BridgeResult<ChildCaptured> {
     match timeout(DRAIN_GRACE, &mut task).await {
         Ok(result) => {
             result.map_err(|error| BridgeError::new(ErrorCode::Io, error.to_string(), false))?
@@ -897,7 +1226,7 @@ fn elapsed_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_probe_command, render_remote_command};
+    use super::{capability_probe_command, render_fixed_command, render_remote_command};
     use crate::capability::{ShellKind, parse_probe_output};
     use crate::error::ErrorCode;
     use crate::path::RemotePath;
@@ -959,5 +1288,26 @@ mod tests {
                 .code,
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn fixed_runner_render_uses_static_script_and_positional_values() {
+        let rendered = render_fixed_command(
+            "printf '%s\\0' \"$@\"",
+            &[
+                "quote'".to_owned(),
+                "line\n$()`".to_owned(),
+                "-x".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(rendered.starts_with("exec sh -c "));
+        assert!(rendered.contains(" codex-ssh-bridge-op "));
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &rendered])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"quote'\0line\n$()`\0-x\0");
     }
 }

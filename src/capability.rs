@@ -23,6 +23,13 @@ const TOOL_NAMES: &[&str] = &[
     "timeout",
     "ln",
     "mv",
+    "read_slice",
+    "find_nul",
+    "stat_printf",
+    "rg_json",
+    "grep_nul",
+    "xargs_nul",
+    "search_bound",
 ];
 
 pub const CAPABILITY_PROBE_SCRIPT: &str = r#"
@@ -89,6 +96,46 @@ if [ -n "$probe_tmp" ] && command -v dd >/dev/null 2>&1; then
     fi
 fi
 
+tool_read_slice=0
+tool_find_nul=0
+tool_stat_printf=0
+tool_rg_json=0
+tool_grep_nul=0
+tool_xargs_nul=0
+tool_search_bound=0
+if [ -n "$probe_tmp" ]; then
+    printf 'first\nsecond' >"$probe_tmp/read"
+    if [ "$(tail -n +2 -- "$probe_tmp/read" | head -n 1 | head -c 7)" = second ]; then
+        tool_read_slice=1
+    fi
+    mkdir "$probe_tmp/find"
+    newline_name='line
+name'
+    : >"$probe_tmp/find/$newline_name"
+    find_bytes=$(find "$probe_tmp/find" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | wc -c)
+    expected_find_bytes=$(printf '%s/find/%s\000' "$probe_tmp" "$newline_name" | wc -c)
+    if [ "$find_bytes" -eq "$expected_find_bytes" ]; then tool_find_nul=1; fi
+    stat_value=$(stat --printf='%f:%s' -- "$probe_tmp/read" 2>/dev/null || true)
+    case "$stat_value" in *:12) tool_stat_printf=1 ;; esac
+    if command -v rg >/dev/null 2>&1 && printf x | rg --json -F x 2>/dev/null | grep -F '"type":"match"' >/dev/null 2>&1; then
+        tool_rg_json=1
+    fi
+    printf x >"$probe_tmp/grep"
+    grep_bytes=$(grep -HnZ -F x "$probe_tmp/grep" 2>/dev/null | wc -c)
+    expected_grep_bytes=$({ printf '%s\000' "$probe_tmp/grep"; printf '1:x\n'; } | wc -c)
+    if [ "$grep_bytes" -eq "$expected_grep_bytes" ]; then tool_grep_nul=1; fi
+    xargs_value=$(printf 'line\nname\000' | xargs -0 sh -c 'printf %s "$1"' bridge 2>/dev/null || true)
+    if [ "$xargs_value" = "$newline_name" ]; then tool_xargs_nul=1; fi
+    if command -v mkfifo >/dev/null 2>&1; then
+        mkfifo "$probe_tmp/fifo"
+        (printf abc >"$probe_tmp/fifo") &
+        fifo_pid=$!
+        head -c 2 <"$probe_tmp/fifo" >"$probe_tmp/bounded"
+        wait "$fifo_pid" 2>/dev/null || true
+        if [ "$(cat "$probe_tmp/bounded")" = ab ]; then tool_search_bound=1; fi
+    fi
+fi
+
 emit_record CODEX_SSH_PROBE 1
 emit_record REQUESTED_ROOT "$requested_root"
 emit_record ROOT "$physical_root"
@@ -104,6 +151,13 @@ emit_record TOOL_rg "$(has_tool rg)"
 emit_record TOOL_timeout "$(has_gnu_timeout)"
 emit_record TOOL_ln "$(has_tool ln)"
 emit_record TOOL_mv "$(has_tool mv)"
+emit_record TOOL_read_slice "$tool_read_slice"
+emit_record TOOL_find_nul "$tool_find_nul"
+emit_record TOOL_stat_printf "$tool_stat_printf"
+emit_record TOOL_rg_json "$tool_rg_json"
+emit_record TOOL_grep_nul "$tool_grep_nul"
+emit_record TOOL_xargs_nul "$tool_xargs_nul"
+emit_record TOOL_search_bound "$tool_search_bound"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +346,15 @@ pub struct CapabilityCache {
 }
 
 impl CapabilityCache {
+    pub(crate) async fn get(&self, host: &str) -> Option<Arc<Capability>> {
+        let state = self.state.lock().await;
+        state
+            .entries
+            .get(host)
+            .and_then(|cell| cell.get())
+            .map(Arc::clone)
+    }
+
     pub async fn get_or_probe<F, Fut>(&self, host: &str, probe: F) -> BridgeResult<Arc<Capability>>
     where
         F: FnOnce() -> Fut,

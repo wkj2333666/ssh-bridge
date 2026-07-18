@@ -4,6 +4,7 @@ pub mod error;
 pub mod output;
 pub mod path;
 pub mod quote;
+pub mod remote;
 pub mod ssh;
 
 pub use error::{BridgeError, BridgeResult, ErrorCode, ErrorDetails};
