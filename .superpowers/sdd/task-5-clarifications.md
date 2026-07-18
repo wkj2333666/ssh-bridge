@@ -161,6 +161,11 @@ These decisions are binding Task 5 requirements.
     missing required command. An otherwise unexplained utility failure or
     scratch I/O/setup failure emits no closed mismatch record and is unknown;
     a silent nonzero exit is not by itself proof of capability drift.
+28. Parent classification is evidence-based. A provably missing ordinary path
+    component is `NotFound`, but a parent that is itself a dangling symlink is
+    `MutationOutcomeUnknown`: after the mutation child has spawned, failure to
+    follow that symlink cannot safely distinguish a missing referent from an
+    inaccessible or raced referent. The bridge must not retry that request.
 
 Implementation approach A is binding: production-shaped write/delete
 capabilities, cheap pre-mutation sentinels, one-shot static scripts, and strict

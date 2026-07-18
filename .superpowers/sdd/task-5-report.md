@@ -131,3 +131,17 @@ The library phase initially ran 19 tests: 18 passed and the pre-existing runner 
 - `.superpowers/sdd/task-5-report.md`
 
 No Python source or pycache content was changed.
+
+## Final second-review closure
+
+The final review added bounded-work and race-sampling requirements. Parent
+classification now performs at most 32 ancestor lstat attempts, treats a
+malformed closed stat record as unknown immediately, and only climbs after an
+operational stat failure. Decimal stat fields are checked exactly against
+`u64::MAX` without spawning another process. The five-host staging sampler
+ignores only `NotFound` between directory enumeration and `symlink_metadata`;
+all other lookup errors, non-regular entries, and non-0600 modes still fail.
+
+Fresh controller verification after those fixes passed `cargo fmt --check`,
+Clippy with warnings denied, and `cargo test --all-targets`: 34 library, 25
+core, 59 remote-operation, and 60 SSH-transport tests all passed.

@@ -266,7 +266,8 @@ The `safe_write` probe executes and verifies the complete production forms for:
   target-hash helper, including a separately captured producer status so a
   failed no-follow open cannot be mistaken for the empty-file digest;
 - `sha256sum --` with exact lowercase digest extraction;
-- `ln --` hard-link installation and collision no-clobber behavior;
+- `ln -T --` hard-link installation and collision no-clobber behavior,
+  including refusal to follow a target symlink to a directory;
 - `mv -T --` same-directory replacement;
 - GNU `chmod -h <mode> -- <operand>` on a regular file;
 - successful `chmod -h` on a symlink operand without changing the referent's
@@ -366,9 +367,12 @@ The write script performs these phases in one child.
 1. Initialize `tmp` to empty and install cleanup and signal traps.
 2. Run the `safe_write` sentinel in private scratch.
 3. Validate the positional protocol without copying caller data to output.
-4. Classify the parent with the shared exact `parent_stat_follow` helper:
-   absent/dangling is `NotFound` and an existing non-directory is
-   `NotDirectory`. Record the dereferenced directory's device and inode before
+4. Classify the parent with the shared exact `parent_stat_follow` helper: a
+   provably absent ordinary component is `NotFound`, an existing non-directory
+   is `NotDirectory`, and a parent that is itself a dangling symlink is
+   `MutationOutcomeUnknown`. A failed follow-stat cannot safely distinguish a
+   dangling referent from inaccessible or raced ancestry after spawn. Record
+   the dereferenced directory's device and inode before
    entry. This deliberately permits a configured-root or intermediate parent
    symlink.
 5. Use POSIX `cd "$parent"` (the parent is an already validated absolute
@@ -432,7 +436,7 @@ could affect safety.
 
 ### 8.4 Create commit
 
-Create calls `ln -- "$tmp" "$target"`. A collision, including a target created
+Create calls `ln -T -- "$tmp" "$target"`. A collision, including a target created
 during upload, is `WriteConflict`. Other unproven link failures do not produce
 a false domain result.
 

@@ -268,7 +268,7 @@ codex_hash_nofollow() {
     case "$codex_hash_digest" in *[!0-9a-f]*) return 1 ;; esac
 }
 codex_mode() { chmod -h "$1" -- "$2"; }
-codex_link() { ln -- "$1" "$2"; }
+codex_link() { ln -T -- "$1" "$2"; }
 codex_replace() { mv -T -- "$1" "$2"; }
 codex_remove() { rm -f -- "$1"; }
 ```
