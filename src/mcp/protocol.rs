@@ -17,6 +17,7 @@ pub const MAX_JSON_NODES: usize = 262_144;
 pub const MAX_JSON_OBJECT_MEMBERS: usize = 131_072;
 pub const MAX_JSON_KEY_BYTES: usize = 1_048_576;
 pub const MAX_REQUEST_ID_WIRE_BYTES: usize = 256;
+pub const MAX_INVALID_ARGUMENT_ACTION_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RequestId {
@@ -73,10 +74,10 @@ impl TryFrom<Value> for RequestId {
 }
 
 fn string_wire_len_at_most(value: &str, maximum: usize) -> bool {
-    escaped_json_string_len(value).is_some_and(|length| length <= maximum)
+    escaped_json_string_len(value, maximum).is_some_and(|length| length <= maximum)
 }
 
-fn escaped_json_string_len(value: &str) -> Option<usize> {
+fn escaped_json_string_len(value: &str, maximum: usize) -> Option<usize> {
     let mut length = 2_usize;
     for byte in value.bytes() {
         let encoded = match byte {
@@ -85,7 +86,7 @@ fn escaped_json_string_len(value: &str) -> Option<usize> {
             _ => 1,
         };
         length = length.checked_add(encoded)?;
-        if length > MAX_REQUEST_ID_WIRE_BYTES {
+        if length > maximum {
             return Some(length);
         }
     }
@@ -157,8 +158,13 @@ impl CallToolResult {
         }
     }
 
-    pub fn invalid_argument(actionable_safe_text: impl Into<String>) -> Self {
-        let action = actionable_safe_text.into();
+    pub fn invalid_argument(actionable_safe_text: &'static str) -> Self {
+        let action = if actionable_safe_text.len() <= MAX_INVALID_ARGUMENT_ACTION_BYTES {
+            actionable_safe_text
+        } else {
+            "provide valid tool arguments"
+        }
+        .to_owned();
         let compact = serde_json::to_string(&serde_json::json!({
             "error": {
                 "code": "INVALID_ARGUMENT",
@@ -307,7 +313,7 @@ impl StrictValueSeed {
     }
 
     fn reject_structure<E: de::Error>(&self) -> E {
-        self.marker.set(StrictFailureMarker::StructuralBudget);
+        mark_failure(&self.marker, StrictFailureMarker::StructuralBudget);
         E::custom("JSON structural budget exceeded")
     }
 
@@ -328,28 +334,102 @@ impl StrictValueSeed {
         Ok(())
     }
 
-    fn enter_member<E: de::Error>(&self, key_bytes: usize) -> Result<(), E> {
+    fn key_seed(&self) -> StrictKeySeed {
+        StrictKeySeed {
+            counters: Rc::clone(&self.counters),
+            marker: Rc::clone(&self.marker),
+        }
+    }
+
+    fn reject_duplicate<E: de::Error>(&self) -> E {
+        mark_failure(&self.marker, StrictFailureMarker::DuplicateKey);
+        E::custom("duplicate JSON object key")
+    }
+}
+
+fn mark_failure(marker: &Cell<StrictFailureMarker>, failure: StrictFailureMarker) {
+    if marker.get() == StrictFailureMarker::None {
+        marker.set(failure);
+    }
+}
+
+#[derive(Clone)]
+struct StrictKeySeed {
+    counters: Rc<RefCell<StructuralCounters>>,
+    marker: Rc<Cell<StrictFailureMarker>>,
+}
+
+impl StrictKeySeed {
+    fn reject_structure<E: de::Error>(&self) -> E {
+        mark_failure(&self.marker, StrictFailureMarker::StructuralBudget);
+        E::custom("JSON structural budget exceeded")
+    }
+
+    fn reserve_member<E: de::Error>(&self) -> Result<(), E> {
         let mut counters = self.counters.borrow_mut();
         let Some(object_members) = counters.object_members.checked_add(1) else {
             drop(counters);
             return Err(self.reject_structure());
         };
-        let Some(total_key_bytes) = counters.key_bytes.checked_add(key_bytes) else {
-            drop(counters);
-            return Err(self.reject_structure());
-        };
-        if object_members > MAX_JSON_OBJECT_MEMBERS || total_key_bytes > MAX_JSON_KEY_BYTES {
+        if object_members > MAX_JSON_OBJECT_MEMBERS {
             drop(counters);
             return Err(self.reject_structure());
         }
         counters.object_members = object_members;
-        counters.key_bytes = total_key_bytes;
         Ok(())
     }
 
-    fn reject_duplicate<E: de::Error>(&self) -> E {
-        self.marker.set(StrictFailureMarker::DuplicateKey);
-        E::custom("duplicate JSON object key")
+    fn reserve_decoded_key_bytes<E: de::Error>(&self, bytes: usize) -> Result<(), E> {
+        let mut counters = self.counters.borrow_mut();
+        let Some(key_bytes) = counters.key_bytes.checked_add(bytes) else {
+            drop(counters);
+            return Err(self.reject_structure());
+        };
+        if key_bytes > MAX_JSON_KEY_BYTES {
+            drop(counters);
+            return Err(self.reject_structure());
+        }
+        counters.key_bytes = key_bytes;
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for StrictKeySeed {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.reserve_member()?;
+        deserializer.deserialize_str(StrictKeyVisitor { seed: self })
+    }
+}
+
+struct StrictKeyVisitor {
+    seed: StrictKeySeed,
+}
+
+impl<'de> Visitor<'de> for StrictKeyVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded JSON object key")
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        self.seed.reserve_decoded_key_bytes(value.len())?;
+        Ok(value.to_owned())
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        self.seed.reserve_decoded_key_bytes(value.len())?;
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        self.seed.reserve_decoded_key_bytes(value.len())?;
+        Ok(value)
     }
 }
 
@@ -428,11 +508,11 @@ impl<'de> Visitor<'de> for StrictValueVisitor {
     {
         let mut object = Map::new();
         let child = self.seed.child()?;
-        while let Some(key) = entries.next_key::<String>()? {
+        let key_seed = self.seed.key_seed();
+        while let Some(key) = entries.next_key_seed(key_seed.clone())? {
             if object.contains_key(&key) {
                 return Err(self.seed.reject_duplicate());
             }
-            self.seed.enter_member(key.len())?;
             let value = entries.next_value_seed(child.clone())?;
             object.insert(key, value);
         }
