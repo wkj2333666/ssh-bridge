@@ -1,5 +1,7 @@
 # Codex SSH Bridge Rust Implementation Plan
 
+Status: Ready; Tasks 7–8 strict MCP review incorporated
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the audited Python prototype with a fast, bounded, security-hardened Rust MCP/CLI that uses local OpenSSH to operate allowlisted Linux servers without installing Codex remotely.
@@ -75,14 +77,14 @@
 - Create: `config.example.toml`
 
 **Interfaces:**
-- Produces: `BridgeError { code: ErrorCode, message: String, retryable: bool, details: ErrorDetails }` and `type BridgeResult<T> = Result<T, BridgeError>`.
+- Produces: `BridgeError { code: ErrorCode, message: String, retryable: bool, details: ErrorDetails }`, optional bounded `ErrorDetails.physical_root`, non-overwriting `attach_available_remote_context`, and `type BridgeResult<T> = Result<T, BridgeError>`.
 - Produces: `quote::shell_word(&str) -> BridgeResult<String>` and `quote::fixed_command(script: &str, args: &[&str]) -> BridgeResult<String>`.
 - Produces: `RemotePath::resolve(root: &str, requested: &str) -> BridgeResult<RemotePath>` with `absolute()` and `relative()` accessors.
-- Produces: `Config::load(path: &Path)`, `Config::save_atomic(path: &Path)`, and `Config::host(alias: &str)`.
+- Produces: `Config::load(path: &Path)`, `Config::save_atomic(path: &Path)`, `Config::host(alias: &str)`, and shared `MAX_REMOTE_CONTEXT_ROOT_BYTES=65_536`.
 
 - [ ] **Step 1: Add the failing core tests**
 
-Create tests that prove shell encoding round-trips through `/bin/sh`, NUL is rejected, `..` cannot escape, exact aliases are required, unknown TOML fields fail, limits cannot exceed compiled ceilings, unsafe configuration modes fail, and an environment-overridden config path is explicitly marked as trusted execution-authority input in diagnostics. Include this property test:
+Create tests that prove shell encoding round-trips through `/bin/sh`, NUL is rejected, `..` cannot escape, exact aliases are required, unknown TOML fields fail, limits cannot exceed compiled ceilings, unsafe configuration modes fail, and an environment-overridden config path is explicitly marked as trusted execution-authority input in diagnostics. Configured normalized roots accept exactly 65,536 UTF-8 bytes and reject one more; non-ASCII cases prove byte rather than character counting. Error serialization includes bounded physical root when known and omits it before probe. Include this property test:
 
 ```rust
 proptest! {
@@ -113,6 +115,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
 pub const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_REMOTE_CONTEXT_ROOT_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -132,6 +135,11 @@ pub fn shell_word(value: &str) -> BridgeResult<String> {
 ```
 
 Define `Config` with `#[serde(deny_unknown_fields)]`, a `BTreeMap<String, HostProfile>`, defaults matching the global constraints, and a host alias regex equivalent to `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. On Unix, validate regular-file type, current UID ownership, and no group/other write bits before loading. Atomic saves use a same-directory `NamedTempFile`, mode `0600`, `sync_all`, then persist.
+
+Validate normalized configured roots against
+`MAX_REMOTE_CONTEXT_ROOT_BYTES` using UTF-8 bytes. `ErrorDetails` has optional
+`physical_root`; `attach_available_remote_context` fills missing host/root/shell
+without overwriting an existing domain code, retryability, or progress.
 
 `RemotePath::resolve` must normalize components lexically without filesystem access, reject NUL and `ParentDir` that would escape root, accept absolute paths only when they begin at the normalized root component boundary, and retain both normalized absolute and root-relative strings.
 
@@ -175,7 +183,8 @@ git commit -m "feat: add Rust bridge core primitives"
 - Consumes: `Config`, `HostProfile`, `RemotePath`, `shell_word`, `BridgeResult`.
 - Produces: `SshPolicy::for_host(&Config, ResolvedHost<'_>, &RuntimePaths, resolved_connection_identity: &str) -> BridgeResult<SshPolicy>`. The later runner obtains `resolved_connection_identity` from system `ssh -G`; Task 2 uses a stable fixture string and does not reimplement OpenSSH config parsing.
 - Produces: `build_ssh_argv(&SshPolicy, host: &str, remote_command: &str) -> Vec<OsString>`.
-- Produces: `Capability { physical_root, shell: ShellKind, bash_version, tools }`.
+- Produces: `Capability { physical_root, shell: ShellKind, bash_version, tools }`
+  with shared `MAX_SHELL_VERSION_BYTES=256` enforced before caching.
 - Produces: async `CapabilityCache::get_or_probe(host, probe_fn)` backed by a per-host Tokio `OnceCell`, so concurrent callers share one probe future, plus async `invalidate(host)`.
 - Produces: `parse_probe_output(output: &[u8], expected_requested_root: &RemotePath) -> BridgeResult<Capability>` for strict NUL-delimited `key=value` records.
 
@@ -189,7 +198,7 @@ Feed the probe parser fixed NUL-delimited output for Bash and sh-only hosts (the
 CODEX_SSH_PROBE=1\0REQUESTED_ROOT=/srv/project\0ROOT=/srv/project\0SHELL_KIND=bash\0BASH_VERSION=5.2.15\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=1\0
 ```
 
-Assert malformed, duplicated, unknown-version, and root-mismatch output fails closed. Assert a capability failure invalidates exactly one host cache entry.
+Assert malformed, duplicated, unknown-version, and root-mismatch output fails closed. Probed physical `ROOT` imports the shared configured-root constant, accepts exactly 65,536 UTF-8 bytes, rejects +1, and has non-ASCII byte-bound cases. Bash-version values accept exactly 256 UTF-8 bytes and reject +1, including non-ASCII boundaries and malicious fake-Bash records, before shell metadata reaches any result or error. Assert a capability failure invalidates exactly one host cache entry.
 
 - [ ] **Step 2: Run the focused tests and verify red**
 
@@ -201,7 +210,7 @@ Expected: compilation fails for missing `ssh` and `capability` modules.
 
 Create runtime paths below `XDG_RUNTIME_DIR/codex-ssh-bridge` or `/tmp/codex-ssh-bridge-<uid>`. Refuse symlinks, wrong ownership, or permissions other than `0700`. Hash the alias and resolved connection identity into a short ControlPath filename without exposing it to the Agent.
 
-Build a compile-time probe script that performs `cd -- "$1"`, emits both the exact requested root and `pwd -P`, checks `command -v` for required tools, tests `dd oflag=nofollow` in a private temporary directory, and removes that directory with a trap. Emit strict NUL-delimited `key=value` records so roots containing newlines remain representable. Parse only the versioned keys the bridge defines; do not use `eval`. Require `REQUESTED_ROOT` to equal the expected normalized configured root; require physical `ROOT` to be normalized and absolute but allow it to differ when the configured root traverses symlinks.
+Build a compile-time probe script that performs `cd -- "$1"`, emits both the exact requested root and `pwd -P`, checks `command -v` for required tools, tests `dd oflag=nofollow` in a private temporary directory, and removes that directory with a trap. Emit strict NUL-delimited `key=value` records so roots containing newlines remain representable. Parse only the versioned keys the bridge defines; do not use `eval`. Require `REQUESTED_ROOT` to equal the expected normalized configured root; require physical `ROOT` to be normalized, absolute, and within the shared UTF-8 byte ceiling, but allow it to differ when the configured root traverses symlinks. Enforce exported `MAX_SHELL_VERSION_BYTES=256` against UTF-8 bytes while parsing `BASH_VERSION`; MCP imports it rather than redeclaring it.
 
 Represent shell selection exactly as:
 
@@ -310,7 +319,7 @@ git commit -m "feat: add cancellable SSH execution and bounded output"
 
 - [ ] **Step 1: Write failing high-level read tests**
 
-Use a temporary local filesystem behind the fake SSH transport. Test batched reads, binary detection/local Base64 encoding, line/byte limits, hashes, hidden/depth entry limits, exact stat types, `rg` selection, grep/find fallback, paths with quotes/newlines/leading hyphens, and root traversal rejection before process launch.
+Use a temporary local filesystem behind the fake SSH transport. Test batched reads, binary detection/local Base64 encoding, line/byte limits, hashes, hidden/depth entry limits, exact stat types, `rg` selection, grep/find fallback, paths with quotes/newlines/leading hyphens, and root traversal rejection before process launch. Inject exit-zero malformed read/list/stat/search records and assert new domain/protocol errors retain the available host/physical-root/shell through `attach_available_remote_context`.
 
 Assert result serialization includes `remote: true`, `host`, and `physical_root` for every entry.
 
@@ -322,7 +331,7 @@ Expected: missing `RemoteBridge` methods cause compilation failure.
 
 - [ ] **Step 3: Implement fixed scripts and parsers**
 
-Each operation uses a compile-time script plus encoded positional arguments. Stream file bytes directly and hash locally when the full requested content is present; obtain a remote SHA-256 for version identity when reads are truncated. Use NUL-delimited internal records for list/stat/search where Linux tools support them, then parse with explicit entry ceilings.
+Each operation uses a compile-time script plus encoded positional arguments. Stream file bytes directly and hash locally when the full requested content is present; obtain a remote SHA-256 for version identity when reads are truncated. Use NUL-delimited internal records for list/stat/search where Linux tools support them, then parse with explicit entry ceilings. Every facade/parser return path attaches available safe remote context to newly created errors without overwriting their classification.
 
 `search` chooses `rg --json` when probed, otherwise a bounded `find -print0` plus `grep` path. Query and glob values remain positional/data inputs. Reject unsupported binary search in the fallback with a typed capability error.
 
@@ -355,7 +364,7 @@ git commit -m "feat: add high-level remote read operations"
 
 - [ ] **Step 1: Add the adversarial failing tests**
 
-Recreate the Python prototype exploit by predicting/replacing candidate temporary names with symlinks to an outside file. Assert the outside content never changes. Also test dangling target symlinks, create-only collision, target created during write, expected-hash mismatch, interrupted transfer cleanup, mode `0600`, same-directory install, read-only profile rejection, and a filename containing all shell metacharacter classes.
+Recreate the Python prototype exploit by predicting/replacing candidate temporary names with symlinks to an outside file. Assert the outside content never changes. Also test dangling target symlinks, create-only collision, target created during write, expected-hash mismatch, interrupted transfer cleanup, mode `0600`, same-directory install, read-only profile rejection, and a filename containing all shell metacharacter classes. Write-conflict/snapshot/domain errors created after capability selection must retain host/physical-root/shell without changing conflict or mutation truth.
 
 - [ ] **Step 2: Run safe-write tests and verify red**
 
@@ -377,7 +386,7 @@ test -f "$tmp" && test ! -L "$tmp" || exit 72
 
 Pass script/path/mode/hash as encoded arguments rather than interpolating them. Verify ownership/size/hash. For create, `ln -- "$tmp" "$target"` and then unlink the temp, treating `EEXIST` as `WriteConflict`. For replace, recheck expected SHA-256 immediately before `mv -T -- "$tmp" "$target"`. Return exact typed conflicts and cleanup evidence.
 
-The Rust parent computes the content SHA-256 while streaming and checks the remote reported value. It must not retry a mutating write automatically after an ambiguous disconnect.
+The Rust parent computes the content SHA-256 while streaming and checks the remote reported value. It must not retry a mutating write automatically after an ambiguous disconnect. Newly parsed conflict/protocol errors pass through the shared non-overwriting remote-context helper.
 
 - [ ] **Step 4: Verify safe writes and the exploit regression**
 
@@ -408,7 +417,7 @@ git commit -m "feat: add symlink-safe remote writes"
 
 - [ ] **Step 1: Write failing parser and orchestration tests**
 
-Cover multi-hunk updates, multiple files, create/delete, no-newline marker, malformed ranges, overlapping hunks, absolute/traversal paths, binary markers, base mismatch, all-bases-validated-before-write, and accurate partial-change reporting when the second write fails.
+Cover multi-hunk updates, multiple files, create/delete, no-newline marker, malformed ranges, overlapping hunks, absolute/traversal paths, binary markers, base mismatch, all-bases-validated-before-write, and accurate partial-change reporting when the second write fails. Patch result/progress parse errors after a fixed child completes retain available host/physical-root/shell and exact changed/not-changed/unknown partitions.
 
 - [ ] **Step 2: Run patch tests and verify red**
 
@@ -420,7 +429,7 @@ Expected: missing patch parser and bridge method fail compilation.
 
 Parse line-by-line with explicit file/hunk state and checked integer arithmetic. Require every context/deletion line to match the downloaded base byte-for-byte. Preserve final-newline state. Cap file count, hunk count, and total output under configured write ceilings.
 
-`apply_patch` first resolves every path and reads every base/version, then computes every output. Only after all validation succeeds does it call guarded write/delete sequentially. Record `changed_paths` after each confirmed operation; on failure return those paths plus `not_changed_paths` and the underlying typed error.
+`apply_patch` first resolves every path and reads every base/version, then computes every output. Only after all validation succeeds does it call guarded write/delete sequentially. Record `changed_paths` after each confirmed operation; on failure return those paths plus `not_changed_paths` and the underlying typed error. Attach available safe remote context at parser/facade boundaries without overwriting progress.
 
 - [ ] **Step 4: Verify all patch behavior**
 
@@ -453,7 +462,7 @@ git commit -m "feat: add guarded remote patch application"
 
 - [ ] **Step 1: Write failing protocol state and frame tests**
 
-Test valid initialize flow plus JSON-RPC 1.0 rejection, non-object valid JSON (`-32600`), parse error (`-32700`), invalid/null IDs, tool calls before initialization, duplicated initialize, unknown methods, notifications without responses, oversized line rejection before JSON allocation, and cancellation read while another tool future is blocked.
+Test valid initialize flow for both supported versions plus JSON-RPC 1.0 rejection, non-object valid JSON (`-32600`), parse error (`-32700`), invalid/null/overlong IDs, requested-version `clientInfo`, unsupported-version bounded-current-union behavior, open capabilities and `_meta`, ping in AwaitInitialized and Ready, tool calls before initialization, duplicated initialize, unknown methods, notifications without responses, exact `DuplicateKey`/`StructuralBudget`/`Syntax` classification, oversized/over-depth/over-node/member/key-byte input rejection before excess allocation, wide-array/object RSS, exact frame minimum/minimum-minus-one, and cancellation read while another tool future is blocked. Add a two-version official golden matrix for initialize/ping/initialized/list/call/cancelled: 2025-06 accepts bounded extra top-level params and ignores/never reflects them; 2025-11 rejects fields outside official method shapes while keeping object `_meta` open; closed tool `arguments` stay closed in both, unnegotiated `task` is rejected, and invalid notifications cause no state/cancellation effect.
 
 - [ ] **Step 2: Run protocol tests and verify red**
 
@@ -465,13 +474,17 @@ Expected: missing MCP server fails compilation.
 
 Read with `AsyncBufReadExt::fill_buf`, scanning for newline while counting bytes; discard and return `REQUEST_TOO_LARGE` once 8 MiB is exceeded without constructing a larger `String` or `Value`. Parse only complete UTF-8 JSON lines.
 
-Keep lifecycle state in one owner task. Dispatch valid tool calls into a bounded `JoinSet` and map `RequestId` to cancellation tokens. Serialize all responses through one writer task/channel so JSON lines cannot interleave. On `notifications/cancelled`, cancel immediately without waiting for the tool task.
+Keep lifecycle state in one owner task. Dispatch valid tool calls into a bounded `JoinSet` and map bounded `RequestId` to cancellation tokens. Serialize all responses through one writer task/channel so JSON lines cannot interleave. On `notifications/cancelled`, cancel immediately without waiting for the tool task and suppress its response.
 
-Negotiate the MCP protocol version from the supported set declared in one constant and return server name/version/capabilities. Reject unknown fields in tool arguments at the tools layer.
+Negotiate exactly `2025-11-25` and `2025-06-18` from one constant and return server name/version/capabilities. Supported versions validate their requested shape: name/title/version for 2025-06-18 and those plus icons/description/websiteUrl for 2025-11-25. An unsupported version validates the bounded current 2025-11 union before selecting latest; latest-only fields pass there while fields outside the union fail. Use bounded absolute URIs and fixed non-echoing errors. For the six supported methods, negotiated June shapes collect and discard bounded additional top-level params, while November shapes use official closed fields; both keep object `_meta` and client capabilities open. Reject unnegotiated `task` and unknown fields in tool arguments at the tools layer.
+
+The strict visitor enforces depth, node, aggregate member, and key-byte budgets, uses one shared failure marker to distinguish duplicate/structural/genuine-syntax errors, and reuses the destination `serde_json::Map` for duplicate detection rather than a second cloned-key set. A malformed tools/call envelope or unknown name is `-32602`; known-tool argument validation returns an actionable normal `isError=true` result and launches no bridge operation.
+
+Define compiled `MIN_MCP_FRAME_BYTES=1024*1024` with a static checked formula covering the shared 65,536-byte root ceiling times conservative combined expansion 13, a maximum 256-byte wire ID, and 64 KiB fixed reserve; known context cannot be truncated. Error rendering derives a context-free `RenderedErrorCore`: Text carries context once and structured top level once, while `structuredContent.error.details` excludes host/root/shell. An authoritative counting test begins with a real maximum `BridgeError`/`ErrorDetails` containing the maximum control-heavy root and shared 256-byte shell version plus maximum bounded message/action/warnings, projects it, proves only those two root contexts remain, and fits the compiled minimum. Server construction also counting-serializes the trusted exact full nine-tool list with a synthetic maximum wire ID and rejects anything below the larger minimum. Test exact effective minimum/minus-one with both the full list and real worst fallback. `max_frame_bytes` and `WireBudget` exclude the newline delimiter. Every tool future receives `ToolCallContext { cancel, wire_budget }`, passing the exact token to the bridge and budget to validation/success/error renderers. Every bulk tool has a compact fallback; completed mutation truth/counts can never become `-32603`. Retention is best-effort and uses a bridge-owned direct-to-spool generic facade with typed remote/aggregate provenance, never direct MCP access to `OutputStore` or another full-size buffer.
 
 - [ ] **Step 4: Verify strict MCP behavior**
 
-Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test mcp_protocol`
+Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test mcp_protocol && cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture`
 
 Expected: exact JSON-RPC codes and no pre-initialize tool execution.
 
@@ -488,18 +501,28 @@ git commit -m "feat: add strict asynchronous MCP protocol"
 
 **Files:**
 - Create: `src/mcp/tools.rs`
+- Create: `src/mcp/render.rs`
 - Modify: `src/mcp/mod.rs`
+- Modify: `src/config.rs`
+- Modify: `config.example.toml`
+- Modify: `src/remote/mod.rs`
+- Modify: `src/output.rs`
+- Modify: `src/ssh/process.rs`
 - Modify: `tests/mcp_protocol.rs`
+- Create: `tests/mcp_tools.rs`
+- Modify: `tests/core.rs`
+- Modify: `tests/ssh_transport.rs`
+- Modify: `tests/remote_ops.rs`
 
 **Interfaces:**
-- Consumes: every `RemoteBridge` high-level operation and `OutputStore` paging.
+- Consumes: every `RemoteBridge` high-level operation and bridge-owned opaque-reference paging; MCP never imports `OutputStore`.
 - Produces exact schemas and handlers for `remote_hosts`, `remote_list`, `remote_stat`, `remote_search`, `remote_read`, `remote_output_read`, `remote_apply_patch`, `remote_write`, and `remote_run`.
 
 - [ ] **Step 1: Add failing schema and result tests**
 
-Assert the exact nine-tool list, `remote_` names, required host fields, `additionalProperties=false`, size/range constraints, read-only/destructive/open-world annotations, server-side read-only rejection, automatic probe behavior, shell/fallback metadata, and remote labels.
+Assert the exact nine-tool list, `remote_` names, required host fields, `additionalProperties=false`, size/range constraints, read-only/destructive/open-world annotations, server-side read-only rejection, automatic probe behavior, shell/fallback metadata, actionable sh warnings on success and errors, and remote labels.
 
-Serialize 1 MiB and hostile NUL-heavy output and assert payload appears in only one MCP content representation, total wire size remains within response budget, and structured content contains metadata rather than duplicate stdout/stderr.
+Serialize 1 MiB and hostile NUL-heavy output and assert payload appears in only one MCP content representation, the text block's JSON itself contains remote/host/root/shell plus bulk, total wire size remains within response budget, and structured content repeats only small metadata rather than stdout/stderr or other bulk. Bridge-error text is compact JSON with every available remote context plus bounded safe error/warning fields; `RenderedErrorCore` prevents nested structured error details from repeating host/root/shell. Force compact fallbacks for hosts/list/stat/search/read/output-read/run and applied/partial/unknown mutations. Assert truth/counts survive without `-32603`; inject retention success and storage/admission failure for each new read-only ref and mutation detail. Retention tests use actual serialized canonical sizes at exactly `MAX_OUTPUT_BYTES` and +1, cancellation and serializer failure, proving false/no-ref and zero temp residue on failure plus TTL, disk-admission, and concurrency bounds. Use more than five configured hosts without probing. Test aggregate host-list output paging and single-host provenance, plus multi-page UTF-8/Base64 reassembly where shrunk pages use raw-byte offsets with no gaps/overlaps. Release RSS cases for large retained hosts/list/stat/search prove no second full-size vector/JSON clone.
 
 - [ ] **Step 2: Run tool tests and verify red**
 
@@ -511,18 +534,36 @@ Expected: missing tool registry/handlers fail compilation.
 
 Deserialize each argument object into a dedicated `#[serde(deny_unknown_fields)]` struct. Resolve aliases only through `Config::host`. Let `RemoteBridge` own probe, quoting, limits, and errors; handlers only translate typed requests/results.
 
-Render one concise text content block for Agent-visible payload plus `structuredContent` metadata without payload duplication. Large command output returns head/tail preview and `output_ref`; file content uses a single text or Base64 content block. Include actual shell metadata on `remote_run` even after failure where selection occurred.
+Render one compact-JSON text content block containing remote/host/root/shell context and the Agent-visible payload, plus `structuredContent` small metadata without payload duplication. Construct typed projections directly; never serialize a complete result/error and then delete or clone fields. Error message/action are bounded to 1,024 UTF-8 bytes, with at most 16 warnings of 1,024 bytes, UTF-8-boundary truncation flags, and no truncation of code/context/truth/counts/progress. Large bulk results adapt to `ToolCallContext.wire_budget`. Output-read shrink selects raw bytes before UTF-8/Base64 encoding, then sets `next_offset=offset+actual_inline_raw_bytes` and EOF from the actual stored position. Include actual shell metadata and an actionable Bashism warning in compact-JSON `remote_run` errors as well as successes after sh selection. Compact mutation fallbacks preserve status, progress counts, and `mutation_may_have_applied`.
+
+Define `RetentionProvenance::{Remote(RemoteContext), Aggregate { kind, source_count }}` and carry it through `OutputReadResult`; aggregate pages omit fabricated single-host context. A generic `RemoteBridge::retain_serialized_detail<T: Serialize + Send + 'static>` serializes the owned model directly to bounded private spool storage (offloading blocking work as needed), so MCP never receives store access or creates another large buffer. Enforce crate-root `MAX_OUTPUT_BYTES=64 MiB` on actual serialized canonical bytes with a counting/capped writer: exact succeeds and first +1 byte fails.
+
+Add `Limits.global_spool_quota_bytes` (512 MiB default, compiled `MIN_GLOBAL_SPOOL_QUOTA_BYTES=64 MiB` and maximum 512 MiB), `Limits.retention_serialization_jobs` (two default, four maximum), and compiled `MAX_SPOOL_ENTRIES=1024` pending-plus-committed slots with at most two files per entry. Validate quota config in the inclusive `[64 MiB, 512 MiB]` range. A shared ledger covers command stdout/stderr, fixed-command internal capture, and retained detail. Command/internal writers reserve actual next chunks, release partial tails, and roll back failures; exact quota succeeds and only the next racing byte fails. On a fresh store, five maximum outputs total 320 MiB plus two default retention reservations total 128 MiB, so 448 MiB fits with 64 MiB remaining. Light calls avoid theoretical-max rejection. Test this combined fresh-store case explicitly.
+
+At MCP bootstrap, copy the two validated spool limit values before moving the loaded config and pass them explicitly to `OutputStore::with_limits`. Constructor tests use non-default quota values across 64--511 MiB and job counts across 1--4, proving both configuration fields have real consumers and are not replaced by store defaults.
+
+Generic detail retention first `try_acquire`s its job permit, then an entry slot, then a full crate-root `MAX_OUTPUT_BYTES` quota reservation before `spawn_blocking`; a miss returns false/no-ref without serialization CPU. Its capped writer checks cancel at least every 64 KiB, and the async path always awaits the blocking join and cleanup. Commit shrinks the reservation to actual bytes. Command/internal saturation remains typed `OUTPUT_LIMIT`; detail saturation/overflow/cancellation/serializer failure returns false/no-ref without losing truth/counts. Release byte charge only after unlink succeeds or `NotFound`; other unlink errors retain charge and a retry tombstone. Release the entry slot only after all files are gone; expiry/removal/shutdown use the same order. Tests cover exact quota/next-byte races, exact 1,024/next-slot and two-file limits, job saturation, light internal capture, partial writes, 64 KiB cancellation, awaited joins, unlink failure retry, no premature ledger/slot/permit release, TTL/shutdown, and worst cases `spool_bytes <= 512 MiB`, `spool_files <= 2048` independent of inflight calls.
+
+Under one entry lock, `OutputStore::read` checks expiry and synchronously opens
+a new independent handle for the selected private pathname; only after open
+succeeds does it create the ref-counted byte/entry lease and release the lock.
+It never publishes a lease before open, keeps no FD per committed entry, and
+never clones a shared cursor. TTL/discard that wins removes and unlinks the
+entry, while a reader that wins finishes from its own handle and pins
+charge/slot until final close. Test both lock orders, the former
+lease-before-open window, 1,024 entries without resident-FD amplification,
+concurrent different-offset pages, and last-reader release.
 
 - [ ] **Step 4: Verify the complete MCP surface**
 
-Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test mcp_protocol`
+Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test mcp_protocol && cargo test --test mcp_tools && cargo test --release --test mcp_tools task78_release_dispatch_p95_ -- --nocapture && cargo test --release --test mcp_tools task78_release_fake_call_p95_ -- --nocapture && cargo test --release --test mcp_tools task8_five_hosts_ -- --nocapture && cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture && cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture`
 
-Expected: all lifecycle, schema, cancellation, readonly, and amplification tests pass.
+Expected: lifecycle, schema, cancellation, readonly, amplification, dispatch/fake-call p95, five-host, release cancellation, and RSS gates pass. Task 11 still repeats and records the final whole-product/real-SSH acceptance.
 
 - [ ] **Step 5: Commit Task 8**
 
 ```bash
-git add src/mcp tests/mcp_protocol.rs
+git add src/mcp src/config.rs config.example.toml src/remote/mod.rs src/output.rs src/ssh/process.rs tests/core.rs tests/mcp_protocol.rs tests/mcp_tools.rs tests/ssh_transport.rs tests/remote_ops.rs
 git commit -m "feat: expose high-level remote MCP tools"
 ```
 
@@ -647,7 +688,7 @@ git commit -m "feat: package Rust SSH bridge plugin"
 
 - [ ] **Step 1: Add acceptance tests before recording results**
 
-The release-only performance test must measure at least 100 dispatches/fake calls for p95, five concurrent one-second commands, cancellation latency, 64 MiB output RSS delta, and maximum MCP wire bytes. The real-SSH test creates an isolated local `sshd` fixture when facilities permit and otherwise prints one explicit skip reason; it tests host keys, ControlMaster reuse, Bash/sh metadata, raw command, read/search/patch/write, timeout, and cleanup.
+The release-only performance test must measure at least 100 dispatches/fake calls for p95, five concurrent one-second commands, cancellation latency, 64 MiB output RSS delta, maximum-budget wide JSON array/object RSS deltas below 48 MiB, and maximum MCP wire bytes. Run the wide array and wide object in separate fresh release child processes. Each child records an idle/warmed baseline, samples peak during repeated parsing, prints raw baseline/peak/delta, and asserts `peak-baseline < 48 MiB`; never reuse one test-binary process where allocator-retained memory or parallel tests can contaminate the second shape. Task 11 deliberately repeats the Tasks 7–8 wide-JSON gate as final whole-product acceptance. The real-SSH test creates an isolated local `sshd` fixture when facilities permit and otherwise prints one explicit skip reason; it tests host keys, ControlMaster reuse, Bash/sh metadata, raw command, read/search/patch/write, timeout, and cleanup.
 
 - [ ] **Step 2: Run acceptance tests to expose remaining failures**
 
