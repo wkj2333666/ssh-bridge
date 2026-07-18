@@ -1519,9 +1519,16 @@ mod tests {
             .env(CHILD_ENV, "1")
             .output()
             .unwrap();
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{stdout}");
+        eprint!("{stderr}");
         assert!(output.status.success(), "fresh quote RSS child failed");
+        assert!(
+            stdout.contains("quote admission release RSS:")
+                || stderr.contains("quote admission release RSS:"),
+            "fresh quote RSS child did not run the requested test"
+        );
     }
 
     fn quote_admission_rss_child() {
