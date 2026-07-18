@@ -3,6 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crate::capability::{ShellKind, ShellSelection};
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalCapturedOutput, StreamKind};
+use crate::ssh::FixedRunResult;
 
 use super::{
     EncodedValue, EntryError, EntryErrorCode, RemoteContext, RemoteFileKind, ShellMetadata,
@@ -62,34 +63,220 @@ pub(super) fn context(
     }
 }
 
-pub(super) async fn read_stream(
+const CURSOR_PAGE_BYTES: usize = 64 * 1024;
+
+pub(super) struct SpoolCursor<'a> {
+    output: &'a InternalCapturedOutput,
+    stream: StreamKind,
+    length: u64,
+    offset: u64,
+    page: Vec<u8>,
+    page_index: usize,
+    discarded_incomplete: bool,
+}
+
+impl<'a> SpoolCursor<'a> {
+    pub(super) fn new(
+        output: &'a InternalCapturedOutput,
+        stream: StreamKind,
+        maximum: usize,
+    ) -> BridgeResult<Self> {
+        let length = match stream {
+            StreamKind::Stdout => output.stdout_len,
+            StreamKind::Stderr => output.stderr_len,
+        };
+        if length > maximum as u64 {
+            return Err(protocol_error("fixed stream exceeded its protocol bound"));
+        }
+        Ok(Self {
+            output,
+            stream,
+            length,
+            offset: 0,
+            page: Vec::new(),
+            page_index: 0,
+            discarded_incomplete: false,
+        })
+    }
+
+    pub(super) async fn next_field(&mut self, maximum: usize) -> BridgeResult<Option<Vec<u8>>> {
+        self.next_delimited(0, maximum, "protocol record is not NUL terminated", false)
+            .await
+    }
+
+    pub(super) async fn next_field_capped(
+        &mut self,
+        maximum: usize,
+    ) -> BridgeResult<Option<Vec<u8>>> {
+        self.next_delimited(0, maximum, "protocol record is not NUL terminated", true)
+            .await
+    }
+
+    pub(super) async fn next_line(&mut self, maximum: usize) -> BridgeResult<Option<Vec<u8>>> {
+        self.next_delimited(
+            b'\n',
+            maximum,
+            "protocol line is not newline terminated",
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn next_line_capped(
+        &mut self,
+        maximum: usize,
+    ) -> BridgeResult<Option<Vec<u8>>> {
+        self.next_delimited(
+            b'\n',
+            maximum,
+            "protocol line is not newline terminated",
+            true,
+        )
+        .await
+    }
+
+    async fn next_delimited(
+        &mut self,
+        delimiter: u8,
+        maximum: usize,
+        incomplete: &'static str,
+        discard_incomplete: bool,
+    ) -> BridgeResult<Option<Vec<u8>>> {
+        let mut record = Vec::new();
+        loop {
+            if self.page_index == self.page.len() {
+                if self.offset == self.length {
+                    if record.is_empty() {
+                        return Ok(None);
+                    }
+                    if discard_incomplete {
+                        self.discarded_incomplete = true;
+                        return Ok(None);
+                    }
+                    return Err(protocol_error(incomplete));
+                }
+                let page = self
+                    .output
+                    .read(self.stream, self.offset, CURSOR_PAGE_BYTES)
+                    .await?;
+                if page.bytes.is_empty() && !page.eof {
+                    return Err(protocol_error("fixed stream cursor made no progress"));
+                }
+                self.offset = page.next_offset;
+                self.page = page.bytes;
+                self.page_index = 0;
+                continue;
+            }
+
+            let remaining = &self.page[self.page_index..];
+            if let Some(relative) = remaining.iter().position(|byte| *byte == delimiter) {
+                self.extend_record(&mut record, &remaining[..relative], maximum)?;
+                self.page_index += relative + 1;
+                return Ok(Some(record));
+            }
+            self.extend_record(&mut record, remaining, maximum)?;
+            self.page_index = self.page.len();
+        }
+    }
+
+    pub(super) fn discarded_incomplete(&self) -> bool {
+        self.discarded_incomplete
+    }
+
+    fn extend_record(
+        &self,
+        record: &mut Vec<u8>,
+        bytes: &[u8],
+        maximum: usize,
+    ) -> BridgeResult<()> {
+        let new_length = record
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| protocol_error("protocol record length overflowed"))?;
+        if new_length > maximum {
+            return Err(protocol_error("protocol record is oversized"));
+        }
+        record.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub(super) async fn read_to_end(mut self, maximum: usize) -> BridgeResult<Vec<u8>> {
+        if self.length > maximum as u64 {
+            return Err(protocol_error("fixed stream exceeded its protocol bound"));
+        }
+        let capacity = usize::try_from(self.length)
+            .map_err(|_| protocol_error("fixed stream length is invalid"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        while self.offset < self.length || self.page_index < self.page.len() {
+            if self.page_index == self.page.len() {
+                let page = self
+                    .output
+                    .read(self.stream, self.offset, CURSOR_PAGE_BYTES)
+                    .await?;
+                self.offset = page.next_offset;
+                self.page = page.bytes;
+                self.page_index = 0;
+                if self.page.is_empty() && !page.eof {
+                    return Err(protocol_error("fixed stream cursor made no progress"));
+                }
+            }
+            bytes.extend_from_slice(&self.page[self.page_index..]);
+            self.page_index = self.page.len();
+        }
+        if bytes.len() != capacity {
+            return Err(protocol_error("fixed stream length changed while parsing"));
+        }
+        Ok(bytes)
+    }
+}
+
+pub(super) async fn read_small_stream(
     output: &InternalCapturedOutput,
     stream: StreamKind,
     maximum: usize,
 ) -> BridgeResult<Vec<u8>> {
-    let expected = match stream {
-        StreamKind::Stdout => output.stdout_len,
-        StreamKind::Stderr => output.stderr_len,
+    SpoolCursor::new(output, stream, maximum)?
+        .read_to_end(maximum)
+        .await
+}
+
+pub(super) async fn capability_mismatch(
+    result: &FixedRunResult,
+    required: &'static [&'static str],
+) -> BridgeResult<Option<String>> {
+    let output = &result.output;
+    if output.stderr_len == 0 {
+        return Ok(None);
+    }
+    if output.stderr_len > 4096 {
+        return Ok(None);
+    }
+    let page = output.read(StreamKind::Stderr, 0, 4096).await?;
+    const PREFIX: &[u8] = b"CODE=CAPABILITY_MISMATCH\0";
+    if !page.bytes.starts_with(PREFIX) {
+        return Ok(None);
+    }
+    if output.stdout_len != 0 || !page.eof {
+        return Err(protocol_error("capability mismatch record is malformed"));
+    }
+    let rest = &page.bytes[PREFIX.len()..];
+    let Some(value) = rest
+        .strip_prefix(b"CAPABILITY=")
+        .and_then(|value| value.strip_suffix(&[0]))
+    else {
+        return Err(protocol_error("capability mismatch record is malformed"));
     };
-    if expected > maximum as u64 {
-        return Err(protocol_error("fixed stream exceeded its protocol bound"));
+    if value.is_empty() || value.contains(&0) {
+        return Err(protocol_error("capability mismatch record is malformed"));
     }
-    let capacity =
-        usize::try_from(expected).map_err(|_| protocol_error("fixed stream length is invalid"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut offset = 0;
-    loop {
-        let page = output.read(stream, offset, 64 * 1024).await?;
-        bytes.extend_from_slice(&page.bytes);
-        offset = page.next_offset;
-        if page.eof {
-            break;
-        }
+    let key = std::str::from_utf8(value)
+        .map_err(|_| protocol_error("capability mismatch key is invalid"))?;
+    if !required.contains(&key) {
+        return Err(protocol_error(
+            "capability mismatch named an unexpected key",
+        ));
     }
-    if bytes.len() != capacity {
-        return Err(protocol_error("fixed stream length changed while parsing"));
-    }
-    Ok(bytes)
+    Ok(Some(key.to_owned()))
 }
 
 pub(super) fn nul_fields(bytes: &[u8]) -> BridgeResult<Vec<&[u8]>> {
@@ -104,30 +291,6 @@ pub(super) fn nul_fields(bytes: &[u8]) -> BridgeResult<Vec<&[u8]>> {
         return Err(protocol_error("protocol contains an empty field"));
     }
     Ok(fields)
-}
-
-pub(super) fn trim_capped_nul_groups(
-    bytes: &mut Vec<u8>,
-    fields_per_record: usize,
-) -> BridgeResult<()> {
-    let Some(last_nul) = bytes.iter().rposition(|byte| *byte == 0) else {
-        return Err(protocol_error("protocol record is oversized"));
-    };
-    bytes.truncate(last_nul + 1);
-    let field_count = bytes.iter().filter(|byte| **byte == 0).count();
-    let keep_fields = field_count - field_count % fields_per_record;
-    if keep_fields == 0 {
-        return Err(protocol_error("protocol record is oversized"));
-    }
-    let keep_end = bytes
-        .iter()
-        .enumerate()
-        .filter(|(_, byte)| **byte == 0)
-        .nth(keep_fields - 1)
-        .map(|(index, _)| index + 1)
-        .ok_or_else(|| protocol_error("protocol record is oversized"))?;
-    bytes.truncate(keep_end);
-    Ok(())
 }
 
 pub(super) fn utf8(field: &[u8]) -> BridgeResult<&str> {
@@ -215,16 +378,56 @@ pub(super) fn protocol_error(message: &'static str) -> BridgeError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn exact_eight_mib_plus_one_capped_frame_keeps_only_complete_groups() {
+    #[tokio::test]
+    async fn spool_cursor_nul_field_crosses_the_sixty_four_kib_page_boundary() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut bytes = vec![b'a'; 64 * 1024];
+        bytes.push(0);
+        bytes.extend_from_slice(b"tail\0");
+        let output = InternalCapturedOutput::for_test(directory.path(), &bytes, b"");
+        let mut cursor = SpoolCursor::new(&output, StreamKind::Stdout, bytes.len()).unwrap();
+        assert_eq!(
+            cursor.next_field(64 * 1024).await.unwrap().unwrap().len(),
+            64 * 1024
+        );
+        assert_eq!(cursor.next_field(16).await.unwrap().unwrap(), b"tail");
+        assert!(cursor.next_field(16).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn spool_cursor_json_line_crosses_the_sixty_four_kib_page_boundary() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut bytes = vec![b' '; 64 * 1024 - 1];
+        bytes.extend_from_slice(b"{}\nnext\n");
+        let output = InternalCapturedOutput::for_test(directory.path(), &bytes, b"");
+        let mut cursor = SpoolCursor::new(&output, StreamKind::Stdout, bytes.len()).unwrap();
+        let first = cursor.next_line(64 * 1024 + 1).await.unwrap().unwrap();
+        assert_eq!(&first[first.len() - 2..], b"{}");
+        assert_eq!(cursor.next_line(16).await.unwrap().unwrap(), b"next");
+        assert!(cursor.next_line(16).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_eight_mib_plus_one_capped_cursor_keeps_only_complete_groups() {
         let mut bytes = Vec::with_capacity(crate::MAX_FRAME_BYTES + 1);
         while bytes.len() + 10 <= crate::MAX_FRAME_BYTES {
             bytes.extend_from_slice(b"a\0b\0c\0d\0e\0");
         }
         bytes.resize(crate::MAX_FRAME_BYTES + 1, b'x');
-        trim_capped_nul_groups(&mut bytes, 5).unwrap();
-        assert!(bytes.len() <= crate::MAX_FRAME_BYTES);
-        assert_eq!(bytes.iter().filter(|byte| **byte == 0).count() % 5, 0);
-        assert_eq!(bytes.last(), Some(&0));
+        let directory = tempfile::TempDir::new().unwrap();
+        let output = InternalCapturedOutput::for_test(directory.path(), &bytes, b"");
+        let mut cursor =
+            SpoolCursor::new(&output, StreamKind::Stdout, crate::MAX_FRAME_BYTES + 1).unwrap();
+        let mut fields = 0usize;
+        while cursor
+            .next_field_capped(crate::MAX_FRAME_BYTES)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            fields += 1;
+        }
+        assert!(fields > 0);
+        assert_eq!(fields % 5, 0);
     }
 }

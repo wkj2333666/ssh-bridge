@@ -12,7 +12,7 @@ use crate::config::{Config, EffectiveLimits};
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::StreamKind;
 use crate::path::RemotePath;
-use crate::ssh::SshRunner;
+use crate::ssh::{FixedRunRequest, FixedRunResult, SshRunner};
 
 mod metadata;
 mod protocol;
@@ -71,7 +71,7 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<ListResult> {
         let resolved = resolve_list(self.runner.config(), request)?;
-        metadata::list(&self.runner, resolved, cancel).await
+        metadata::list(self, resolved, cancel).await
     }
 
     pub async fn stat(
@@ -80,7 +80,7 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<StatResult> {
         let resolved = resolve_stat(self.runner.config(), request)?;
-        metadata::stat(&self.runner, resolved, cancel).await
+        metadata::stat(self, resolved, cancel).await
     }
 
     pub async fn read(
@@ -89,7 +89,7 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<ReadResult> {
         let resolved = resolve_read(self.runner.config(), request)?;
-        read::read(&self.runner, resolved, cancel).await
+        read::read(self, resolved, cancel).await
     }
 
     pub async fn search(
@@ -98,7 +98,7 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<SearchResult> {
         let resolved = resolve_search(self.runner.config(), request)?;
-        search::search(&self.runner, resolved, cancel).await
+        search::search(self, resolved, cancel).await
     }
 
     pub async fn output_read(
@@ -125,6 +125,32 @@ impl RemoteBridge {
             eof: page.eof,
             data: protocol::encode_bytes(&page.bytes),
         })
+    }
+
+    async fn execute_readonly_fixed(
+        &self,
+        request: FixedRunRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<FixedRunResult> {
+        let first = self
+            .runner
+            .execute_fixed(request.clone(), cancel.clone())
+            .await?;
+        match protocol::capability_mismatch(&first, request.required_capabilities).await? {
+            None => Ok(first),
+            Some(_) => {
+                self.runner.invalidate_capability(&request.host).await;
+                let second = self.runner.execute_fixed(request.clone(), cancel).await?;
+                match protocol::capability_mismatch(&second, request.required_capabilities).await? {
+                    None => Ok(second),
+                    Some(_) => Err(BridgeError::new(
+                        ErrorCode::RemoteCapabilityMissing,
+                        "remote read capability remained unavailable after reprobe",
+                        false,
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -334,9 +360,15 @@ fn validate_glob(glob: &str) -> BridgeResult<()> {
             "search glob must be a positive root-relative pattern",
         ));
     }
-    globset::Glob::new(glob)
-        .map_err(|_| BridgeError::invalid_argument("search glob is invalid"))?;
+    compile_glob(glob)?;
     Ok(())
+}
+
+fn compile_glob(glob: &str) -> BridgeResult<globset::Glob> {
+    globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .build()
+        .map_err(|_| BridgeError::invalid_argument("search glob is invalid"))
 }
 
 fn validate_frame(
