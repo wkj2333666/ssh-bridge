@@ -2,11 +2,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use codex_ssh_bridge::mcp::{
-    CallToolResult, ProtocolState, RequestId, SUPPORTED_PROTOCOL_VERSIONS, StrictJsonError,
-    ToolAnnotations, ToolCallContext, ToolDefinition, ToolFuture, ToolService, WireBudget,
-    internal_error_response, invalid_params_response, invalid_request_response,
-    method_not_found_response, parse_error_response, parse_strict_json, request_too_large_response,
-    result_response, server_busy_response, server_not_initialized_response,
+    CallToolResult, MAX_INVALID_ARGUMENT_ACTION_BYTES, ProtocolState, RequestId,
+    SUPPORTED_PROTOCOL_VERSIONS, StrictJsonError, ToolAnnotations, ToolCallContext, ToolDefinition,
+    ToolFuture, ToolService, WireBudget, internal_error_response, invalid_params_response,
+    invalid_request_response, method_not_found_response, parse_error_response, parse_strict_json,
+    request_too_large_response, result_response, server_busy_response,
+    server_not_initialized_response,
 };
 use serde_json::{Value, json};
 
@@ -53,6 +54,27 @@ fn object_with_key_bytes(bytes: usize) -> Vec<u8> {
     input
 }
 
+fn nested_objects_with_members(members: usize) -> Vec<u8> {
+    assert!(members >= 1);
+    let inner = wide_object(members - 1);
+    let mut input = Vec::with_capacity(inner.len() + 10);
+    input.extend_from_slice(b"{\"outer\":");
+    input.extend_from_slice(&inner);
+    input.push(b'}');
+    input
+}
+
+fn nested_objects_with_key_bytes(key_bytes: usize) -> Vec<u8> {
+    const OUTER_KEY_BYTES: usize = "outer".len();
+    assert!(key_bytes >= OUTER_KEY_BYTES);
+    let inner = object_with_key_bytes(key_bytes - OUTER_KEY_BYTES);
+    let mut input = Vec::with_capacity(inner.len() + 10);
+    input.extend_from_slice(b"{\"outer\":");
+    input.extend_from_slice(&inner);
+    input.push(b'}');
+    input
+}
+
 #[test]
 fn task7_strict_json_rejects_duplicate_keys_at_every_depth() {
     for input in [
@@ -65,6 +87,14 @@ fn task7_strict_json_rejects_duplicate_keys_at_every_depth() {
             Err(StrictJsonError::DuplicateKey)
         );
     }
+}
+
+#[test]
+fn task7_strict_json_duplicate_marker_wins_before_malformed_duplicate_value() {
+    assert_eq!(
+        parse_strict_json(br#"{"a":1,"a":}"#),
+        Err(StrictJsonError::DuplicateKey)
+    );
 }
 
 #[test]
@@ -105,10 +135,28 @@ fn task7_strict_json_enforces_aggregate_member_boundary_for_wide_objects() {
 }
 
 #[test]
+fn task7_strict_json_member_budget_is_aggregate_across_distinct_nested_maps() {
+    assert!(parse_strict_json(&nested_objects_with_members(131_072)).is_ok());
+    assert_eq!(
+        parse_strict_json(&nested_objects_with_members(131_073)),
+        Err(StrictJsonError::StructuralBudget)
+    );
+}
+
+#[test]
 fn task7_strict_json_enforces_aggregate_key_byte_boundary() {
     assert!(parse_strict_json(&object_with_key_bytes(1_048_576)).is_ok());
     assert_eq!(
         parse_strict_json(&object_with_key_bytes(1_048_577)),
+        Err(StrictJsonError::StructuralBudget)
+    );
+}
+
+#[test]
+fn task7_strict_json_key_byte_budget_is_aggregate_across_distinct_nested_maps() {
+    assert!(parse_strict_json(&nested_objects_with_key_bytes(1_048_576)).is_ok());
+    assert_eq!(
+        parse_strict_json(&nested_objects_with_key_bytes(1_048_577)),
         Err(StrictJsonError::StructuralBudget)
     );
 }
@@ -137,6 +185,9 @@ fn task7_strict_json_builds_all_json_value_kinds() {
 fn task7_strict_json_duplicate_detection_uses_destination_map_only() {
     let source = include_str!("../src/mcp/protocol.rs");
     assert!(source.contains("contains_key"));
+    assert!(source.contains("next_key_seed"));
+    assert!(source.contains("StrictKeySeed"));
+    assert!(!source.contains("next_key::<String>"));
     assert!(!source.contains("HashSet<String>"));
     assert!(!source.contains("HashSet::<String>"));
 }
@@ -168,6 +219,36 @@ fn task7_request_ids_preserve_wire_type_and_enforce_serialized_size() {
             .len(),
         256
     );
+}
+
+#[test]
+fn task7_request_ids_enforce_escaped_control_wire_boundary() {
+    let exact_value = format!("{}\n", "x".repeat(252));
+    let oversized_value = format!("{}\n", "x".repeat(253));
+    assert_eq!(serde_json::to_vec(&exact_value).unwrap().len(), 256);
+    assert_eq!(serde_json::to_vec(&oversized_value).unwrap().len(), 257);
+    assert!(RequestId::try_from(json!(exact_value)).is_ok());
+    assert!(RequestId::try_from(json!(oversized_value)).is_err());
+}
+
+#[test]
+fn task7_request_ids_enforce_multibyte_utf8_wire_boundary() {
+    let prefix = "界".repeat(84);
+    let exact_value = format!("{prefix}ab");
+    let oversized_value = format!("{prefix}abc");
+    assert_eq!(serde_json::to_vec(&exact_value).unwrap().len(), 256);
+    assert_eq!(serde_json::to_vec(&oversized_value).unwrap().len(), 257);
+    assert!(RequestId::try_from(json!(exact_value)).is_ok());
+    assert!(RequestId::try_from(json!(oversized_value)).is_err());
+}
+
+#[test]
+fn task7_request_id_wire_counter_uses_its_explicit_bound() {
+    let source = include_str!("../src/mcp/protocol.rs");
+    assert!(source.contains("fn escaped_json_string_len(value: &str, maximum: usize)"));
+    assert!(source.contains("escaped_json_string_len(value, maximum)"));
+    assert!(source.contains("if length > maximum"));
+    assert!(!source.contains("if length > MAX_REQUEST_ID_WIRE_BYTES"));
 }
 
 #[test]
@@ -283,6 +364,58 @@ fn task7_tool_protocol_models_serialize_exact_shapes() {
     let text: Value = serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(text["error"]["code"], "INVALID_ARGUMENT");
     assert_eq!(text["action"], "provide arguments.host");
+}
+
+#[test]
+fn task7_invalid_argument_accepts_only_static_bounded_actions() {
+    const OVERSIZED_STATIC_ACTION: &str = concat!(
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "x"
+    );
+    assert_eq!(MAX_INVALID_ARGUMENT_ACTION_BYTES, 1024);
+    assert_eq!(OVERSIZED_STATIC_ACTION.len(), 1025);
+
+    let bounded = serde_json::to_value(CallToolResult::invalid_argument(
+        "provide arguments.host as a configured alias",
+    ))
+    .unwrap();
+    assert_eq!(
+        bounded["structuredContent"]["action"],
+        "provide arguments.host as a configured alias"
+    );
+
+    let oversized =
+        serde_json::to_value(CallToolResult::invalid_argument(OVERSIZED_STATIC_ACTION)).unwrap();
+    assert_eq!(
+        oversized["structuredContent"]["action"],
+        "provide valid tool arguments"
+    );
+    assert!(
+        oversized["structuredContent"]["action"]
+            .as_str()
+            .unwrap()
+            .len()
+            <= MAX_INVALID_ARGUMENT_ACTION_BYTES
+    );
+
+    let source = include_str!("../src/mcp/protocol.rs");
+    assert!(source.contains("pub fn invalid_argument(actionable_safe_text: &'static str) -> Self"));
+    assert!(!source.contains("invalid_argument(actionable_safe_text: impl Into<String>)"));
 }
 
 struct NullService {
