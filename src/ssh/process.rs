@@ -57,6 +57,7 @@ const SSH_G_OPTIONS: &[&str] = &[
 pub struct RunRequest {
     pub host: String,
     pub command: String,
+    pub cwd: String,
     pub shell: ShellRequest,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
@@ -202,21 +203,40 @@ impl SshRunner {
             );
             error
         })?;
-        let timeout_ms = u64::try_from(request.timeout.as_millis())
-            .map_err(|_| BridgeError::invalid_argument("command timeout is too large"))?;
         let remote_timeout = !matches!(shell.shell, ShellKind::Login)
             && capability.tools.get("timeout") == Some(&true);
-        let remote_command =
-            render_remote_command(&request.command, &shell.shell, remote_timeout, timeout_ms)?;
+        let prepared = (|| {
+            let timeout_ms = u64::try_from(request.timeout.as_millis())
+                .map_err(|_| BridgeError::invalid_argument("command timeout is too large"))?;
+            let remote_command = render_remote_command(
+                &request.command,
+                &request.cwd,
+                &shell.shell,
+                remote_timeout,
+                timeout_ms,
+            )?;
+            if remote_command.len() > limits.max_frame_bytes {
+                return Err(BridgeError::new(
+                    ErrorCode::RequestTooLarge,
+                    "rendered command exceeds the configured frame limit",
+                    false,
+                ));
+            }
+            let local_deadline = if remote_timeout {
+                request
+                    .timeout
+                    .checked_add(REMOTE_TIMEOUT_RETURN_GRACE)
+                    .ok_or_else(|| BridgeError::invalid_argument("command timeout is too large"))?
+            } else {
+                request.timeout
+            };
+            Ok((remote_command, local_deadline))
+        })()
+        .map_err(|error| {
+            attach_selected_context(error, &request.host, &capability.physical_root, &shell)
+        })?;
+        let (remote_command, local_deadline) = prepared;
         let argv = build_ssh_argv(&policy, &request.host, &remote_command);
-        let local_deadline = if remote_timeout {
-            request
-                .timeout
-                .checked_add(REMOTE_TIMEOUT_RETURN_GRACE)
-                .ok_or_else(|| BridgeError::invalid_argument("command timeout is too large"))?
-        } else {
-            request.timeout
-        };
         let outcome = self
             .run_child(
                 ChildSpec {
@@ -1054,9 +1074,9 @@ fn validate_request(request: &RunRequest, limits: EffectiveLimits) -> BridgeResu
             limits.command_timeout_ms
         )));
     }
-    if request.command.as_bytes().contains(&0) {
+    if request.command.as_bytes().contains(&0) || request.cwd.as_bytes().contains(&0) {
         return Err(BridgeError::invalid_argument(
-            "NUL is not representable in a remote command",
+            "NUL is not representable in a remote command or cwd",
         ));
     }
     if request
@@ -1075,27 +1095,45 @@ fn validate_request(request: &RunRequest, limits: EffectiveLimits) -> BridgeResu
 
 fn render_remote_command(
     command: &str,
+    cwd: &str,
     shell: &ShellKind,
     remote_timeout: bool,
     timeout_ms: u64,
 ) -> BridgeResult<String> {
     if matches!(shell, ShellKind::Login) {
-        return Ok(command.to_owned());
+        return Ok(format!("cd -- {} || exit 126\n{command}", shell_word(cwd)?));
     }
-    let quoted = shell_word(command)?;
-    let timeout_prefix = if remote_timeout {
-        let duration = format_timeout_duration(timeout_ms)?;
-        format!("timeout --signal=TERM --kill-after=1s {duration} ")
+    const BASH_SCRIPT: &str = r#"set -u
+[ "$#" -eq 3 ] || exit 2
+cd -- "$1" || exit 126
+if [ -n "$3" ]; then
+    exec timeout --signal=TERM --kill-after=1s "$3" bash --noprofile --norc -c "$2"
+fi
+exec bash --noprofile --norc -c "$2""#;
+    const SH_SCRIPT: &str = r#"set -u
+[ "$#" -eq 3 ] || exit 2
+cd -- "$1" || exit 126
+if [ -n "$3" ]; then
+    exec timeout --signal=TERM --kill-after=1s "$3" sh -c "$2"
+fi
+exec sh -c "$2""#;
+    let script = match shell {
+        ShellKind::Bash { .. } => BASH_SCRIPT,
+        ShellKind::PosixSh => SH_SCRIPT,
+        ShellKind::Login => unreachable!(),
+    };
+    let duration = if remote_timeout {
+        format_timeout_duration(timeout_ms)?
     } else {
         String::new()
     };
-    match shell {
-        ShellKind::Bash { .. } => Ok(format!(
-            "exec {timeout_prefix}bash --noprofile --norc -c {quoted}"
-        )),
-        ShellKind::PosixSh => Ok(format!("exec {timeout_prefix}sh -c {quoted}")),
-        ShellKind::Login => unreachable!(),
-    }
+    Ok(format!(
+        "exec sh -c {} codex-ssh-bridge-run {} {} {}",
+        shell_word(script)?,
+        shell_word(cwd)?,
+        shell_word(command)?,
+        shell_word(&duration)?,
+    ))
 }
 
 pub(crate) fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<String> {
@@ -1310,7 +1348,7 @@ mod tests {
 
     #[test]
     fn remote_timeout_uses_gnu_decimal_seconds() {
-        let command = render_remote_command("exit 0", &ShellKind::PosixSh, true, 123).unwrap();
+        let command = render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 123).unwrap();
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &command])
             .env("PATH", "/usr/bin")
@@ -1322,20 +1360,23 @@ mod tests {
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(command.contains(" codex-ssh-bridge-run '/' 'exit 0' '0.123s'"));
         assert_eq!(
-            command,
-            "exec timeout --signal=TERM --kill-after=1s 0.123s sh -c 'exit 0'"
+            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 1000)
+                .unwrap()
+                .rsplit(' ')
+                .next(),
+            Some("'1.000s'")
         );
         assert_eq!(
-            render_remote_command("exit 0", &ShellKind::PosixSh, true, 1000).unwrap(),
-            "exec timeout --signal=TERM --kill-after=1s 1.000s sh -c 'exit 0'"
+            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, u64::MAX)
+                .unwrap()
+                .rsplit(' ')
+                .next(),
+            Some("'18446744073709551.615s'")
         );
         assert_eq!(
-            render_remote_command("exit 0", &ShellKind::PosixSh, true, u64::MAX).unwrap(),
-            "exec timeout --signal=TERM --kill-after=1s 18446744073709551.615s sh -c 'exit 0'"
-        );
-        assert_eq!(
-            render_remote_command("exit 0", &ShellKind::PosixSh, true, 0)
+            render_remote_command("exit 0", "/", &ShellKind::PosixSh, true, 0)
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidArgument

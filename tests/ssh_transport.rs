@@ -1339,10 +1339,70 @@ fn request(host: &str, shell: ShellRequest, timeout: Duration) -> RunRequest {
     RunRequest {
         host: host.to_owned(),
         command: "printf safe".to_owned(),
+        cwd: "/srv/project".to_owned(),
         shell,
         stdin: None,
         timeout,
     }
+}
+
+#[tokio::test]
+async fn task78_run_cwd_is_encoded_as_data_and_never_executed() {
+    let filesystem = TempDir::new().unwrap();
+    let sentinel = filesystem.path().join("cwd-injection");
+    let hostile_cwd = format!("'; touch {}; '", sentinel.display());
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[("FAKE_SSH_MODE", "echo-command".to_owned())],
+    );
+    let mut run = request("dev", ShellRequest::Sh, Duration::from_secs(2));
+    run.cwd = hostile_cwd;
+    let result = fixture
+        .runner
+        .execute(run, CancellationToken::new())
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
+    assert!(rendered.contains("codex-ssh-bridge-run"), "{rendered}");
+    assert!(!sentinel.exists());
+}
+
+#[tokio::test]
+async fn task78_run_rejects_quote_expansion_over_frame_before_command_child() {
+    let log_dir = TempDir::new().unwrap();
+    let log = log_dir.path().join("calls.log");
+    let limits = Limits {
+        max_frame_bytes: 512,
+        ..Limits::default()
+    };
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    let mut run = request("dev", ShellRequest::Sh, Duration::from_secs(2));
+    run.command = "'".repeat(200);
+    assert!(run.command.len() < 512);
+    let error = fixture
+        .runner
+        .execute(run, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RequestTooLarge);
+    assert_eq!(
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "C")
+            .count(),
+        0
+    );
 }
 
 fn preview_bytes(preview: &codex_ssh_bridge::output::OutputPreview) -> Vec<u8> {
@@ -1548,9 +1608,18 @@ async fn selected_shell_and_remote_gnu_timeout_are_reported_and_rendered_exactly
     assert_eq!(result.shell.shell, ShellKind::PosixSh);
     assert!(result.shell.fallback);
     assert!(!result.remote_process_may_continue);
+    let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
     assert_eq!(
-        preview_bytes(&result.output.stdout),
-        b"exec timeout --signal=TERM --kill-after=1s 0.123s sh -c 'printf safe'"
+        rendered,
+        concat!(
+            "exec sh -c 'set -u\n",
+            "[ \"$#\" -eq 3 ] || exit 2\n",
+            "cd -- \"$1\" || exit 126\n",
+            "if [ -n \"$3\" ]; then\n",
+            "    exec timeout --signal=TERM --kill-after=1s \"$3\" sh -c \"$2\"\n",
+            "fi\n",
+            "exec sh -c \"$2\"' codex-ssh-bridge-run '/srv/project' 'printf safe' '0.123s'"
+        )
     );
 }
 
@@ -1608,7 +1677,10 @@ async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
         .await
         .unwrap();
     assert_eq!(result.shell.shell, ShellKind::Login);
-    assert_eq!(preview_bytes(&result.output.stdout), b"printf safe");
+    assert_eq!(
+        preview_bytes(&result.output.stdout),
+        b"cd -- '/srv/project' || exit 126\nprintf safe"
+    );
 }
 
 #[tokio::test]
