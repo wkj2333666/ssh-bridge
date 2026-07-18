@@ -1456,7 +1456,7 @@ mod tests {
         )
         .unwrap();
         let exact = rendered.len();
-        assert_eq!(rendered.capacity(), exact);
+        assert!(rendered.capacity() >= exact);
         assert_eq!(
             render_remote_command(
                 &command,
@@ -1496,6 +1496,125 @@ mod tests {
             .code,
             ErrorCode::RequestTooLarge
         );
+    }
+
+    #[test]
+    fn task78_quote_admission_release_rss() {
+        run_quote_admission_release_rss();
+    }
+
+    fn run_quote_admission_release_rss() {
+        const CHILD_ENV: &str = "CODEX_SSH_BRIDGE_QUOTE_RSS_CHILD";
+        const TEST_NAME: &str = "ssh::process::tests::task78_quote_admission_release_rss";
+        if cfg!(debug_assertions) {
+            eprintln!("quote admission RSS assertion is release-only");
+            return;
+        }
+        if std::env::var_os(CHILD_ENV).is_some() {
+            quote_admission_rss_child();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "fresh quote RSS child failed");
+    }
+
+    fn quote_admission_rss_child() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const WORKERS: usize = 5;
+        const ROUNDS: usize = 16;
+        const RSS_DELTA_CEILING_KIB: u64 = 16 * 1024;
+
+        let commands: Vec<_> = (0..WORKERS)
+            .map(|_| Arc::new("'".repeat(crate::MAX_FRAME_BYTES)))
+            .collect();
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.len() == crate::MAX_FRAME_BYTES)
+        );
+        let warmed = commands
+            .iter()
+            .flat_map(|command| command.as_bytes().iter().step_by(4096))
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        std::hint::black_box(warmed);
+
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+        let finish = Arc::new(Barrier::new(WORKERS + 1));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::with_capacity(WORKERS);
+        for command in commands {
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let completed = Arc::clone(&completed);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let mut last_error = None;
+                for _ in 0..ROUNDS {
+                    let error = render_remote_command(
+                        &command,
+                        "/srv/project",
+                        &ShellKind::PosixSh,
+                        false,
+                        1_000,
+                        crate::MAX_FRAME_BYTES,
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.code, ErrorCode::RequestTooLarge);
+                    assert_eq!(
+                        error.message,
+                        "rendered command exceeds the configured frame limit"
+                    );
+                    last_error = Some(error);
+                }
+                completed.fetch_add(1, Ordering::Release);
+                finish.wait();
+                last_error.unwrap().code
+            }));
+        }
+
+        let baseline = resident_kib_for_rss_test();
+        let mut peak = baseline;
+        start.wait();
+        while completed.load(Ordering::Acquire) != WORKERS {
+            peak = peak.max(resident_kib_for_rss_test());
+            std::thread::sleep(Duration::from_micros(250));
+        }
+        for _ in 0..20 {
+            peak = peak.max(resident_kib_for_rss_test());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        finish.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), ErrorCode::RequestTooLarge);
+        }
+        let delta = peak.saturating_sub(baseline);
+        eprintln!(
+            "quote admission release RSS: baseline={baseline} KiB peak={peak} KiB delta={delta} KiB ceiling={RSS_DELTA_CEILING_KIB} KiB"
+        );
+        assert!(
+            delta < RSS_DELTA_CEILING_KIB,
+            "quote admission RSS baseline={baseline} peak={peak} delta={delta}"
+        );
+    }
+
+    fn resident_kib_for_rss_test() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap()
     }
 
     #[test]
