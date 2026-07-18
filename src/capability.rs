@@ -843,7 +843,7 @@ impl CapabilityCache {
             match lookup {
                 CacheLookup::Ready(capability) => return Ok(capability),
                 CacheLookup::Follower(flight) => match wait_for_probe(&flight).await {
-                    ProbeWait::Completed(outcome) => return outcome,
+                    ProbeWait::Completed(outcome) => return *outcome,
                     ProbeWait::Abandoned => {
                         self.remove_generation(host, &flight, true).await;
                     }
@@ -892,7 +892,7 @@ impl CapabilityCache {
 }
 
 enum ProbeWait {
-    Completed(BridgeResult<Arc<Capability>>),
+    Completed(Box<BridgeResult<Arc<Capability>>>),
     Abandoned,
 }
 
@@ -900,11 +900,11 @@ async fn wait_for_probe(flight: &ProbeFlight) -> ProbeWait {
     let mut receiver = flight.outcome.clone();
     loop {
         if let Some(outcome) = receiver.borrow().clone() {
-            return ProbeWait::Completed(outcome);
+            return ProbeWait::Completed(Box::new(outcome));
         }
         if receiver.changed().await.is_err() {
             if let Some(outcome) = receiver.borrow().clone() {
-                return ProbeWait::Completed(outcome);
+                return ProbeWait::Completed(Box::new(outcome));
             }
             return ProbeWait::Abandoned;
         }

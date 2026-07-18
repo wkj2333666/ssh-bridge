@@ -673,7 +673,7 @@ impl SshRunner {
                 result = &mut wait_task, if status.is_none() => {
                     match joined_wait(result) {
                         Ok(exit_status) => status = Some(exit_status),
-                        Err(error) => break Stop::InternalError(error),
+                        Err(error) => break Stop::InternalError(Box::new(error)),
                     }
                     if capture.is_some() && stdin_finished {
                         break Stop::Completed;
@@ -685,7 +685,7 @@ impl SshRunner {
                         Err(error) if error.code == ErrorCode::OutputLimit => {
                             Some(Stop::OutputLimit)
                         }
-                        Err(error) => Some(Stop::InternalError(error.clone())),
+                        Err(error) => Some(Stop::InternalError(Box::new(error.clone()))),
                         Ok(_) => None,
                     };
                     capture = Some(result);
@@ -699,7 +699,7 @@ impl SshRunner {
                 result = &mut stdin_task, if !stdin_finished => {
                     stdin_finished = true;
                     if let Err(error) = joined_stdin(result) {
-                        break Stop::InternalError(error);
+                        break Stop::InternalError(Box::new(error));
                     }
                     if status.is_some() && capture.is_some() {
                         break Stop::Completed;
@@ -760,7 +760,7 @@ impl SshRunner {
                             false,
                         ),
                     },
-                    Stop::InternalError(error) => error,
+                    Stop::InternalError(error) => *error,
                     Stop::Completed => unreachable!(),
                 };
                 error.details.host = Some(host.to_owned());
@@ -966,7 +966,7 @@ enum Stop {
     Cancelled,
     OutputLimit,
     Deadline,
-    InternalError(BridgeError),
+    InternalError(Box<BridgeError>),
 }
 
 async fn wait_for_permit(

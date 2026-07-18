@@ -15,6 +15,7 @@ use crate::path::RemotePath;
 use crate::ssh::{FixedRunRequest, FixedRunResult, SshRunner};
 
 mod metadata;
+mod patch;
 mod protocol;
 mod read;
 mod search;
@@ -108,6 +109,14 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<WriteResult> {
         write::write(self, request, cancel).await
+    }
+
+    pub async fn apply_patch(
+        &self,
+        request: ApplyPatchRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<ApplyPatchResult> {
+        patch::apply_patch(self, request, cancel).await
     }
 
     #[allow(dead_code, reason = "reserved for the internal Task 6 patch workflow")]
@@ -469,6 +478,12 @@ pub struct WriteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyPatchRequest {
+    pub host: String,
+    pub patch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuardedDeleteRequest {
     pub host: String,
     pub path: String,
@@ -693,6 +708,13 @@ pub struct WriteResult {
     pub sha256: String,
     pub mode: u32,
     pub temporary_cleanup_confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApplyPatchResult {
+    #[serde(flatten)]
+    pub context: RemoteContext,
+    pub changed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
