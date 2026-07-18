@@ -1110,24 +1110,20 @@ async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
 
 #[tokio::test]
 async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
-    let cases = [
+    let bootstrap_cases = [
         ("host-key", ErrorCode::HostKeyUnknown, false),
         ("host-key-ed25519", ErrorCode::HostKeyUnknown, false),
         ("host-key-rsa", ErrorCode::HostKeyUnknown, false),
         ("host-key-ecdsa", ErrorCode::HostKeyUnknown, false),
         ("auth", ErrorCode::AuthRequired, false),
         ("connect-timeout", ErrorCode::ConnectTimeout, true),
-        ("remote", ErrorCode::RemoteExit, false),
     ];
-    for (kind, code, retryable) in cases {
+    for (kind, code, retryable) in bootstrap_cases {
         let fixture = task3_runner(
             &["dev"],
             Limits::default(),
             Duration::from_secs(600),
-            &[
-                ("FAKE_SSH_MODE", "error".to_owned()),
-                ("FAKE_SSH_ERROR", kind.to_owned()),
-            ],
+            &[("FAKE_SSH_PROBE_ERROR", kind.to_owned())],
         );
         let error = fixture
             .runner
@@ -1140,8 +1136,105 @@ async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
         assert_eq!(error.code, code, "{kind}");
         assert_eq!(error.retryable, retryable, "{kind}");
         assert!(!error.message.contains("VERY_SECRET"), "{error:?}");
-        if kind == "remote" {
-            assert_eq!(error.details.exit_status, Some(7));
+    }
+
+    let resolve = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[("FAKE_SSH_G_ERROR", "host-key".to_owned())],
+    );
+    let error = resolve
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::HostKeyUnknown);
+
+    let resolve_non_255 = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_G_ERROR", "host-key".to_owned()),
+            ("FAKE_SSH_ERROR_STATUS", "7".to_owned()),
+        ],
+    );
+    let error = resolve_non_255
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteExit);
+    assert!(!error.retryable);
+    assert_eq!(error.details.exit_status, Some(7));
+
+    let remote = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "error".to_owned()),
+            ("FAKE_SSH_ERROR", "remote".to_owned()),
+        ],
+    );
+    let error = remote
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteExit);
+    assert!(!error.retryable);
+    assert_eq!(error.details.exit_status, Some(7));
+    assert!(!error.message.contains("VERY_SECRET"));
+}
+
+#[tokio::test]
+async fn command_phase_exit_255_canonical_lines_are_nonretryable_remote_exit() {
+    let shells = [
+        ("sh", ShellRequest::Auto),
+        ("bash", ShellRequest::Bash),
+        ("sh", ShellRequest::Login),
+    ];
+    for (reported_shell, request_shell) in shells {
+        for diagnostic in ["host-key", "auth", "connect-timeout"] {
+            let fixture = task3_runner(
+                &["dev"],
+                Limits::default(),
+                Duration::from_secs(600),
+                &[
+                    ("FAKE_SSH_MODE", "error".to_owned()),
+                    ("FAKE_SSH_ERROR", diagnostic.to_owned()),
+                    ("FAKE_SSH_SHELL", reported_shell.to_owned()),
+                ],
+            );
+            let error = fixture
+                .runner
+                .execute(
+                    request("dev", request_shell, Duration::from_secs(2)),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                ErrorCode::RemoteExit,
+                "shell={request_shell:?} diagnostic={diagnostic}"
+            );
+            assert!(!error.retryable);
+            assert_eq!(error.details.exit_status, Some(255));
+            assert_eq!(error.details.remote_process_may_continue, Some(true));
+            assert_eq!(error.message, "remote command exited unsuccessfully");
+            assert!(!error.message.contains("VERY_SECRET"));
         }
     }
 }
