@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -239,26 +239,58 @@ impl ByteQuota {
 }
 
 #[derive(Debug)]
-struct EntryAccounting {
-    quota: Arc<ByteQuota>,
-    bytes: AtomicU64,
-    slot: StdMutex<Option<OwnedSemaphorePermit>>,
+struct EntrySlot {
+    permit: StdMutex<Option<OwnedSemaphorePermit>>,
 }
 
-impl EntryAccounting {
-    fn new(quota: Arc<ByteQuota>) -> Self {
+impl EntrySlot {
+    fn new() -> Self {
         Self {
-            quota,
-            bytes: AtomicU64::new(0),
-            slot: StdMutex::new(None),
+            permit: StdMutex::new(None),
         }
     }
 
-    fn with_reservation(quota: Arc<ByteQuota>, bytes: u64, slot: OwnedSemaphorePermit) -> Self {
+    fn with_permit(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            permit: StdMutex::new(Some(permit)),
+        }
+    }
+
+    fn attach(&self, permit: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
+        let mut owned = self
+            .permit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if owned.is_some() {
+            Err(permit)
+        } else {
+            *owned = Some(permit);
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FileAccounting {
+    quota: Arc<ByteQuota>,
+    bytes: AtomicU64,
+    _slot: Arc<EntrySlot>,
+}
+
+impl FileAccounting {
+    fn new(quota: Arc<ByteQuota>, slot: Arc<EntrySlot>) -> Self {
+        Self {
+            quota,
+            bytes: AtomicU64::new(0),
+            _slot: slot,
+        }
+    }
+
+    fn with_reservation(quota: Arc<ByteQuota>, bytes: u64, slot: Arc<EntrySlot>) -> Self {
         Self {
             quota,
             bytes: AtomicU64::new(bytes),
-            slot: StdMutex::new(Some(slot)),
+            _slot: slot,
         }
     }
 
@@ -270,14 +302,13 @@ impl EntryAccounting {
         true
     }
 
-    fn attach_slot(&self, slot: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
-        let mut owned = self.slot.lock().unwrap_or_else(|error| error.into_inner());
-        if owned.is_some() {
-            Err(slot)
-        } else {
-            *owned = Some(slot);
-            Ok(())
+    fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
         }
+        let previous = self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(previous >= bytes);
+        self.quota.release(bytes);
     }
 
     fn shrink_to(&self, actual: u64) {
@@ -287,9 +318,89 @@ impl EntryAccounting {
     }
 }
 
-impl Drop for EntryAccounting {
+impl Drop for FileAccounting {
     fn drop(&mut self) {
         self.quota.release(self.bytes.load(Ordering::Acquire));
+    }
+}
+
+#[derive(Debug)]
+struct EntryAccounting {
+    slot: Arc<EntrySlot>,
+    stdout: Arc<FileAccounting>,
+    stderr: Option<Arc<FileAccounting>>,
+}
+
+impl EntryAccounting {
+    fn new(quota: Arc<ByteQuota>) -> Self {
+        let slot = Arc::new(EntrySlot::new());
+        Self {
+            stdout: Arc::new(FileAccounting::new(Arc::clone(&quota), Arc::clone(&slot))),
+            stderr: Some(Arc::new(FileAccounting::new(quota, Arc::clone(&slot)))),
+            slot,
+        }
+    }
+
+    fn with_reservation(quota: Arc<ByteQuota>, bytes: u64, permit: OwnedSemaphorePermit) -> Self {
+        let slot = Arc::new(EntrySlot::with_permit(permit));
+        Self {
+            stdout: Arc::new(FileAccounting::with_reservation(
+                quota,
+                bytes,
+                Arc::clone(&slot),
+            )),
+            stderr: None,
+            slot,
+        }
+    }
+
+    fn file(&self, stream: StreamKind) -> &Arc<FileAccounting> {
+        match stream {
+            StreamKind::Stdout => &self.stdout,
+            StreamKind::Stderr => self.stderr.as_ref().expect("capture has stderr accounting"),
+        }
+    }
+
+    fn reserve(&self, stream: StreamKind, bytes: u64) -> bool {
+        self.file(stream).reserve(bytes)
+    }
+
+    fn release(&self, stream: StreamKind, bytes: u64) {
+        self.file(stream).release(bytes);
+    }
+
+    fn attach_slot(&self, permit: OwnedSemaphorePermit) -> Result<(), OwnedSemaphorePermit> {
+        self.slot.attach(permit)
+    }
+
+    fn shrink_stdout_to(&self, actual: u64) {
+        self.stdout.shrink_to(actual);
+    }
+
+    fn shrink_to(&self, stream: StreamKind, actual: u64) {
+        self.file(stream).shrink_to(actual);
+    }
+
+    fn cleanup_targets(&self, paths: Vec<PathBuf>) -> Vec<CleanupTarget> {
+        let mut paths = paths.into_iter();
+        let mut targets = Vec::with_capacity(if self.stderr.is_some() { 2 } else { 1 });
+        if let Some(path) = paths.next() {
+            targets.push(CleanupTarget {
+                path,
+                _accounting: Some(Arc::clone(&self.stdout)),
+            });
+        }
+        if let (Some(path), Some(stderr)) = (paths.next(), self.stderr.as_ref()) {
+            targets.push(CleanupTarget {
+                path,
+                _accounting: Some(Arc::clone(stderr)),
+            });
+        }
+        targets.extend(paths.map(|path| CleanupTarget {
+            path,
+            _accounting: None,
+        }));
+        targets
     }
 }
 
@@ -431,8 +542,13 @@ struct SpoolEntry {
 
 #[derive(Debug)]
 struct CleanupTombstone {
-    paths: Vec<PathBuf>,
-    _accounting: Vec<Arc<EntryAccounting>>,
+    targets: Vec<CleanupTarget>,
+}
+
+#[derive(Debug)]
+struct CleanupTarget {
+    path: PathBuf,
+    _accounting: Option<Arc<FileAccounting>>,
 }
 
 #[derive(Debug)]
@@ -545,13 +661,15 @@ impl OutputStore {
 
         let (token, path, file) = create_detail_file(self.spool_directory.path())?;
         let worker_cancel = cancel.child_token();
+        let actual_written = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = oneshot::channel();
         let handle = match std::thread::Builder::new()
             .name("codex-retention-serializer".to_owned())
             .spawn({
                 let worker_cancel = worker_cancel.clone();
+                let actual_written = Arc::clone(&actual_written);
                 move || {
-                    let mut writer = CappedDetailWriter::new(file, worker_cancel);
+                    let mut writer = CappedDetailWriter::new(file, worker_cancel, actual_written);
                     let result = match serde_json::to_writer(&mut writer, &owned) {
                         Ok(()) => writer.finish(),
                         Err(_) if writer.cancel.is_cancelled() => Err(retention_cancelled()),
@@ -562,6 +680,7 @@ impl OutputStore {
             }) {
             Ok(handle) => handle,
             Err(error) => {
+                accounting.shrink_stdout_to(0);
                 cleanup_paths(vec![path], vec![accounting], &self.tombstones);
                 return Err(BridgeError::io(error));
             }
@@ -571,6 +690,7 @@ impl OutputStore {
             worker_cancel,
             path,
             accounting,
+            actual_written,
             Arc::clone(&self.tombstones),
         );
         let serialization = receiver
@@ -581,7 +701,6 @@ impl OutputStore {
             cleanup_paths(vec![path], vec![accounting], &self.tombstones);
             return Err(retention_cancelled());
         }
-        accounting.shrink_to(length);
         let expires_at = Instant::now() + self.ttl;
         self.entries
             .lock()
@@ -937,9 +1056,24 @@ fn cleanup_paths(
     accounting: Vec<Arc<EntryAccounting>>,
     tombstones: &Arc<StdMutex<Vec<CleanupTombstone>>>,
 ) {
-    let failed = paths
+    let mut paths = paths.into_iter();
+    let mut targets = Vec::new();
+    for accounting in accounting {
+        let count = if accounting.stderr.is_some() { 2 } else { 1 };
+        let owned_paths = paths.by_ref().take(count).collect();
+        targets.extend(accounting.cleanup_targets(owned_paths));
+    }
+    targets.extend(paths.map(|path| CleanupTarget {
+        path,
+        _accounting: None,
+    }));
+    cleanup_targets(targets, tombstones);
+}
+
+fn cleanup_targets(targets: Vec<CleanupTarget>, tombstones: &Arc<StdMutex<Vec<CleanupTombstone>>>) {
+    let failed = targets
         .into_iter()
-        .filter(|path| match std::fs::remove_file(path) {
+        .filter(|target| match std::fs::remove_file(&target.path) {
             Ok(()) => false,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(_) => true,
@@ -951,10 +1085,7 @@ fn cleanup_paths(
     tombstones
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .push(CleanupTombstone {
-            paths: failed,
-            _accounting: accounting,
-        });
+        .push(CleanupTombstone { targets: failed });
 }
 
 fn retry_tombstones(tombstones: &Arc<StdMutex<Vec<CleanupTombstone>>>) {
@@ -962,13 +1093,13 @@ fn retry_tombstones(tombstones: &Arc<StdMutex<Vec<CleanupTombstone>>>) {
     let mut remaining = Vec::new();
     for mut tombstone in tombstones.drain(..) {
         tombstone
-            .paths
-            .retain(|path| match std::fs::remove_file(path) {
+            .targets
+            .retain(|target| match std::fs::remove_file(&target.path) {
                 Ok(()) => false,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => false,
                 Err(_) => true,
             });
-        if !tombstone.paths.is_empty() {
+        if !tombstone.targets.is_empty() {
             remaining.push(tombstone);
         }
     }
@@ -1004,6 +1135,7 @@ struct SerializationJoinGuard {
     cancel: CancellationToken,
     path: Option<PathBuf>,
     accounting: Option<Arc<EntryAccounting>>,
+    actual_written: Arc<AtomicU64>,
     tombstones: Arc<StdMutex<Vec<CleanupTombstone>>>,
 }
 
@@ -1013,6 +1145,7 @@ impl SerializationJoinGuard {
         cancel: CancellationToken,
         path: PathBuf,
         accounting: Arc<EntryAccounting>,
+        actual_written: Arc<AtomicU64>,
         tombstones: Arc<StdMutex<Vec<CleanupTombstone>>>,
     ) -> Self {
         Self {
@@ -1020,6 +1153,7 @@ impl SerializationJoinGuard {
             cancel,
             path: Some(path),
             accounting: Some(accounting),
+            actual_written,
             tombstones,
         }
     }
@@ -1038,6 +1172,7 @@ impl SerializationJoinGuard {
         } else {
             result
         };
+        self.reconcile_accounting();
         match result {
             Ok(length) => Ok((
                 self.path.take().expect("serializer path is owned"),
@@ -1054,9 +1189,16 @@ impl SerializationJoinGuard {
     }
 
     fn cleanup(&mut self) {
+        self.reconcile_accounting();
         let paths = self.path.take().into_iter().collect();
         let accounting = self.accounting.take().into_iter().collect();
         cleanup_paths(paths, accounting, &self.tombstones);
+    }
+
+    fn reconcile_accounting(&self) {
+        if let Some(accounting) = &self.accounting {
+            accounting.shrink_stdout_to(self.actual_written.load(Ordering::Acquire));
+        }
     }
 }
 
@@ -1074,14 +1216,16 @@ struct CappedDetailWriter {
     file: std::fs::File,
     cancel: CancellationToken,
     bytes: u64,
+    actual_written: Arc<AtomicU64>,
 }
 
 impl CappedDetailWriter {
-    fn new(file: std::fs::File, cancel: CancellationToken) -> Self {
+    fn new(file: std::fs::File, cancel: CancellationToken, actual_written: Arc<AtomicU64>) -> Self {
         Self {
             file,
             cancel,
             bytes: 0,
+            actual_written,
         }
     }
 
@@ -1111,9 +1255,19 @@ impl std::io::Write for CappedDetailWriter {
             let count = (buffer.len() - written)
                 .min(READ_BUFFER_BYTES)
                 .min(remaining as usize);
-            std::io::Write::write_all(&mut self.file, &buffer[written..written + count])?;
-            self.bytes += count as u64;
-            written += count;
+            match std::io::Write::write(&mut self.file, &buffer[written..written + count])? {
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write retained detail",
+                    ));
+                }
+                count => {
+                    self.bytes += count as u64;
+                    written += count;
+                    self.actual_written.store(self.bytes, Ordering::Release);
+                }
+            }
         }
         Ok(written)
     }
@@ -1261,7 +1415,7 @@ impl OutputSink {
         stream: StreamKind,
         bytes: &[u8],
     ) -> BridgeResult<()> {
-        if !self.accounting.reserve(bytes.len() as u64) {
+        if !self.accounting.reserve(stream, bytes.len() as u64) {
             let mut error = BridgeError::new(
                 ErrorCode::OutputLimit,
                 "global output spool quota is exhausted",
@@ -1320,18 +1474,26 @@ impl OutputSink {
             Arc::clone(&self.accounting),
             Arc::clone(&self.tombstones),
         )?;
-        spool
-            .stdout
-            .write_all(&stdout_bytes)
-            .await
-            .map_err(BridgeError::io)?;
-        spool
-            .stderr
-            .as_mut()
-            .expect("completed pending spool")
-            .write_all(&stderr_bytes)
-            .await
-            .map_err(BridgeError::io)?;
+        let (stdout_result, stdout_written) =
+            write_all_counted(&mut spool.stdout, &stdout_bytes).await;
+        if let Err(error) = stdout_result {
+            self.accounting
+                .shrink_to(StreamKind::Stdout, stdout_written as u64);
+            self.accounting.shrink_to(StreamKind::Stderr, 0);
+            return Err(BridgeError::io(error));
+        }
+        let (stderr_result, stderr_written) = write_all_counted(
+            spool.stderr.as_mut().expect("completed pending spool"),
+            &stderr_bytes,
+        )
+        .await;
+        if let Err(error) = stderr_result {
+            self.accounting
+                .shrink_to(StreamKind::Stdout, stdout_written as u64);
+            self.accounting
+                .shrink_to(StreamKind::Stderr, stderr_written as u64);
+            return Err(BridgeError::io(error));
+        }
         self.retained = RetainedOutput::Spool(Box::new(spool));
         Ok(())
     }
@@ -1512,26 +1674,55 @@ enum RetainedOutput {
     Spool(Box<PendingSpool>),
 }
 
+async fn write_all_counted<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> (io::Result<()>, usize) {
+    let mut written = 0;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]).await {
+            Ok(0) => {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write buffered output",
+                    )),
+                    written,
+                );
+            }
+            Ok(count) => written += count,
+            Err(error) => return (Err(error), written),
+        }
+    }
+    (Ok(()), written)
+}
+
 impl RetainedOutput {
     async fn write(&mut self, stream: StreamKind, bytes: &[u8]) -> BridgeResult<()> {
         match (self, stream) {
             (Self::Memory { stdout, .. }, StreamKind::Stdout) => stdout.extend_from_slice(bytes),
             (Self::Memory { stderr, .. }, StreamKind::Stderr) => stderr.extend_from_slice(bytes),
             (Self::Spool(spool), StreamKind::Stdout) => {
-                spool
-                    .stdout
-                    .write_all(bytes)
-                    .await
-                    .map_err(BridgeError::io)?;
+                let (result, written) = write_all_counted(&mut spool.stdout, bytes).await;
+                if let Err(error) = result {
+                    spool
+                        .accounting
+                        .release(StreamKind::Stdout, (bytes.len() - written) as u64);
+                    return Err(BridgeError::io(error));
+                }
             }
             (Self::Spool(spool), StreamKind::Stderr) => {
-                spool
-                    .stderr
-                    .as_mut()
-                    .expect("completed pending spool")
-                    .write_all(bytes)
-                    .await
-                    .map_err(BridgeError::io)?;
+                let (result, written) = write_all_counted(
+                    spool.stderr.as_mut().expect("completed pending spool"),
+                    bytes,
+                )
+                .await;
+                if let Err(error) = result {
+                    spool
+                        .accounting
+                        .release(StreamKind::Stderr, (bytes.len() - written) as u64);
+                    return Err(BridgeError::io(error));
+                }
             }
         }
         Ok(())
@@ -1722,13 +1913,13 @@ fn is_single_diagnostic_field(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
     use std::task::{Context, Poll};
 
     use super::{
         ByteQuota, CleanupTombstone, EntryAccounting, InternalSpoolOwner, OutputStore,
-        PendingSpool, StoredAggregateKind, StoredProvenance, cleanup_entry, create_private_file,
-        create_spool, retry_tombstones,
+        PendingSpool, StoredAggregateKind, StoredProvenance, cleanup_entry, cleanup_paths,
+        create_private_file, create_spool, retry_tombstones, write_all_counted,
     };
     use crate::config::{
         MAX_GLOBAL_SPOOL_QUOTA_BYTES, MAX_SPOOL_ENTRIES, MIN_GLOBAL_SPOOL_QUOTA_BYTES,
@@ -1736,6 +1927,7 @@ mod tests {
     use crate::ssh::RuntimePaths;
     use serde::Serialize;
     use serde::ser::{SerializeSeq, Serializer};
+    use tokio::io::AsyncReadExt as _;
     use tokio_util::sync::CancellationToken;
 
     struct ErrorAfterBytes {
@@ -1749,12 +1941,75 @@ mod tests {
 
     struct FailingDetail;
 
+    struct PanicDetail;
+
+    struct BlockingFailDetail {
+        gate: Arc<(StdMutex<(bool, bool)>, Condvar)>,
+        payload: String,
+    }
+
+    struct PartialErrorWriter {
+        first_write: usize,
+        wrote_once: bool,
+    }
+
     impl Serialize for FailingDetail {
         fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
             Err(serde::ser::Error::custom("injected serializer failure"))
+        }
+    }
+
+    impl Serialize for PanicDetail {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            sequence.serialize_element("prefix written before panic")?;
+            panic!("injected serializer panic");
+        }
+    }
+
+    impl Serialize for BlockingFailDetail {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut sequence = serializer.serialize_seq(Some(2))?;
+            sequence.serialize_element(&self.payload)?;
+            let (lock, ready) = &*self.gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            ready.notify_all();
+            while !state.1 {
+                state = ready.wait(state).unwrap();
+            }
+            Err(serde::ser::Error::custom("injected failure after prefix"))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PartialErrorWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.wrote_once {
+                return Poll::Ready(Err(std::io::Error::other("injected partial write")));
+            }
+            self.wrote_once = true;
+            Poll::Ready(Ok(self.first_write.min(bytes.len())))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -1801,6 +2056,21 @@ mod tests {
             )
             .unwrap();
         (accounting, Arc::new(StdMutex::new(Vec::new())))
+    }
+
+    async fn spooled_capture(store: &OutputStore) -> super::CapturedOutput {
+        store
+            .capture(
+                tokio::io::repeat(b'x').take(300 * 1024),
+                tokio::io::empty(),
+                super::CaptureLimits {
+                    preview_bytes: 16,
+                    max_output_bytes: 1024 * 1024,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1911,6 +2181,87 @@ mod tests {
         assert_eq!(quota.used(), 448 * 1024 * 1024);
         assert!(quota.try_reserve(64 * 1024 * 1024));
         assert!(!quota.try_reserve(1));
+    }
+
+    #[test]
+    fn retention_cleanup_releases_each_unlinked_stream_but_keeps_the_shared_slot() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let stdout_path = directory.path().join("mixed.stdout");
+        let stderr_path = directory.path().join("mixed.stderr");
+        std::fs::write(&stdout_path, b"0123456789").unwrap();
+        std::fs::create_dir(&stderr_path).unwrap();
+        let blocker = stderr_path.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let quota = Arc::new(ByteQuota::new(1024));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let accounting = Arc::new(EntryAccounting::new(Arc::clone(&quota)));
+        assert!(accounting.reserve(super::StreamKind::Stdout, 10));
+        assert!(accounting.reserve(super::StreamKind::Stderr, 20));
+        accounting
+            .attach_slot(Arc::clone(&slots).try_acquire_owned().unwrap())
+            .unwrap();
+        let tombstones = Arc::new(StdMutex::new(Vec::new()));
+
+        cleanup_paths(
+            vec![stdout_path.clone(), stderr_path.clone()],
+            vec![accounting],
+            &tombstones,
+        );
+
+        assert!(!stdout_path.exists());
+        assert_eq!(
+            quota.used(),
+            20,
+            "only the failed stderr path stays charged"
+        );
+        assert_eq!(slots.available_permits(), 0, "the entry slot is shared");
+
+        std::fs::remove_file(blocker).unwrap();
+        std::fs::remove_dir(stderr_path).unwrap();
+        retry_tombstones(&tombstones);
+        assert_eq!(quota.used(), 0);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn retention_partial_write_reports_exact_bytes_for_reservation_rollback() {
+        let quota = Arc::new(ByteQuota::new(1024));
+        let accounting = Arc::new(EntryAccounting::new(Arc::clone(&quota)));
+        let intended = b"abcdef";
+        assert!(accounting.reserve(super::StreamKind::Stdout, intended.len() as u64));
+        let mut writer = PartialErrorWriter {
+            first_write: 2,
+            wrote_once: false,
+        };
+
+        let (result, written) = write_all_counted(&mut writer, intended).await;
+        assert!(result.is_err());
+        accounting.release(super::StreamKind::Stdout, (intended.len() - written) as u64);
+        assert_eq!(written, 2);
+        assert_eq!(quota.used(), 2);
+        drop(accounting);
+        assert_eq!(quota.used(), 0);
+    }
+
+    #[test]
+    fn retention_cleanup_treats_not_found_as_success_and_releases_resources() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let missing = directory.path().join("already-gone.stdout");
+        let quota = Arc::new(ByteQuota::new(1024));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let accounting = Arc::new(EntryAccounting::new(Arc::clone(&quota)));
+        assert!(accounting.reserve(super::StreamKind::Stdout, 7));
+        accounting
+            .attach_slot(Arc::clone(&slots).try_acquire_owned().unwrap())
+            .unwrap();
+        let tombstones = Arc::new(StdMutex::new(Vec::new()));
+
+        cleanup_paths(vec![missing], vec![accounting], &tombstones);
+
+        assert_eq!(quota.used(), 0);
+        assert_eq!(slots.available_permits(), 1);
+        assert!(tombstones.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2159,6 +2510,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_serializer_panic_reconciles_and_releases_all_resources() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store = OutputStore::with_limits(&runtime, MAX_GLOBAL_SPOOL_QUOTA_BYTES, 1).unwrap();
+        let error = store
+            .retain_serialized_detail(
+                StoredProvenance::Aggregate {
+                    kind: StoredAggregateKind::Hosts,
+                    source_count: 1,
+                },
+                PanicDetail,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Io);
+        assert_eq!(error.message, "result retention serialization failed");
+        assert_eq!(store.quota.used(), 0);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES);
+        assert_eq!(store.retention_jobs.available_permits(), 1);
+        assert_eq!(
+            std::fs::read_dir(store.spool_directory.path())
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_failed_serializer_unlink_tombstone_charges_only_actual_bytes() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store =
+            Arc::new(OutputStore::with_limits(&runtime, MAX_GLOBAL_SPOOL_QUOTA_BYTES, 1).unwrap());
+        let gate = Arc::new((StdMutex::new((false, false)), Condvar::new()));
+        let task_store = Arc::clone(&store);
+        let task_gate = Arc::clone(&gate);
+        let task = tokio::spawn(async move {
+            task_store
+                .retain_serialized_detail(
+                    StoredProvenance::Aggregate {
+                        kind: StoredAggregateKind::Hosts,
+                        source_count: 1,
+                    },
+                    BlockingFailDetail {
+                        gate: task_gate,
+                        payload: "x".repeat(4096),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if gate.0.lock().unwrap().0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = std::fs::read_dir(store.spool_directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let actual = std::fs::metadata(&path).unwrap().len();
+        assert!(actual > 0);
+        assert!(actual < crate::MAX_OUTPUT_BYTES);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let blocker = path.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        {
+            let mut state = gate.0.lock().unwrap();
+            state.1 = true;
+            gate.1.notify_all();
+        }
+
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Io);
+        assert_eq!(store.quota.used(), actual);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES - 1);
+        assert_eq!(store.tombstones.lock().unwrap().len(), 1);
+
+        std::fs::remove_file(blocker).unwrap();
+        std::fs::remove_dir(path).unwrap();
+        retry_tombstones(&store.tombstones);
+        assert_eq!(store.quota.used(), 0);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES);
+    }
+
+    #[tokio::test]
     async fn task8_spool_quota_unlink_failure_pins_charge_and_slot_until_tombstone_retry() {
         let base = tempfile::TempDir::new().unwrap();
         let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
@@ -2250,6 +2697,140 @@ mod tests {
         assert!(store.quota.used() > 0);
         drop(lease);
         assert_eq!(store.quota.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn retention_reader_wins_ttl_and_pins_the_whole_entry_until_release() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store = OutputStore::with_ttl_and_limits(
+            &runtime,
+            std::time::Duration::from_millis(10),
+            MAX_GLOBAL_SPOOL_QUOTA_BYTES,
+            1,
+        )
+        .unwrap();
+        let reference = store
+            .retain_serialized_detail(
+                StoredProvenance::Aggregate {
+                    kind: StoredAggregateKind::Hosts,
+                    source_count: 1,
+                },
+                "ttl reader wins",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (_file, _length, lease) = store
+            .open_independent(&reference, super::StreamKind::Stdout, 0)
+            .unwrap();
+        let lease = lease.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(reference.as_str())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            store
+                .open_independent(&reference, super::StreamKind::Stdout, 0)
+                .is_err()
+        );
+        assert!(store.quota.used() > 0);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES - 1);
+        drop(lease);
+        assert_eq!(store.quota.used(), 0);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn retention_ttl_wins_before_reader_and_releases_resources() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store = OutputStore::with_ttl_and_limits(
+            &runtime,
+            std::time::Duration::from_millis(10),
+            MAX_GLOBAL_SPOOL_QUOTA_BYTES,
+            1,
+        )
+        .unwrap();
+        let reference = store
+            .retain_serialized_detail(
+                StoredProvenance::Aggregate {
+                    kind: StoredAggregateKind::Hosts,
+                    source_count: 1,
+                },
+                "ttl removal wins",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store.quota.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            store
+                .open_independent(&reference, super::StreamKind::Stdout, 0)
+                .is_err()
+        );
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn retention_reader_wins_explicit_discard_and_pins_accounting() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store = OutputStore::with_limits(&runtime, MAX_GLOBAL_SPOOL_QUOTA_BYTES, 1).unwrap();
+        let captured = spooled_capture(&store).await;
+        let reference = captured.reference.as_ref().unwrap();
+        let (_file, _length, lease) = store
+            .open_independent(reference, super::StreamKind::Stdout, 0)
+            .unwrap();
+        let lease = lease.unwrap();
+
+        store.discard(&captured).await;
+
+        assert!(
+            store
+                .open_independent(reference, super::StreamKind::Stdout, 0)
+                .is_err()
+        );
+        assert_eq!(store.quota.used(), captured.aggregate_bytes);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES - 1);
+        drop(lease);
+        assert_eq!(store.quota.used(), 0);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn retention_explicit_discard_wins_before_reader_and_releases_resources() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store = OutputStore::with_limits(&runtime, MAX_GLOBAL_SPOOL_QUOTA_BYTES, 1).unwrap();
+        let captured = spooled_capture(&store).await;
+        let reference = captured.reference.as_ref().unwrap().clone();
+
+        store.discard(&captured).await;
+
+        assert!(
+            store
+                .open_independent(&reference, super::StreamKind::Stdout, 0)
+                .is_err()
+        );
+        assert_eq!(store.quota.used(), 0);
+        assert_eq!(store.entry_slots.available_permits(), MAX_SPOOL_ENTRIES);
     }
 
     #[tokio::test]
