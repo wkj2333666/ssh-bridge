@@ -24,6 +24,12 @@ const MAX_GLOBAL_CONCURRENCY: usize = 32;
 const MAX_PER_HOST_CONCURRENCY: usize = 8;
 
 pub const MAX_REMOTE_CONTEXT_ROOT_BYTES: usize = 65_536;
+pub const DEFAULT_GLOBAL_SPOOL_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
+pub const MIN_GLOBAL_SPOOL_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_GLOBAL_SPOOL_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_RETENTION_SERIALIZATION_JOBS: usize = 2;
+pub const MAX_RETENTION_SERIALIZATION_JOBS: usize = 4;
+pub const MAX_SPOOL_ENTRIES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -56,6 +62,8 @@ pub struct Limits {
     pub max_output_bytes: u64,
     pub global_concurrency: usize,
     pub per_host_concurrency: usize,
+    pub global_spool_quota_bytes: u64,
+    pub retention_serialization_jobs: usize,
 }
 
 impl Default for Limits {
@@ -71,6 +79,8 @@ impl Default for Limits {
             max_output_bytes: MAX_OUTPUT_BYTES,
             global_concurrency: 8,
             per_host_concurrency: 2,
+            global_spool_quota_bytes: DEFAULT_GLOBAL_SPOOL_QUOTA_BYTES,
+            retention_serialization_jobs: DEFAULT_RETENTION_SERIALIZATION_JOBS,
         }
     }
 }
@@ -264,6 +274,18 @@ fn validate_limits(limits: &Limits) -> BridgeResult<()> {
         "per_host_concurrency",
         limits.per_host_concurrency,
         MAX_PER_HOST_CONCURRENCY,
+    )?;
+    if !(MIN_GLOBAL_SPOOL_QUOTA_BYTES..=MAX_GLOBAL_SPOOL_QUOTA_BYTES)
+        .contains(&limits.global_spool_quota_bytes)
+    {
+        return Err(BridgeError::invalid_config(format!(
+            "global_spool_quota_bytes must be between {MIN_GLOBAL_SPOOL_QUOTA_BYTES} and {MAX_GLOBAL_SPOOL_QUOTA_BYTES}"
+        )));
+    }
+    validate_usize(
+        "retention_serialization_jobs",
+        limits.retention_serialization_jobs,
+        MAX_RETENTION_SERIALIZATION_JOBS,
     )?;
     if limits.per_host_concurrency > limits.global_concurrency {
         return Err(BridgeError::invalid_config(

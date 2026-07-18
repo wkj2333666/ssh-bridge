@@ -5,23 +5,27 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use codex_ssh_bridge::capability::ShellRequest;
 use codex_ssh_bridge::output::OutputStore;
 use codex_ssh_bridge::output::StreamKind;
 use codex_ssh_bridge::remote::{
-    ApplyPatchRequest, ApplyPatchResult, EncodedValue, EntryError, EntryErrorCode, HostInfo,
-    HostsResult, ListEntry, ListRequest, ListResult, OutputReadResult, ReadEntry, ReadRequest,
-    ReadResult, RemoteBridge, RemoteContext, RemoteFileKind, RemoteMetadata, RemoteRunRequest,
-    RunShell, RunStdin, SearchEngine, SearchMatch, SearchRequest, SearchResult, ShellMetadata,
-    ShellName, StatEntry, StatRequest, StatResult, ValueEncoding, WriteEncoding, WriteMode,
-    WriteOperation, WriteRequest, WriteResult,
+    AggregateKind, ApplyPatchRequest, ApplyPatchResult, EncodedValue, EntryError, EntryErrorCode,
+    HostInfo, HostsResult, ListEntry, ListRequest, ListResult, OutputReadResult, ReadEntry,
+    ReadRequest, ReadResult, RemoteBridge, RemoteContext, RemoteFileKind, RemoteMetadata,
+    RemoteRunRequest, RetentionProvenance, RunShell, RunStdin, SearchEngine, SearchMatch,
+    SearchRequest, SearchResult, ShellMetadata, ShellName, StatEntry, StatRequest, StatResult,
+    ValueEncoding, WriteEncoding, WriteMode, WriteOperation, WriteRequest, WriteResult,
 };
 use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshRunner};
 use codex_ssh_bridge::{BridgeError, ErrorCode};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+
+use serde::Serialize;
+use serde::ser::{SerializeSeq, Serializer};
 
 fn fixture(root: &std::path::Path, rg: bool) -> (tempfile::TempDir, Arc<SshRunner>, RemoteBridge) {
     fixture_with_options(root, rg, None, &[])
@@ -132,6 +136,158 @@ fn context() -> RemoteContext {
             fallback: false,
         },
     }
+}
+
+#[tokio::test]
+async fn task8_retention_spool_round_trips_remote_and_aggregate_provenance() {
+    let root = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture(root.path(), true);
+    let remote_context = context();
+    let owned = vec!["TASK8_RETAINED_DETAIL", "second"];
+    let expected = serde_json::to_vec(&owned).unwrap();
+    let reference = bridge
+        .retain_serialized_detail(
+            RetentionProvenance::Remote(remote_context.clone()),
+            owned,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let page = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref: reference.as_str().to_owned(),
+                stream: StreamKind::Stdout,
+                offset: 0,
+                max_bytes: 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.provenance, RetentionProvenance::Remote(remote_context));
+    assert_eq!(page.data.encoding, ValueEncoding::Utf8);
+    assert_eq!(page.data.value.as_bytes(), expected);
+    assert!(serde_json::to_value(&page).is_ok());
+
+    let aggregate = RetentionProvenance::Aggregate {
+        kind: AggregateKind::Hosts,
+        source_count: 37,
+    };
+    let reference = bridge
+        .retain_serialized_detail(
+            aggregate.clone(),
+            vec!["host-a", "host-b"],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let page = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref: reference.as_str().to_owned(),
+                stream: StreamKind::Stdout,
+                offset: 0,
+                max_bytes: 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.provenance, aggregate);
+    assert!(serde_json::to_value(&page).is_ok());
+}
+
+#[tokio::test]
+async fn task8_retention_spool_accepts_exact_serialized_limit_and_rejects_first_byte_over() {
+    let root = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture(root.path(), true);
+    let exact = "x".repeat(codex_ssh_bridge::MAX_OUTPUT_BYTES as usize - 2);
+    let reference = bridge
+        .retain_serialized_detail(
+            RetentionProvenance::Remote(context()),
+            exact,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let page = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref: reference.as_str().to_owned(),
+                stream: StreamKind::Stdout,
+                offset: codex_ssh_bridge::MAX_OUTPUT_BYTES - 1,
+                max_bytes: 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.data.value, "\"");
+    assert!(page.eof);
+
+    let over = "x".repeat(codex_ssh_bridge::MAX_OUTPUT_BYTES as usize - 1);
+    let error = bridge
+        .retain_serialized_detail(
+            RetentionProvenance::Remote(context()),
+            over,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Io);
+}
+
+struct CancellableDetail {
+    progress: Arc<AtomicUsize>,
+    chunk: String,
+}
+
+impl Serialize for CancellableDetail {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(1_024))?;
+        for _ in 0..1_024 {
+            self.progress.fetch_add(1, Ordering::Release);
+            sequence.serialize_element(&self.chunk)?;
+            std::thread::yield_now();
+        }
+        sequence.end()
+    }
+}
+
+#[tokio::test]
+async fn task8_retention_spool_cancellation_is_polled_and_blocking_join_is_awaited() {
+    let root = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture(root.path(), true);
+    let progress = Arc::new(AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let future = bridge.retain_serialized_detail(
+        RetentionProvenance::Remote(context()),
+        CancellableDetail {
+            progress: Arc::clone(&progress),
+            chunk: "x".repeat(64 * 1024),
+        },
+        cancel.clone(),
+    );
+    tokio::pin!(future);
+    while progress.load(Ordering::Acquire) < 2 {
+        tokio::select! {
+            result = &mut future => panic!("serialization finished before cancellation: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), &mut future)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    let stopped = progress.load(Ordering::Acquire);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(progress.load(Ordering::Acquire), stopped);
 }
 
 fn value(value: &str) -> EncodedValue {
@@ -1163,7 +1319,7 @@ fn task4_request_and_result_shapes_are_closed_and_serializable() {
     assert_eq!(serde_json::to_value(search).unwrap()["engine"], "rg");
 
     let page = OutputReadResult {
-        context: context(),
+        provenance: RetentionProvenance::Remote(context()),
         stream: StreamKind::Stdout,
         offset: 0,
         next_offset: 3,
@@ -4903,7 +5059,10 @@ async fn output_read_requires_and_uses_command_provenance() {
         )
         .await
         .unwrap();
-    assert_eq!(page.context.host, "dev");
+    assert!(matches!(
+        &page.provenance,
+        RetentionProvenance::Remote(context) if context.host == "dev"
+    ));
     assert_eq!(page.data.encoding, ValueEncoding::Base64);
     assert_eq!(page.next_offset, 16);
 

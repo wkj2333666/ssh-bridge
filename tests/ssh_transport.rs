@@ -20,10 +20,11 @@ use codex_ssh_bridge::config::{Config, HostProfile, Limits};
 use codex_ssh_bridge::error::{BridgeError, ErrorCode};
 use codex_ssh_bridge::output::{CaptureLimits, OutputReference, OutputStore, StreamKind};
 use codex_ssh_bridge::path::RemotePath;
+use codex_ssh_bridge::remote::{RemoteBridge, StatRequest};
 use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshPolicy, SshRunner, build_ssh_argv};
 use codex_ssh_bridge::{MAX_OUTPUT_BYTES, MAX_READ_BYTES, MAX_WRITE_BYTES};
 use tempfile::TempDir;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
@@ -2860,6 +2861,74 @@ async fn exact_64_mib_spills_privately_pages_both_streams_and_expires() {
         .await
         .unwrap_err();
     assert_eq!(unknown.message, "output reference is unknown or expired");
+}
+
+#[tokio::test]
+async fn task8_internal_capture_quota_is_shared_with_a_committed_command_spool() {
+    let remote_root = TempDir::new().unwrap();
+    fs::write(remote_root.path().join("a"), b"x").unwrap();
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = Arc::new(
+        OutputStore::with_limits(
+            &runtime,
+            codex_ssh_bridge::config::MIN_GLOBAL_SPOOL_QUOTA_BYTES,
+            1,
+        )
+        .unwrap(),
+    );
+    let environment = BTreeMap::from([
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("local-fixed"),
+        ),
+        (
+            OsString::from("FAKE_SSH_ROOT"),
+            remote_root.path().as_os_str().to_owned(),
+        ),
+    ]);
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config_with_host(
+                "dev",
+                remote_root.path().to_str().unwrap(),
+            )),
+            runtime,
+            Arc::clone(&store),
+            fake_ssh_path(),
+            environment,
+        )
+        .unwrap(),
+    );
+    let bridge = RemoteBridge::new(runner);
+    let request = StatRequest {
+        host: "dev".to_owned(),
+        paths: vec!["a".to_owned()],
+    };
+    bridge
+        .stat(request.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let captured = store
+        .capture(
+            tokio::io::repeat(b'x').take(MAX_OUTPUT_BYTES),
+            tokio::io::empty(),
+            CaptureLimits {
+                preview_bytes: 16,
+                max_output_bytes: MAX_OUTPUT_BYTES,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(captured.reference.is_some());
+
+    let error = bridge
+        .stat(request, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::OutputLimit);
 }
 
 #[tokio::test]
