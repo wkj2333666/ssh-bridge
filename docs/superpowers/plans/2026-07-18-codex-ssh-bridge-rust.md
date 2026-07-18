@@ -173,7 +173,7 @@ git commit -m "feat: add Rust bridge core primitives"
 
 **Interfaces:**
 - Consumes: `Config`, `HostProfile`, `RemotePath`, `shell_word`, `BridgeResult`.
-- Produces: `SshPolicy::for_host(&Config, &HostProfile, &RuntimePaths) -> SshPolicy`.
+- Produces: `SshPolicy::for_host(&Config, ResolvedHost<'_>, &RuntimePaths, resolved_connection_identity: &str) -> BridgeResult<SshPolicy>`. The later runner obtains `resolved_connection_identity` from system `ssh -G`; Task 2 uses a stable fixture string and does not reimplement OpenSSH config parsing.
 - Produces: `build_ssh_argv(&SshPolicy, host: &str, remote_command: &str) -> Vec<OsString>`.
 - Produces: `Capability { physical_root, shell: ShellKind, bash_version, tools }`.
 - Produces: `CapabilityCache::get_or_probe(host, probe_fn)` and `invalidate(host)`.
