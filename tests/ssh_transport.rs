@@ -23,6 +23,7 @@ use codex_ssh_bridge::path::RemotePath;
 use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshPolicy, SshRunner, build_ssh_argv};
 use codex_ssh_bridge::{MAX_OUTPUT_BYTES, MAX_READ_BYTES};
 use tempfile::TempDir;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
@@ -884,6 +885,12 @@ async fn wait_for_process_exit(pid: u32) {
     .expect("fake SSH child survived process-group cancellation");
 }
 
+fn force_kill_process(pid: u32) {
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+}
+
 #[tokio::test]
 async fn runner_resolves_once_probes_once_and_uses_hardened_ssh_g() {
     let log_dir = TempDir::new().unwrap();
@@ -1070,6 +1077,9 @@ async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
 async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
     let cases = [
         ("host-key", ErrorCode::HostKeyUnknown, false),
+        ("host-key-ed25519", ErrorCode::HostKeyUnknown, false),
+        ("host-key-rsa", ErrorCode::HostKeyUnknown, false),
+        ("host-key-ecdsa", ErrorCode::HostKeyUnknown, false),
         ("auth", ErrorCode::AuthRequired, false),
         ("connect-timeout", ErrorCode::ConnectTimeout, true),
         ("remote", ErrorCode::RemoteExit, false),
@@ -1098,6 +1108,42 @@ async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
         if kind == "remote" {
             assert_eq!(error.details.exit_status, Some(7));
         }
+    }
+}
+
+#[tokio::test]
+async fn fuzzy_or_remote_spoofed_exit_255_diagnostics_are_not_transport_failures() {
+    let diagnostics = [
+        "Host key verification failed. trailing text",
+        "remote: Host key verification failed.",
+        "fixture@fake.internal: Permission denied (publickey). trailing text",
+        "Permission denied (publickey).",
+        "ssh: connect to host fake.internal port 22: Connection timed out trailing text",
+        "remote: ssh: connect to host fake.internal port 22: Connection timed out",
+        "connection timed out",
+    ];
+    for diagnostic in diagnostics {
+        let fixture = task3_runner(
+            &["dev"],
+            Limits::default(),
+            Duration::from_secs(600),
+            &[
+                ("FAKE_SSH_MODE", "error".to_owned()),
+                ("FAKE_SSH_ERROR", "diagnostic".to_owned()),
+                ("FAKE_SSH_DIAGNOSTIC", diagnostic.to_owned()),
+            ],
+        );
+        let error = fixture
+            .runner
+            .execute(
+                request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RemoteExit, "{diagnostic:?}");
+        assert!(!error.retryable, "{diagnostic:?}");
+        assert_eq!(error.details.exit_status, Some(255), "{diagnostic:?}");
     }
 }
 
@@ -1388,6 +1434,229 @@ async fn cancellation_during_capability_probe_is_remote_best_effort_and_kills_th
     assert_eq!(error.code, ErrorCode::Cancelled);
     assert_eq!(error.details.remote_process_may_continue, Some(true));
     wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
+async fn cancellation_still_kills_pipe_inheriting_descendants_after_ssh_parent_exit() {
+    let files = TempDir::new().unwrap();
+    let pid_file = files.path().join("child.pid");
+    let parent_exit = files.path().join("parent.exit");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "orphan-streams".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_CHILD_PID_FILE", pid_file.display().to_string()),
+            (
+                "FAKE_SSH_PARENT_EXIT_FILE",
+                parent_exit.display().to_string(),
+            ),
+        ],
+    );
+    let cancel = CancellationToken::new();
+    let mut task = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_secs(20)),
+                    token,
+                )
+                .await
+        })
+    };
+    wait_for_file(&pid_file).await;
+    wait_for_file(&parent_exit).await;
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    sleep(Duration::from_millis(20)).await;
+    cancel.cancel();
+    let result = timeout(Duration::from_millis(250), &mut task).await;
+    let error = match result {
+        Ok(result) => result.unwrap().unwrap_err(),
+        Err(_) => {
+            force_kill_process(pid);
+            let _ = timeout(Duration::from_millis(250), &mut task).await;
+            task.abort();
+            panic!("cancel was ignored after the SSH parent exited")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
+async fn deadline_still_kills_pipe_inheriting_descendants_after_ssh_parent_exit() {
+    let files = TempDir::new().unwrap();
+    let pid_file = files.path().join("child.pid");
+    let parent_exit = files.path().join("parent.exit");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "orphan-streams".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_CHILD_PID_FILE", pid_file.display().to_string()),
+            (
+                "FAKE_SSH_PARENT_EXIT_FILE",
+                parent_exit.display().to_string(),
+            ),
+        ],
+    );
+    let mut task = {
+        let runner = Arc::clone(&fixture.runner);
+        tokio::spawn(async move {
+            runner
+                .execute(
+                    request("dev", ShellRequest::Auto, Duration::from_millis(80)),
+                    CancellationToken::new(),
+                )
+                .await
+        })
+    };
+    wait_for_file(&pid_file).await;
+    wait_for_file(&parent_exit).await;
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let result = timeout(Duration::from_millis(450), &mut task).await;
+    let error = match result {
+        Ok(result) => result.unwrap().unwrap_err(),
+        Err(_) => {
+            force_kill_process(pid);
+            let _ = timeout(Duration::from_millis(250), &mut task).await;
+            task.abort();
+            panic!("deadline was ignored after the SSH parent exited")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::CommandTimeout);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
+async fn output_capture_honors_a_pre_cancelled_token() {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = OutputStore::new(&runtime).unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = store
+        .capture(
+            tokio::io::empty(),
+            tokio::io::empty(),
+            CaptureLimits {
+                preview_bytes: 16,
+                max_output_bytes: 1024,
+            },
+            cancel,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.bytes_seen, Some(0));
+}
+
+#[tokio::test]
+async fn output_capture_cancellation_aborts_drains_and_cleans_pending_spool() {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let cancel = CancellationToken::new();
+    let (mut writer, reader) = tokio::io::duplex(512 * 1024);
+    let mut task = {
+        let store = Arc::clone(&store);
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            store
+                .capture(
+                    reader,
+                    tokio::io::empty(),
+                    CaptureLimits {
+                        preview_bytes: 16,
+                        max_output_bytes: 1024 * 1024,
+                    },
+                    token,
+                )
+                .await
+        })
+    };
+    writer.write_all(&vec![0; 300 * 1024]).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while private_spool_files(&runtime).len() != 2 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("capture never spilled");
+    cancel.cancel();
+    let result = timeout(Duration::from_millis(250), &mut task).await;
+    let error = match result {
+        Ok(result) => result.unwrap().unwrap_err(),
+        Err(_) => {
+            drop(writer);
+            let _ = timeout(Duration::from_millis(250), &mut task).await;
+            task.abort();
+            panic!("standalone output capture ignored cancellation")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.bytes_seen, Some(300 * 1024));
+    assert!(private_spool_files(&runtime).is_empty());
+}
+
+struct ErrorAfterBytes {
+    remaining: usize,
+}
+
+impl AsyncRead for ErrorAfterBytes {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::other("fixture read failure")));
+        }
+        let count = self.remaining.min(buffer.remaining());
+        buffer.initialize_unfilled_to(count).fill(b'x');
+        buffer.advance(count);
+        self.remaining -= count;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn output_capture_read_error_cleans_an_unregistered_spool() {
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = OutputStore::new(&runtime).unwrap();
+    let error = store
+        .capture(
+            ErrorAfterBytes {
+                remaining: 300 * 1024,
+            },
+            tokio::io::empty(),
+            CaptureLimits {
+                preview_bytes: 16,
+                max_output_bytes: 1024 * 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Io);
+    assert!(private_spool_files(&runtime).is_empty());
 }
 
 #[tokio::test]
