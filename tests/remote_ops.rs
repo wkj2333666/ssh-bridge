@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use codex_ssh_bridge::capability::ShellRequest;
 use codex_ssh_bridge::output::OutputStore;
@@ -386,7 +386,7 @@ async fn readonly_real_mismatch_retries_exactly_once_from_the_list_script() {
     std::fs::write(
         &find,
         format!(
-            "#!/bin/sh\ncase \" $* \" in *codex-probe-find*) exec /usr/bin/find \"$@\";; esac\nif [ ! -e {} ]; then : >{}; exit 64; fi\nexec /usr/bin/find \"$@\"\n",
+            "#!/bin/sh\ncase \" $* \" in *codex-probe-find*) exec /usr/bin/find \"$@\";; *codex-sentinel-list-find*) if [ ! -e {} ]; then : >{}; printf 'corrupt\\000'; exit 0; fi;; esac\nexec /usr/bin/find \"$@\"\n",
             codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
             codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
         ),
@@ -443,6 +443,459 @@ async fn readonly_real_mismatch_retries_exactly_once_from_the_list_script() {
     let log = std::fs::read_to_string(log).unwrap();
     assert_eq!(log.lines().filter(|line| *line == "P").count(), 2);
     assert_eq!(log.lines().filter(|line| *line == "C").count(), 2);
+}
+
+#[tokio::test]
+async fn readonly_stale_sentinel_retries_each_production_form_exactly_once() {
+    struct Case {
+        tool: &'static str,
+        sentinel: &'static str,
+        failure: &'static str,
+        operation: &'static str,
+        rg: bool,
+        expected_commands: usize,
+        expected_sentinel_invocations: usize,
+    }
+
+    let cases = [
+        Case {
+            tool: "find",
+            sentinel: "codex-sentinel-list-find",
+            failure: "printf 'corrupt\\000'; exit 0",
+            operation: "list",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 4,
+        },
+        Case {
+            tool: "xargs",
+            sentinel: "codex-sentinel-list-xargs",
+            failure: "exit 0",
+            operation: "list",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 4,
+        },
+        Case {
+            tool: "head",
+            sentinel: "bound",
+            failure: "printf zzz; exit 0",
+            operation: "list",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 2,
+        },
+        Case {
+            tool: "mktemp",
+            sentinel: "codex-sentinel-bound",
+            failure: "shift; d=${1%XXXXXX}bad; mkdir -m 755 \"$d\"; printf '%s\\n' \"$d\"; exit 0",
+            operation: "list",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 2,
+        },
+        Case {
+            tool: "mkfifo",
+            sentinel: "codex-sentinel-bound",
+            failure: ": >\"$1\"; exit 0",
+            operation: "list",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 2,
+        },
+        Case {
+            tool: "stat",
+            sentinel: "codex-sentinel-stat",
+            failure: "printf corrupt; exit 0",
+            operation: "stat",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 8,
+        },
+        Case {
+            tool: "tail",
+            sentinel: "codex-sentinel-read",
+            failure: "printf z; exit 0",
+            operation: "read",
+            rg: true,
+            expected_commands: 2,
+            expected_sentinel_invocations: 4,
+        },
+        Case {
+            tool: "find",
+            sentinel: "codex-sentinel-search-find",
+            failure: "printf 'corrupt\\000'; exit 0",
+            operation: "rg-search",
+            rg: true,
+            expected_commands: 3,
+            expected_sentinel_invocations: 2,
+        },
+        Case {
+            tool: "rg",
+            sentinel: "codex-sentinel-rg",
+            failure: "printf '%s\\n' '{\"type\":\"mystery\"}'; exit 0",
+            operation: "rg-search",
+            rg: true,
+            expected_commands: 3,
+            expected_sentinel_invocations: 4,
+        },
+        Case {
+            tool: "grep",
+            sentinel: "codex-sentinel-grep",
+            failure: "printf corrupt; exit 0",
+            operation: "grep-search",
+            rg: false,
+            expected_commands: 3,
+            expected_sentinel_invocations: 4,
+        },
+    ];
+
+    let started = Instant::now();
+    for case in cases {
+        let remote = tempfile::TempDir::new().unwrap();
+        std::fs::write(remote.path().join("a"), b"needle\n").unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        let marker = state.path().join("failed-once");
+        let sentinel_log = state.path().join("sentinel.log");
+        let log = state.path().join("ssh.log");
+        let bin = tempfile::TempDir::new().unwrap();
+        let executable = bin.path().join(case.tool);
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"${{CODEX_SSH_SENTINEL:-}}: $*\" in *{}*) printf 'S\\n' >>{}; if [ ! -e {} ]; then : >{}; {}; fi;; esac\nexec /usr/bin/{} \"$@\"\n",
+                case.sentinel,
+                codex_ssh_bridge::quote::shell_word(sentinel_log.to_str().unwrap()).unwrap(),
+                codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+                codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+                case.failure,
+                case.tool,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = OsString::from(format!(
+            "{}:/usr/local/bin:/usr/bin:/bin",
+            bin.path().display()
+        ));
+        let (_runtime, _runner, bridge) = fixture_with_options(
+            remote.path(),
+            case.rg,
+            None,
+            &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+        );
+        let result = match case.operation {
+            "list" => bridge
+                .list(
+                    ListRequest {
+                        host: "dev".into(),
+                        path: None,
+                        depth: None,
+                        include_hidden: None,
+                        max_entries: None,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|_| ()),
+            "stat" => bridge
+                .stat(
+                    StatRequest {
+                        host: "dev".into(),
+                        paths: vec!["a".into()],
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|_| ()),
+            "read" => bridge
+                .read(
+                    ReadRequest {
+                        host: "dev".into(),
+                        paths: vec!["a".into()],
+                        start_line: None,
+                        max_lines: None,
+                        max_bytes: None,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|_| ()),
+            "rg-search" | "grep-search" => bridge
+                .search(
+                    SearchRequest {
+                        host: "dev".into(),
+                        query: "needle".into(),
+                        path: None,
+                        globs: vec![],
+                        max_results: None,
+                        binary: Some(false),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        result.unwrap_or_else(|error| {
+            panic!("tool={}, sentinel={}: {error:?}", case.tool, case.sentinel)
+        });
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            log.lines().filter(|line| *line == "P").count(),
+            2,
+            "tool={}, sentinel={}",
+            case.tool,
+            case.sentinel
+        );
+        assert_eq!(
+            log.lines().filter(|line| *line == "C").count(),
+            case.expected_commands,
+            "tool={}, sentinel={}",
+            case.tool,
+            case.sentinel
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel_log)
+                .unwrap()
+                .lines()
+                .count(),
+            case.expected_sentinel_invocations,
+            "tool={}, sentinel={}",
+            case.tool,
+            case.sentinel
+        );
+    }
+    eprintln!(
+        "ten stale-sentinel retry cases completed in {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn readonly_warm_operation_sentinel_latency_evidence() {
+    fn report(name: &str, samples: &mut [Duration]) {
+        samples.sort_unstable();
+        let milliseconds = |duration: Duration| duration.as_secs_f64() * 1_000.0;
+        eprintln!(
+            "warm {name}: p50={:.2}ms range={:.2}..{:.2}ms (n={})",
+            milliseconds(samples[samples.len() / 2]),
+            milliseconds(samples[0]),
+            milliseconds(samples[samples.len() - 1]),
+            samples.len()
+        );
+    }
+
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("a"), b"needle\n").unwrap();
+    let (_runtime, _runner, rg_bridge) = fixture(remote.path(), true);
+    rg_bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let mut list = Vec::new();
+    let mut stat = Vec::new();
+    let mut read = Vec::new();
+    let mut rg = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        rg_bridge
+            .list(
+                ListRequest {
+                    host: "dev".into(),
+                    path: None,
+                    depth: None,
+                    include_hidden: None,
+                    max_entries: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        list.push(started.elapsed());
+
+        let started = Instant::now();
+        rg_bridge
+            .stat(
+                StatRequest {
+                    host: "dev".into(),
+                    paths: vec!["a".into()],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        stat.push(started.elapsed());
+
+        let started = Instant::now();
+        rg_bridge
+            .read(
+                ReadRequest {
+                    host: "dev".into(),
+                    paths: vec!["a".into()],
+                    start_line: None,
+                    max_lines: None,
+                    max_bytes: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        read.push(started.elapsed());
+
+        let started = Instant::now();
+        rg_bridge
+            .search(
+                SearchRequest {
+                    host: "dev".into(),
+                    query: "needle".into(),
+                    path: None,
+                    globs: vec![],
+                    max_results: None,
+                    binary: Some(false),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        rg.push(started.elapsed());
+    }
+
+    let (_runtime, _runner, grep_bridge) = fixture(remote.path(), false);
+    grep_bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut grep = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        grep_bridge
+            .search(
+                SearchRequest {
+                    host: "dev".into(),
+                    query: "needle".into(),
+                    path: None,
+                    globs: vec![],
+                    max_results: None,
+                    binary: Some(false),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        grep.push(started.elapsed());
+    }
+
+    report("list", &mut list);
+    report("stat", &mut stat);
+    report("read", &mut read);
+    report("rg-search", &mut rg);
+    report("grep-search", &mut grep);
+}
+
+#[tokio::test]
+async fn readonly_stale_sentinel_that_remains_bad_is_capability_missing() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("a"), b"x").unwrap();
+    let state = tempfile::TempDir::new().unwrap();
+    let log = state.path().join("ssh.log");
+    let bin = tempfile::TempDir::new().unwrap();
+    let find = bin.path().join("find");
+    std::fs::write(
+        &find,
+        b"#!/bin/sh\ncase \" $* \" in *codex-sentinel-list-find*) printf 'corrupt\\000'; exit 0;; esac\nexec /usr/bin/find \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&find, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        bin.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        true,
+        None,
+        &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+    let error = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "P").count(), 2);
+    assert_eq!(log.lines().filter(|line| *line == "C").count(), 2);
+}
+
+#[tokio::test]
+async fn readonly_sentinel_setup_failure_is_not_retried() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("a"), b"x").unwrap();
+    let state = tempfile::TempDir::new().unwrap();
+    let log = state.path().join("ssh.log");
+    let bin = tempfile::TempDir::new().unwrap();
+    let mktemp = bin.path().join("mktemp");
+    std::fs::write(
+        &mktemp,
+        b"#!/bin/sh\ncase \" $* \" in *codex-sentinel-bound*) exit 1;; esac\nexec /usr/bin/mktemp \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mktemp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        bin.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        true,
+        None,
+        &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+    let error = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteExit);
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(log.lines().filter(|line| *line == "C").count(), 1);
 }
 
 #[tokio::test]
@@ -1172,12 +1625,20 @@ async fn read_final_symlink_errors_are_safe_and_follow_the_target() {
     std::fs::write(&denied_target, b"secret").unwrap();
     symlink("denied-target", remote.path().join("denied-link")).unwrap();
     std::fs::set_permissions(&denied_target, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let denied_parent = remote.path().join("denied-parent");
+    std::fs::create_dir(&denied_parent).unwrap();
+    std::fs::write(denied_parent.join("secret"), b"secret").unwrap();
+    std::fs::set_permissions(&denied_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
     let (_runtime, _runner, bridge) = fixture(remote.path(), false);
     let result = bridge
         .read(
             ReadRequest {
                 host: "dev".into(),
-                paths: vec!["dangling".into(), "denied-link".into()],
+                paths: vec![
+                    "dangling".into(),
+                    "denied-link".into(),
+                    "denied-parent/secret".into(),
+                ],
                 start_line: None,
                 max_lines: None,
                 max_bytes: Some(64),
@@ -1194,10 +1655,14 @@ async fn read_final_symlink_errors_are_safe_and_follow_the_target() {
         assert!(
             matches!(&result.files[1], ReadEntry::Error { error, .. } if error.code == EntryErrorCode::PermissionDenied)
         );
+        assert!(
+            matches!(&result.files[2], ReadEntry::Error { error, .. } if error.code == EntryErrorCode::PermissionDenied)
+        );
     } else {
         eprintln!("platform skip: unreadable target cannot be asserted as effective uid 0");
     }
     std::fs::set_permissions(&denied_target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&denied_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[tokio::test]
@@ -1427,7 +1892,7 @@ async fn search_real_engine_failure_is_fixed_and_redacted() {
     let grep = bin.path().join("grep");
     std::fs::write(
         &grep,
-        b"#!/bin/sh\ncase \" $* \" in *codex-probe-grep*|*/dev/null*) exec /usr/bin/grep \"$@\";; esac\nprintf 'VERY_SECRET_ENGINE_DIAGNOSTIC\\n' >&2\nexit 2\n",
+        b"#!/bin/sh\ncase \" $* \" in *codex-probe-grep*|*codex-sentinel-grep*|*/dev/null*) exec /usr/bin/grep \"$@\";; esac\nprintf 'VERY_SECRET_ENGINE_DIAGNOSTIC\\n' >&2\nexit 2\n",
     )
     .unwrap();
     std::fs::set_permissions(&grep, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1454,6 +1919,86 @@ async fn search_real_engine_failure_is_fixed_and_redacted() {
 }
 
 #[tokio::test]
+async fn list_from_configured_filesystem_root_uses_single_separator() {
+    let (_runtime, _runner, bridge) = fixture(std::path::Path::new("/"), true);
+    let result = bridge
+        .list(
+            ListRequest {
+                host: "dev".into(),
+                path: None,
+                depth: Some(1),
+                include_hidden: Some(true),
+                max_entries: Some(10_000),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let etc = result
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path.value == "etc")
+        .expect("the filesystem root should contain /etc");
+    assert_eq!(etc.actual_path, value("/etc"));
+    assert!(
+        result
+            .entries
+            .iter()
+            .all(|entry| !entry.actual_path.value.starts_with("//"))
+    );
+}
+
+#[tokio::test]
+async fn search_from_configured_filesystem_root_derives_relative_paths() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let file = remote.path().join("a");
+    std::fs::write(&file, b"needle\n").unwrap();
+    let (_runtime, _runner, bridge) = fixture(std::path::Path::new("/"), false);
+    let result = bridge
+        .search(
+            SearchRequest {
+                host: "dev".into(),
+                query: "needle".into(),
+                path: Some(remote.path().to_str().unwrap().into()),
+                globs: vec![],
+                max_results: None,
+                binary: Some(false),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].actual_path.value, file.to_str().unwrap());
+    assert_eq!(
+        result.matches[0].relative_path.value,
+        file.strip_prefix("/").unwrap().to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn search_quote_amplification_over_frame_is_request_too_large() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("candidate"), b"x\n").unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(remote.path(), false, Some(4096), &[]);
+    let error = bridge
+        .search(
+            SearchRequest {
+                host: "dev".into(),
+                query: "'".repeat(300),
+                path: None,
+                globs: vec![],
+                max_results: None,
+                binary: Some(false),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RequestTooLarge);
+}
+
+#[tokio::test]
 async fn search_full_prefix_then_exit_two_is_error() {
     let remote = tempfile::TempDir::new().unwrap();
     std::fs::write(remote.path().join("candidate"), b"needle\n").unwrap();
@@ -1461,7 +2006,7 @@ async fn search_full_prefix_then_exit_two_is_error() {
     let grep = bin.path().join("grep");
     std::fs::write(
         &grep,
-        b"#!/bin/sh\ncase \" $* \" in *codex-probe-grep*|*/dev/null*) exec /usr/bin/grep \"$@\";; esac\nfor value do candidate=$value; done\ni=0\nwhile [ \"$i\" -lt 1000 ]; do printf '%s\\000%d:needle\\n' \"$candidate\" \"$((i + 1))\"; i=$((i + 1)); done\nprintf 'VERY_SECRET_LATE_ENGINE_ERROR\\n' >&2\nexit 2\n",
+        b"#!/bin/sh\ncase \" $* \" in *codex-probe-grep*|*codex-sentinel-grep*|*/dev/null*) exec /usr/bin/grep \"$@\";; esac\nfor value do candidate=$value; done\ni=0\nwhile [ \"$i\" -lt 1000 ]; do printf '%s\\000%d:needle\\n' \"$candidate\" \"$((i + 1))\"; i=$((i + 1)); done\nprintf 'VERY_SECRET_LATE_ENGINE_ERROR\\n' >&2\nexit 2\n",
     )
     .unwrap();
     std::fs::set_permissions(&grep, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1497,7 +2042,7 @@ async fn search_unknown_rg_event_is_protocol_error() {
     let rg = bin.path().join("rg");
     std::fs::write(
         &rg,
-        b"#!/bin/sh\ncase \" $* \" in *codex-probe-rg*|*/dev/null*) exec /usr/bin/rg \"$@\";; esac\nprintf '%s\\n' '{\"type\":\"mystery\",\"data\":{}}'\nexit 0\n",
+        b"#!/bin/sh\ncase \" $* \" in *codex-probe-rg*|*codex-sentinel-rg*|*/dev/null*) exec /usr/bin/rg \"$@\";; esac\nprintf '%s\\n' '{\"type\":\"mystery\",\"data\":{}}'\nexit 0\n",
     )
     .unwrap();
     std::fs::set_permissions(&rg, std::fs::Permissions::from_mode(0o755)).unwrap();

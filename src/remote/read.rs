@@ -18,23 +18,47 @@ path=$1
 start=$2
 lines=$3
 budget=$4
-if ! tail -n +1 -- /dev/null >/dev/null 2>&1 ||
-   ! head -n 1 /dev/null >/dev/null 2>&1 ||
-   ! head -c 1 /dev/null >/dev/null 2>&1 ||
-   ! tail -c 1 -- /dev/null >/dev/null 2>&1 ||
-   ! wc -l </dev/null >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=read_slice\000' >&2
+codex_check_read() (
+    codex_read_dir=$(mktemp -d /tmp/codex-sentinel-read.XXXXXX 2>/dev/null) || exit 9
+    cleanup_codex_read() { rm -rf -- "$codex_read_dir"; }
+    trap cleanup_codex_read EXIT HUP INT TERM
+    codex_read_file=$codex_read_dir/codex-sentinel-read
+    codex_read_tail=$codex_read_dir/tail
+    codex_read_line=$codex_read_dir/line
+    codex_read_bytes=$codex_read_dir/bytes
+    codex_read_last=$codex_read_dir/last
+    codex_read_expected=$codex_read_dir/expected
+    printf 'a\000b\nc' >"$codex_read_file" || exit 9
+    printf 'a\000b\n' >"$codex_read_expected" || exit 9
+    tail -n +1 -- "$codex_read_file" >"$codex_read_tail" 2>/dev/null || exit 1
+    head -n 1 "$codex_read_tail" >"$codex_read_line" 2>/dev/null || exit 1
+    head -c 4 "$codex_read_line" >"$codex_read_bytes" 2>/dev/null || exit 1
+    tail -c 1 -- "$codex_read_file" >"$codex_read_last" 2>/dev/null || exit 1
+    codex_read_count=$(wc -l <"$codex_read_file") || exit 1
+    codex_read_size=$(stat --printf='%s' -- "$codex_read_file" 2>/dev/null) || exit 2
+    codex_read_hash=$(sha256sum -- "$codex_read_file" 2>/dev/null) || exit 3
+    set -- $codex_read_hash
+    codex_read_hash=$1
+    cmp -s "$codex_read_expected" "$codex_read_bytes" &&
+    [ "$(cat "$codex_read_last")" = c ] && [ "$codex_read_count" -eq 1 ] || exit 1
+    [ "$codex_read_size" -eq 5 ] || exit 2
+    [ "$codex_read_hash" = 214df3f68e1a607f5baa40cc3315f4316ae58b282b6c0bf288b89fec4da7aa80 ] || exit 3
+)
+codex_read_status=0
+codex_check_read || codex_read_status=$?
+case "$codex_read_status" in
+    0) ;;
+    1) printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=read_slice\000' >&2; exit 0 ;;
+    2) printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=stat_printf\000' >&2; exit 0 ;;
+    3) printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=sha256sum\000' >&2; exit 0 ;;
+    *) exit 2 ;;
+esac
+if [ ! -e "$path" ]; then
+    parent=${path%/*};[ -n "$parent" ]||parent=/
+    while [ "$parent" != / ]&&[ ! -d "$parent" ];do parent=${parent%/*};[ -n "$parent" ]||parent=/;done
+    if [ -d "$parent" ]&&[ ! -x "$parent" ];then printf 'PERMISSION_DENIED\000' >&2;else printf 'NOT_FOUND\000' >&2;fi
     exit 0
 fi
-if ! stat --printf='%s' -- /dev/null >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=stat_printf\000' >&2
-    exit 0
-fi
-if ! sha256sum -- /dev/null >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=sha256sum\000' >&2
-    exit 0
-fi
-if [ ! -e "$path" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
 if [ ! -r "$path" ]; then printf 'PERMISSION_DENIED\000' >&2; exit 0; fi
 if [ ! -f "$path" ]; then printf 'INVALID_ARGUMENT\000' >&2; exit 0; fi
 size=$(stat --printf='%s' -- "$path" 2>/dev/null) || { printf 'PERMISSION_DENIED\000' >&2; exit 0; }

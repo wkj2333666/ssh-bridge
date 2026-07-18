@@ -811,11 +811,21 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
             "case \" $* \" in *codex-probe-find*) exit 64;; esac\nexec /usr/bin/find \"$@\"\n",
         ),
         (
+            "find_nul",
+            "find",
+            "case \" $* \" in *codex-probe-find-link*) /usr/bin/find \"$@\" | /usr/bin/sed 's/visible/changed/g'; exit 0;; esac\nexec /usr/bin/find \"$@\"\n",
+        ),
+        (
             "stat_printf",
             "stat",
             "case \" $* \" in *codex-probe-stat*) exit 64;; esac\nexec /usr/bin/stat \"$@\"\n",
         ),
         ("rg_json", "rg", "exit 64\n"),
+        (
+            "rg_json",
+            "rg",
+            "case \" $* \" in *codex-probe-rg-error*) exit 1;; *needle*codex-probe-rg*) shim_out=${TMPDIR:-/tmp}/codex-rg-shim.$$; /usr/bin/rg \"$@\" >\"$shim_out\"; shim_status=$?; /usr/bin/sed 's/\"line_number\":1/\"line_number\":9/g' \"$shim_out\"; rm -f \"$shim_out\"; exit \"$shim_status\";; esac\nexec /usr/bin/rg \"$@\"\n",
+        ),
         (
             "grep_nul",
             "grep",
@@ -830,6 +840,26 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
             "search_bound",
             "head",
             "case \" $* \" in *\" -c 3 \"*) exit 64;; esac\nexec /usr/bin/head \"$@\"\n",
+        ),
+        (
+            "search_bound",
+            "mktemp",
+            "case \" $* \" in *codex-probe-bound*) exit 64;; esac\nexec /usr/bin/mktemp \"$@\"\n",
+        ),
+        (
+            "search_bound",
+            "mkfifo",
+            "case \" $* \" in *codex-probe-bound*) exit 64;; esac\nexec /usr/bin/mkfifo \"$@\"\n",
+        ),
+        (
+            "search_bound",
+            "xargs",
+            "case \" $* \" in *codex-ssh-probe-bound-xargs*) exit 0;; esac\nexec /usr/bin/xargs \"$@\"\n",
+        ),
+        (
+            "search_bound",
+            "rm",
+            "case \" $* \" in *codex-probe-bound.*) exit 0;; esac\nexec /usr/bin/rm \"$@\"\n",
         ),
     ];
 
