@@ -885,7 +885,7 @@ exit 0
 "#;
 
 #[derive(Debug)]
-struct ResolvedWrite {
+pub(super) struct ResolvedWrite {
     host: String,
     path: RemotePath,
     parent: String,
@@ -898,7 +898,7 @@ struct ResolvedWrite {
 }
 
 #[derive(Debug)]
-struct ResolvedDelete {
+pub(super) struct ResolvedDelete {
     host: String,
     path: RemotePath,
     parent: String,
@@ -930,7 +930,7 @@ pub(super) async fn write(
     request: WriteRequest,
     cancel: CancellationToken,
 ) -> BridgeResult<WriteResult> {
-    let mut resolved = resolve_write(bridge, request)?;
+    let mut resolved = preflight_write(bridge, request)?;
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
     let args = fixed_args(&resolved);
     let stdin = std::mem::take(&mut resolved.content);
@@ -989,7 +989,7 @@ pub(super) async fn guarded_delete(
     request: GuardedDeleteRequest,
     cancel: CancellationToken,
 ) -> BridgeResult<GuardedDeleteResult> {
-    let resolved = resolve_delete(bridge, request)?;
+    let resolved = preflight_delete(bridge, request)?;
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
     let owner = InternalSpoolOwner::new();
     let request = FixedRunRequest {
@@ -1049,7 +1049,10 @@ async fn execute_owned_mutation(
     result.map(|result| (owner, result))
 }
 
-fn resolve_write(bridge: &RemoteBridge, request: WriteRequest) -> BridgeResult<ResolvedWrite> {
+pub(super) fn preflight_write(
+    bridge: &RemoteBridge,
+    request: WriteRequest,
+) -> BridgeResult<ResolvedWrite> {
     let WriteRequest {
         host,
         path,
@@ -1128,7 +1131,7 @@ fn resolve_write(bridge: &RemoteBridge, request: WriteRequest) -> BridgeResult<R
     Ok(resolved)
 }
 
-fn resolve_delete(
+pub(super) fn preflight_delete(
     bridge: &RemoteBridge,
     request: GuardedDeleteRequest,
 ) -> BridgeResult<ResolvedDelete> {
@@ -1217,7 +1220,7 @@ fn validate_write_path(path: &str) -> BridgeResult<()> {
     Ok(())
 }
 
-fn split_parent_basename(path: &str) -> BridgeResult<(String, String)> {
+pub(super) fn split_parent_basename(path: &str) -> BridgeResult<(String, String)> {
     let (parent, basename) = path
         .rsplit_once('/')
         .ok_or_else(|| BridgeError::invalid_argument("write target is invalid"))?;
