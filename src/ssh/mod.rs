@@ -4,6 +4,7 @@
 )]
 
 mod argv;
+mod process;
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::Write as _;
@@ -19,6 +20,7 @@ use crate::config::{Config, ResolvedHost};
 use crate::error::{BridgeError, BridgeResult};
 
 pub use argv::build_ssh_argv;
+pub use process::{RunRequest, RunResult, SshRunner};
 
 const RUNTIME_DIRECTORY: &str = "codex-ssh-bridge";
 const CONTROL_FILENAME_BYTES: usize = 3 + 32;

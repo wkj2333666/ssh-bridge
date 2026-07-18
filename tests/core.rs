@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use codex_ssh_bridge::config::{Config, Limits};
-use codex_ssh_bridge::error::ErrorCode;
+use codex_ssh_bridge::error::{BridgeError, ErrorCode};
 use codex_ssh_bridge::path::RemotePath;
 use codex_ssh_bridge::quote::{fixed_command, shell_word};
 use codex_ssh_bridge::{MAX_FRAME_BYTES, MAX_OUTPUT_BYTES, MAX_READ_BYTES, MAX_WRITE_BYTES};
@@ -680,4 +680,16 @@ fn bridge_errors_serialize_codes_and_omit_empty_details() {
     let value = serde_json::to_value(error).unwrap();
     assert_eq!(value["code"], "INVALID_ARGUMENT");
     assert_eq!(value["details"], serde_json::json!({}));
+}
+
+#[test]
+fn command_timeout_and_forced_termination_details_serialize_stably() {
+    let mut error = BridgeError::new(ErrorCode::CommandTimeout, "command timed out", false);
+    error.details.remote_process_may_continue = Some(true);
+    error.details.bytes_seen = Some(65_537);
+
+    let value = serde_json::to_value(error).unwrap();
+    assert_eq!(value["code"], "COMMAND_TIMEOUT");
+    assert_eq!(value["details"]["remote_process_may_continue"], true);
+    assert_eq!(value["details"]["bytes_seen"], 65_537);
 }

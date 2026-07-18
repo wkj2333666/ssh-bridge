@@ -1,6 +1,7 @@
 pub mod capability;
 pub mod config;
 pub mod error;
+pub mod output;
 pub mod path;
 pub mod quote;
 pub mod ssh;
