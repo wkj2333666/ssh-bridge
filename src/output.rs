@@ -136,6 +136,22 @@ impl OutputStore {
         stdout: Stdout,
         stderr: Stderr,
         limits: CaptureLimits,
+        cancel: CancellationToken,
+    ) -> BridgeResult<CapturedOutput>
+    where
+        Stdout: AsyncRead + Unpin + Send + 'static,
+        Stderr: AsyncRead + Unpin + Send + 'static,
+    {
+        self.capture_with_limit_signal(stdout, stderr, limits, cancel, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn capture_with_limit_signal<Stdout, Stderr>(
+        &self,
+        stdout: Stdout,
+        stderr: Stderr,
+        limits: CaptureLimits,
+        cancel: CancellationToken,
         output_limit: CancellationToken,
     ) -> BridgeResult<CapturedOutput>
     where
@@ -151,32 +167,63 @@ impl OutputStore {
                 "output capture limits exceed the compiled bounds",
             ));
         }
+        if cancel.is_cancelled() {
+            return Err(capture_cancelled(0));
+        }
 
         let (sender, mut receiver) = mpsc::channel(8);
-        let stdout_task = tokio::spawn(drain_stream(stdout, StreamKind::Stdout, sender.clone()));
-        let stderr_task = tokio::spawn(drain_stream(stderr, StreamKind::Stderr, sender));
+        let mut stdout_task =
+            tokio::spawn(drain_stream(stdout, StreamKind::Stdout, sender.clone()));
+        let mut stderr_task = tokio::spawn(drain_stream(stderr, StreamKind::Stderr, sender));
         let mut sink = OutputSink::new(limits.preview_bytes, limits.max_output_bytes);
+        let mut finished_streams = 0;
 
-        let captured = async {
-            while let Some(event) = receiver.recv().await {
-                sink.append(self.spool_directory.path(), event.stream, &event.bytes)
-                    .await?;
+        while finished_streams != 2 {
+            let event = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    abort_drains(&mut stdout_task, &mut stderr_task).await;
+                    sink.cleanup_incomplete();
+                    return Err(capture_cancelled(sink.aggregate_bytes));
+                }
+                event = receiver.recv() => event,
+            };
+            match event {
+                Some(StreamEvent::Bytes { stream, bytes }) => {
+                    if let Err(error) = sink
+                        .append(self.spool_directory.path(), stream, &bytes)
+                        .await
+                    {
+                        if error.code == ErrorCode::OutputLimit {
+                            output_limit.cancel();
+                        }
+                        abort_drains(&mut stdout_task, &mut stderr_task).await;
+                        sink.cleanup_incomplete();
+                        return Err(error);
+                    }
+                }
+                Some(StreamEvent::Finished { error: Some(error) }) => {
+                    abort_drains(&mut stdout_task, &mut stderr_task).await;
+                    sink.cleanup_incomplete();
+                    return Err(BridgeError::io(error));
+                }
+                Some(StreamEvent::Finished { error: None }) => {
+                    finished_streams += 1;
+                }
+                None => break,
             }
-            let stdout_result = stdout_task.await.map_err(join_error)?;
-            let stderr_result = stderr_task.await.map_err(join_error)?;
-            stdout_result.map_err(BridgeError::io)?;
-            stderr_result.map_err(BridgeError::io)?;
-            sink.finish(self).await
         }
-        .await;
-
-        if captured
-            .as_ref()
-            .is_err_and(|error| error.code == ErrorCode::OutputLimit)
-        {
-            output_limit.cancel();
+        if let Err(error) = stdout_task.await {
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            sink.cleanup_incomplete();
+            return Err(join_error(error));
         }
-        captured
+        if let Err(error) = stderr_task.await {
+            sink.cleanup_incomplete();
+            return Err(join_error(error));
+        }
+        sink.finish(self).await
     }
 
     pub async fn read(
@@ -267,36 +314,58 @@ async fn remove_entry_files(entry: &SpoolEntry) {
     let _ = tokio::fs::remove_file(&entry.stderr_path).await;
 }
 
-struct StreamEvent {
-    stream: StreamKind,
-    bytes: Vec<u8>,
+enum StreamEvent {
+    Bytes { stream: StreamKind, bytes: Vec<u8> },
+    Finished { error: Option<io::Error> },
 }
 
-async fn drain_stream<R>(
-    mut reader: R,
-    stream: StreamKind,
-    sender: mpsc::Sender<StreamEvent>,
-) -> io::Result<()>
+async fn drain_stream<R>(mut reader: R, stream: StreamKind, sender: mpsc::Sender<StreamEvent>)
 where
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0; READ_BUFFER_BYTES];
     loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(());
-        }
-        if sender
-            .send(StreamEvent {
-                stream,
-                bytes: buffer[..count].to_vec(),
-            })
-            .await
-            .is_err()
-        {
-            return Ok(());
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                let _ = sender.send(StreamEvent::Finished { error: None }).await;
+                return;
+            }
+            Ok(count) => {
+                if sender
+                    .send(StreamEvent::Bytes {
+                        stream,
+                        bytes: buffer[..count].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender
+                    .send(StreamEvent::Finished { error: Some(error) })
+                    .await;
+                return;
+            }
         }
     }
+}
+
+async fn abort_drains(
+    stdout: &mut tokio::task::JoinHandle<()>,
+    stderr: &mut tokio::task::JoinHandle<()>,
+) {
+    stdout.abort();
+    stderr.abort();
+    let _ = stdout.await;
+    let _ = stderr.await;
+}
+
+fn capture_cancelled(bytes_seen: u64) -> BridgeError {
+    let mut error = BridgeError::new(ErrorCode::Cancelled, "output capture was cancelled", false);
+    error.details.bytes_seen = Some(bytes_seen);
+    error
 }
 
 struct OutputSink {
@@ -341,7 +410,7 @@ impl OutputSink {
                     .await?;
             }
             self.aggregate_bytes = self.max_output_bytes + 1;
-            self.cleanup_incomplete().await;
+            self.cleanup_incomplete();
             let mut error = BridgeError::new(
                 ErrorCode::OutputLimit,
                 "command output exceeded the configured limit",
@@ -387,7 +456,7 @@ impl OutputSink {
             },
         ) {
             RetainedOutput::Memory { stdout, stderr } => (stdout, stderr),
-            retained @ RetainedOutput::Spool { .. } => {
+            retained @ RetainedOutput::Spool(_) => {
                 self.retained = retained;
                 return Ok(());
             }
@@ -400,63 +469,51 @@ impl OutputSink {
             .map_err(BridgeError::io)?;
         spool
             .stderr
+            .as_mut()
+            .expect("completed pending spool")
             .write_all(&stderr_bytes)
             .await
             .map_err(BridgeError::io)?;
-        self.retained = RetainedOutput::Spool {
-            token: spool.token,
-            stdout_path: spool.stdout_path,
-            stderr_path: spool.stderr_path,
-            stdout: Box::new(spool.stdout),
-            stderr: Box::new(spool.stderr),
-        };
+        self.retained = RetainedOutput::Spool(Box::new(spool));
         Ok(())
     }
 
-    async fn cleanup_incomplete(&mut self) {
-        if let RetainedOutput::Spool {
-            stdout_path,
-            stderr_path,
-            ..
-        } = &self.retained
-        {
-            let stdout_path = stdout_path.clone();
-            let stderr_path = stderr_path.clone();
+    fn cleanup_incomplete(&mut self) {
+        if matches!(self.retained, RetainedOutput::Spool(_)) {
             self.retained = RetainedOutput::Memory {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             };
-            let _ = tokio::fs::remove_file(stdout_path).await;
-            let _ = tokio::fs::remove_file(stderr_path).await;
         }
     }
 
-    async fn finish(self, store: &OutputStore) -> BridgeResult<CapturedOutput> {
-        let reference = match self.retained {
+    async fn finish(mut self, store: &OutputStore) -> BridgeResult<CapturedOutput> {
+        self.stderr_scanner.finish_pending_line();
+        let reference = match &mut self.retained {
             RetainedOutput::Memory { .. } => None,
-            RetainedOutput::Spool {
-                token,
-                stdout_path,
-                stderr_path,
-                mut stdout,
-                mut stderr,
-            } => {
-                stdout.flush().await.map_err(BridgeError::io)?;
-                stderr.flush().await.map_err(BridgeError::io)?;
-                drop(stdout);
-                drop(stderr);
+            RetainedOutput::Spool(spool) => {
+                spool.stdout.flush().await.map_err(BridgeError::io)?;
+                spool
+                    .stderr
+                    .as_mut()
+                    .expect("completed pending spool")
+                    .flush()
+                    .await
+                    .map_err(BridgeError::io)?;
+                let token = spool.token.clone();
                 let reference = OutputReference(token.clone());
                 let expires_at = Instant::now() + store.ttl;
                 store.entries.lock().await.insert(
                     token.clone(),
                     SpoolEntry {
-                        stdout_path,
-                        stderr_path,
+                        stdout_path: spool.stdout_path.clone(),
+                        stderr_path: spool.stderr_path.clone(),
                         stdout_len: self.stdout.bytes_seen,
                         stderr_len: self.stderr.bytes_seen,
                         expires_at,
                     },
                 );
+                spool.armed = false;
                 schedule_expiry(Arc::clone(&store.entries), token, expires_at);
                 Some(reference)
             }
@@ -553,17 +610,8 @@ impl PreviewSink {
 }
 
 enum RetainedOutput {
-    Memory {
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-    },
-    Spool {
-        token: String,
-        stdout_path: PathBuf,
-        stderr_path: PathBuf,
-        stdout: Box<tokio::fs::File>,
-        stderr: Box<tokio::fs::File>,
-    },
+    Memory { stdout: Vec<u8>, stderr: Vec<u8> },
+    Spool(Box<PendingSpool>),
 }
 
 impl RetainedOutput {
@@ -571,26 +619,46 @@ impl RetainedOutput {
         match (self, stream) {
             (Self::Memory { stdout, .. }, StreamKind::Stdout) => stdout.extend_from_slice(bytes),
             (Self::Memory { stderr, .. }, StreamKind::Stderr) => stderr.extend_from_slice(bytes),
-            (Self::Spool { stdout, .. }, StreamKind::Stdout) => {
-                stdout.write_all(bytes).await.map_err(BridgeError::io)?;
+            (Self::Spool(spool), StreamKind::Stdout) => {
+                spool
+                    .stdout
+                    .write_all(bytes)
+                    .await
+                    .map_err(BridgeError::io)?;
             }
-            (Self::Spool { stderr, .. }, StreamKind::Stderr) => {
-                stderr.write_all(bytes).await.map_err(BridgeError::io)?;
+            (Self::Spool(spool), StreamKind::Stderr) => {
+                spool
+                    .stderr
+                    .as_mut()
+                    .expect("completed pending spool")
+                    .write_all(bytes)
+                    .await
+                    .map_err(BridgeError::io)?;
             }
         }
         Ok(())
     }
 }
 
-struct NewSpool {
+struct PendingSpool {
     token: String,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     stdout: tokio::fs::File,
-    stderr: tokio::fs::File,
+    stderr: Option<tokio::fs::File>,
+    armed: bool,
 }
 
-fn create_spool(directory: &Path) -> BridgeResult<NewSpool> {
+impl Drop for PendingSpool {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.stdout_path);
+            let _ = std::fs::remove_file(&self.stderr_path);
+        }
+    }
+}
+
+fn create_spool(directory: &Path) -> BridgeResult<PendingSpool> {
     loop {
         let token = random_token();
         let stdout_path = directory.join(format!("{token}.stdout"));
@@ -600,26 +668,24 @@ fn create_spool(directory: &Path) -> BridgeResult<NewSpool> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(BridgeError::io(error)),
         };
-        let stderr = match create_private_file(&stderr_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                drop(stdout);
-                let _ = std::fs::remove_file(&stdout_path);
-                continue;
-            }
-            Err(error) => {
-                drop(stdout);
-                let _ = std::fs::remove_file(&stdout_path);
-                return Err(BridgeError::io(error));
-            }
-        };
-        return Ok(NewSpool {
+        let mut spool = PendingSpool {
             token,
             stdout_path,
             stderr_path,
             stdout: tokio::fs::File::from_std(stdout),
-            stderr: tokio::fs::File::from_std(stderr),
-        });
+            stderr: None,
+            armed: true,
+        };
+        let stderr = match create_private_file(&spool.stderr_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                drop(spool);
+                continue;
+            }
+            Err(error) => return Err(BridgeError::io(error)),
+        };
+        spool.stderr = Some(tokio::fs::File::from_std(stderr));
+        return Ok(spool);
     }
 }
 
@@ -644,27 +710,116 @@ fn random_token() -> String {
 #[derive(Default)]
 struct DiagnosticScanner {
     signals: StderrSignals,
-    suffix: Vec<u8>,
+    line: Vec<u8>,
+    line_overflowed: bool,
 }
 
 impl DiagnosticScanner {
     fn push(&mut self, bytes: &[u8]) {
-        const MAX_PATTERN_BYTES: usize = 64;
-        let mut combined = Vec::with_capacity(self.suffix.len() + bytes.len());
-        combined.extend_from_slice(&self.suffix);
-        combined.extend_from_slice(bytes);
-        let lower = String::from_utf8_lossy(&combined).to_ascii_lowercase();
-        self.signals.host_key |= lower.contains("host key verification failed")
-            || lower.contains("remote host identification has changed")
-            || lower.contains("no ed25519 host key is known");
-        self.signals.authentication |= lower.contains("permission denied")
-            || lower.contains("authentication failed")
-            || lower.contains("no supported authentication methods available");
-        self.signals.connect_timeout |=
-            lower.contains("connection timed out") || lower.contains("operation timed out");
-        let keep = combined.len().min(MAX_PATTERN_BYTES);
-        self.suffix.clear();
-        self.suffix
-            .extend_from_slice(&combined[combined.len() - keep..]);
+        const MAX_DIAGNOSTIC_LINE_BYTES: usize = 1024;
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.finish_pending_line();
+            } else if !self.line_overflowed {
+                if self.line.len() == MAX_DIAGNOSTIC_LINE_BYTES {
+                    self.line.clear();
+                    self.line_overflowed = true;
+                } else {
+                    self.line.push(*byte);
+                }
+            }
+        }
+    }
+
+    fn finish_pending_line(&mut self) {
+        if !self.line_overflowed
+            && let Ok(line) = std::str::from_utf8(&self.line)
+        {
+            self.signals.host_key |= is_host_key_diagnostic(line);
+            self.signals.authentication |= is_authentication_diagnostic(line);
+            self.signals.connect_timeout |= is_connect_timeout_diagnostic(line);
+        }
+        self.line.clear();
+        self.line_overflowed = false;
+    }
+}
+
+fn is_host_key_diagnostic(line: &str) -> bool {
+    if line == "Host key verification failed."
+        || line == "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @"
+    {
+        return true;
+    }
+    let Some(rest) = line.strip_prefix("No ") else {
+        return false;
+    };
+    let Some((algorithm, rest)) = rest.split_once(" host key is known for ") else {
+        return false;
+    };
+    let Some(host) = rest.strip_suffix(" and you have requested strict checking.") else {
+        return false;
+    };
+    matches!(algorithm, "ED25519" | "RSA" | "ECDSA") && is_single_diagnostic_field(host)
+}
+
+fn is_authentication_diagnostic(line: &str) -> bool {
+    let Some((identity, methods)) = line.split_once(": Permission denied (") else {
+        return false;
+    };
+    let Some(methods) = methods.strip_suffix(").") else {
+        return false;
+    };
+    let Some((user, host)) = identity.split_once('@') else {
+        return false;
+    };
+    is_single_diagnostic_field(user)
+        && is_single_diagnostic_field(host)
+        && methods.split(',').all(|method| {
+            matches!(
+                method,
+                "publickey" | "password" | "keyboard-interactive" | "hostbased" | "gssapi-with-mic"
+            )
+        })
+}
+
+fn is_connect_timeout_diagnostic(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("ssh: connect to host ") else {
+        return false;
+    };
+    let Some((destination, reason)) = rest.rsplit_once(": ") else {
+        return false;
+    };
+    let Some((host, port)) = destination.rsplit_once(" port ") else {
+        return false;
+    };
+    is_single_diagnostic_field(host)
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+        && matches!(reason, "Connection timed out" | "Operation timed out")
+}
+
+fn is_single_diagnostic_field(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_spool;
+
+    #[test]
+    fn dropping_an_unregistered_spool_removes_both_files() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let spool = create_spool(directory.path()).unwrap();
+        let stdout_path = spool.stdout_path.clone();
+        let stderr_path = spool.stderr_path.clone();
+        assert!(stdout_path.exists());
+        assert!(stderr_path.exists());
+
+        drop(spool);
+
+        assert!(!stdout_path.exists());
+        assert!(!stderr_path.exists());
     }
 }

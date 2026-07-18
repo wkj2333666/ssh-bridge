@@ -141,18 +141,48 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
     sleep)
         run_fake_sleep "${FAKE_SSH_SLEEP_SECONDS:-1}"
         ;;
+    orphan-streams)
+        (
+            trap '' TERM HUP
+            sleep "${FAKE_SSH_SLEEP_SECONDS:-10}"
+        ) &
+        orphan_pid=$!
+        if [ -n "${FAKE_SSH_CHILD_PID_FILE:-}" ]; then
+            printf '%s\n' "$orphan_pid" >"$FAKE_SSH_CHILD_PID_FILE"
+        fi
+        if [ -n "${FAKE_SSH_PARENT_EXIT_FILE:-}" ]; then
+            printf '%s\n' exited >"$FAKE_SSH_PARENT_EXIT_FILE"
+        fi
+        exit 0
+        ;;
     error)
         case "${FAKE_SSH_ERROR:-remote}" in
             host-key)
-                printf '%s\n' 'Host key verification failed. VERY_SECRET_HOST_DIAGNOSTIC' >&2
+                printf '%s\n' 'Host key verification failed.' 'VERY_SECRET_HOST_DIAGNOSTIC' >&2
+                exit 255
+                ;;
+            host-key-ed25519)
+                printf '%s\n' 'No ED25519 host key is known for fake.internal and you have requested strict checking.' >&2
+                exit 255
+                ;;
+            host-key-rsa)
+                printf '%s\n' 'No RSA host key is known for fake.internal and you have requested strict checking.' >&2
+                exit 255
+                ;;
+            host-key-ecdsa)
+                printf '%s\n' 'No ECDSA host key is known for fake.internal and you have requested strict checking.' >&2
                 exit 255
                 ;;
             auth)
-                printf '%s\n' 'Permission denied (publickey). VERY_SECRET_AUTH_DIAGNOSTIC' >&2
+                printf '%s\n' 'fixture@fake.internal: Permission denied (publickey).' 'VERY_SECRET_AUTH_DIAGNOSTIC' >&2
                 exit 255
                 ;;
             connect-timeout)
-                printf '%s\n' 'ssh: connect to host fake port 22: Connection timed out VERY_SECRET_CONNECT_DIAGNOSTIC' >&2
+                printf '%s\n' 'ssh: connect to host fake.internal port 22: Connection timed out' 'VERY_SECRET_CONNECT_DIAGNOSTIC' >&2
+                exit 255
+                ;;
+            diagnostic)
+                printf '%s\n' "${FAKE_SSH_DIAGNOSTIC:-}" >&2
                 exit 255
                 ;;
             remote)

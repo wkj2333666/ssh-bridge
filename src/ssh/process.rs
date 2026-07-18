@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -27,7 +27,7 @@ use crate::config::{Config, EffectiveLimits};
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{CaptureLimits, CapturedOutput, OutputStore, StderrSignals};
 use crate::path::RemotePath;
-use crate::quote::{fixed_command, shell_word};
+use crate::quote::shell_word;
 
 const DEFAULT_SSH_EXECUTABLE: &str = "/usr/bin/ssh";
 const RESOLVED_STDOUT_LIMIT: u64 = 1024 * 1024;
@@ -318,7 +318,7 @@ impl SshRunner {
         cancel: &CancellationToken,
     ) -> BridgeResult<Capability> {
         let requested_root = RemotePath::resolve(root, ".")?;
-        let remote_command = fixed_command(CAPABILITY_PROBE_SCRIPT, &[root])?;
+        let remote_command = capability_probe_command(root)?;
         let outcome = self
             .run_child(
                 ChildSpec {
@@ -430,47 +430,81 @@ impl SshRunner {
         let child_stdin = child.stdin.take();
         let stdin_task = tokio::spawn(write_stdin(child_stdin, spec.stdin));
         let output_limit = CancellationToken::new();
-        let capture_task = {
+        let mut capture_task = {
             let store = Arc::clone(&self.output_store);
-            let output_limit = output_limit.clone();
+            let output_limit_signal = output_limit.clone();
+            let capture_cancel = cancel.clone();
             tokio::spawn(async move {
                 store
-                    .capture(stdout, stderr, spec.capture_limits, output_limit)
+                    .capture_with_limit_signal(
+                        stdout,
+                        stderr,
+                        spec.capture_limits,
+                        capture_cancel,
+                        output_limit_signal,
+                    )
                     .await
             })
         };
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+        let mut status = None;
+        let mut capture = None;
+        let deadline = tokio::time::sleep(spec.deadline);
+        tokio::pin!(deadline);
 
-        let mut wait = Box::pin(child.wait());
-        let stop = tokio::select! {
-            biased;
-            result = &mut wait => Stop::Exited(result.map_err(BridgeError::io)?),
-            () = cancel.cancelled() => Stop::Cancelled,
-            () = output_limit.cancelled() => Stop::OutputLimit,
-            () = tokio::time::sleep(spec.deadline) => Stop::Deadline,
+        let stop = loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break Stop::Cancelled,
+                () = output_limit.cancelled() => break Stop::OutputLimit,
+                () = &mut deadline => break Stop::Deadline,
+                result = &mut wait_task, if status.is_none() => {
+                    match joined_wait(result) {
+                        Ok(exit_status) => status = Some(exit_status),
+                        Err(error) => break Stop::InternalError(error),
+                    }
+                    if capture.is_some() {
+                        break Stop::Completed;
+                    }
+                }
+                result = &mut capture_task, if capture.is_none() => {
+                    let result = joined_capture(result);
+                    let stop_for_error = match &result {
+                        Err(error) if error.code == ErrorCode::OutputLimit => {
+                            Some(Stop::OutputLimit)
+                        }
+                        Err(error) => Some(Stop::InternalError(error.clone())),
+                        Ok(_) => None,
+                    };
+                    capture = Some(result);
+                    if let Some(stop) = stop_for_error {
+                        break stop;
+                    }
+                    if status.is_some() {
+                        break Stop::Completed;
+                    }
+                }
+            }
         };
-        drop(wait);
 
         match stop {
-            Stop::Exited(status) => {
-                let output = match finish_capture(capture_task).await {
-                    Ok(output) => output,
-                    Err(mut error) if error.code == ErrorCode::OutputLimit => {
-                        error.details.host = Some(host.to_owned());
-                        error.details.elapsed_ms = Some(elapsed_ms(started.elapsed()));
-                        error.details.remote_process_may_continue =
-                            Some(spec.phase.remote_started());
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                };
+            Stop::Completed => {
+                let status = status.expect("completed child status");
+                let output = capture.expect("completed capture")?;
                 finish_stdin(stdin_task).await?;
                 self.classify_exit(status, output, spec.phase, host, started.elapsed())
                     .await
             }
-            Stop::Cancelled | Stop::OutputLimit | Stop::Deadline => {
-                terminate_process_group(process_group, &mut child).await;
+            Stop::Cancelled | Stop::OutputLimit | Stop::Deadline | Stop::InternalError(_) => {
+                terminate_process_group(process_group).await;
+                if status.is_none() {
+                    let _ = finish_wait(wait_task).await;
+                }
                 let _ = finish_stdin(stdin_task).await;
-                let capture = finish_capture_bounded(capture_task).await;
+                let capture = match capture {
+                    Some(capture) => capture,
+                    None => finish_capture_bounded(capture_task).await,
+                };
                 let bytes_seen = capture
                     .as_ref()
                     .ok()
@@ -485,6 +519,7 @@ impl SshRunner {
                 if let Ok(output) = &capture {
                     self.output_store.discard(output).await;
                 }
+                let stopped_for_output_limit = matches!(&stop, Stop::OutputLimit);
                 let mut error = match stop {
                     Stop::Cancelled => cancelled_error(spec.phase.remote_started(), bytes_seen),
                     Stop::Deadline => spec.phase.timeout_error(bytes_seen),
@@ -496,11 +531,12 @@ impl SshRunner {
                             false,
                         ),
                     },
-                    Stop::Exited(_) => unreachable!(),
+                    Stop::InternalError(error) => error,
+                    Stop::Completed => unreachable!(),
                 };
                 error.details.host = Some(host.to_owned());
                 error.details.elapsed_ms = Some(elapsed_ms(started.elapsed()));
-                if matches!(stop, Stop::OutputLimit) {
+                if stopped_for_output_limit {
                     error.details.bytes_seen = Some(bytes_seen);
                     error.details.remote_process_may_continue = Some(spec.phase.remote_started());
                 }
@@ -610,10 +646,11 @@ impl Phase {
 }
 
 enum Stop {
-    Exited(ExitStatus),
+    Completed,
     Cancelled,
     OutputLimit,
     Deadline,
+    InternalError(BridgeError),
 }
 
 async fn wait_for_permit(
@@ -685,6 +722,14 @@ fn render_remote_command(
     }
 }
 
+fn capability_probe_command(root: &str) -> BridgeResult<String> {
+    Ok(format!(
+        "exec sh -c {} codex-ssh-probe {}",
+        shell_word(CAPABILITY_PROBE_SCRIPT)?,
+        shell_word(root)?
+    ))
+}
+
 async fn write_stdin(
     mut stdin: Option<tokio::process::ChildStdin>,
     bytes: Option<Vec<u8>>,
@@ -707,11 +752,22 @@ async fn finish_stdin(task: JoinHandle<std::io::Result<()>>) -> BridgeResult<()>
         .map_err(BridgeError::io)
 }
 
-async fn finish_capture(
-    task: JoinHandle<BridgeResult<CapturedOutput>>,
+fn joined_capture(
+    result: Result<BridgeResult<CapturedOutput>, tokio::task::JoinError>,
 ) -> BridgeResult<CapturedOutput> {
-    task.await
+    result.map_err(|error| BridgeError::new(ErrorCode::Io, error.to_string(), false))?
+}
+
+fn joined_wait(
+    result: Result<std::io::Result<ExitStatus>, tokio::task::JoinError>,
+) -> BridgeResult<ExitStatus> {
+    result
         .map_err(|error| BridgeError::new(ErrorCode::Io, error.to_string(), false))?
+        .map_err(BridgeError::io)
+}
+
+async fn finish_wait(task: JoinHandle<std::io::Result<ExitStatus>>) -> BridgeResult<ExitStatus> {
+    joined_wait(task.await)
 }
 
 async fn finish_capture_bounded(
@@ -732,11 +788,10 @@ async fn finish_capture_bounded(
     }
 }
 
-async fn terminate_process_group(process_group: i32, child: &mut Child) {
+async fn terminate_process_group(process_group: i32) {
     signal_process_group(process_group, libc::SIGTERM);
     tokio::time::sleep(TERM_GRACE).await;
     signal_process_group(process_group, libc::SIGKILL);
-    let _ = child.wait().await;
 }
 
 fn signal_process_group(process_group: i32, signal: i32) {
@@ -787,4 +842,36 @@ fn hex_digest(digest: &[u8]) -> String {
 
 fn elapsed_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capability_probe_command;
+    use crate::capability::parse_probe_output;
+    use crate::path::RemotePath;
+
+    #[test]
+    fn capability_probe_command_binds_hostile_root_as_positional_one() {
+        let filesystem = tempfile::TempDir::new().unwrap();
+        for component in ["quote'root", "line\nroot", "-leading-root"] {
+            let root = filesystem.path().join(component);
+            std::fs::create_dir(&root).unwrap();
+            let root = root.to_str().unwrap();
+            let command = capability_probe_command(root).unwrap();
+            let scratch = tempfile::TempDir::new().unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env("TMPDIR", scratch.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "root={root:?}\ncommand={command:?}\nstderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = RemotePath::resolve(root, ".").unwrap();
+            let capability = parse_probe_output(&output.stdout, &expected).unwrap();
+            assert_eq!(capability.physical_root, root);
+        }
+    }
 }
