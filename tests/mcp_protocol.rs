@@ -12,8 +12,9 @@ use codex_ssh_bridge::mcp::{
     SUPPORTED_PROTOCOL_VERSIONS, StrictJsonError, ToolAnnotations, ToolCallContext, ToolDefinition,
     ToolFuture, ToolService, WireBudget, duplicate_request_id_response, internal_error_response,
     invalid_params_response, invalid_request_id_response, invalid_request_response,
-    method_not_found_response, parse_error_response, parse_strict_json, request_too_large_response,
-    result_response, server_busy_response, server_not_initialized_response,
+    maximum_compact_fallback_result_bytes, method_not_found_response, parse_error_response,
+    parse_strict_json, request_too_large_response, result_response, server_busy_response,
+    server_not_initialized_response,
 };
 use codex_ssh_bridge::{BridgeError, ErrorCode, ErrorDetails};
 use serde::Serialize;
@@ -1508,16 +1509,17 @@ async fn task7_dispatch_completes_out_of_order_and_propagates_exact_context() {
         assert_eq!(session.recv().await["id"], "slow");
         let contexts = tools.contexts.lock().await;
         assert_eq!(contexts.len(), 2);
+        let compact_fallback_bytes = maximum_compact_fallback_result_bytes();
         let expected_slow = WireBudget::for_response(
             MIN_MCP_FRAME_BYTES,
             &RequestId::try_from(json!("slow")).unwrap(),
-            0,
+            compact_fallback_bytes,
         )
         .unwrap();
         let expected_fast = WireBudget::for_response(
             MIN_MCP_FRAME_BYTES,
             &RequestId::try_from(json!("fast")).unwrap(),
-            0,
+            compact_fallback_bytes,
         )
         .unwrap();
         assert_eq!(contexts[0].wire_budget.result_bytes, expected_slow.result_bytes);

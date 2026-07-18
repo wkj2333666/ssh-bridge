@@ -1,8 +1,10 @@
 mod protocol;
+mod render;
 pub mod stdio;
 pub mod tools;
 
 pub use protocol::*;
+pub use render::maximum_compact_fallback_result_bytes;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -84,7 +86,7 @@ pub struct McpServer<S> {
 impl<S: ToolService> McpServer<S> {
     #[allow(clippy::result_large_err)]
     pub fn new(service: Arc<S>, max_frame_bytes: usize, max_inflight: usize) -> BridgeResult<Self> {
-        let compact_fallback_result_bytes = 0;
+        let compact_fallback_result_bytes = render::maximum_compact_fallback_result_bytes();
         let synthetic_id = RequestId::synthetic_max_wire();
         let required = required_mcp_frame_bytes(
             service.definitions(),
