@@ -324,7 +324,7 @@ name'
     )
 
     codex_mutation_link() {
-        ln -- "$1" "$2"
+        ln -T -- "$1" "$2"
     }
 
     codex_mutation_replace() {
@@ -339,6 +339,11 @@ name'
         rm -f -- "$1"
     }
 
+    codex_mutation_decimal_valid() {
+        case "$1" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${#1}" -le 20 ]
+    }
+
     codex_mutation_stat_parse() {
         codex_stat_line=$1
         case "$codex_stat_line" in ''|*[!0-9a-f:]*) return 1 ;; esac
@@ -347,9 +352,15 @@ name'
         set -- $codex_stat_line
         IFS=$codex_stat_old_ifs
         [ "$#" -eq 7 ] || return 1
-        case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
-        case "$2:$4:$5:$6:$7" in *[!0-9:]*) return 1 ;; esac
+        [ "${#1}" -eq 4 ] || return 1
+        case "$1" in *[!0-9a-f]*) return 1 ;; esac
+        codex_mutation_decimal_valid "$2" || return 1
+        [ "${#3}" -le 4 ] || return 1
         case "$3" in ''|*[!0-7]*) return 1 ;; esac
+        codex_mutation_decimal_valid "$4" || return 1
+        codex_mutation_decimal_valid "$5" || return 1
+        codex_mutation_decimal_valid "$6" || return 1
+        codex_mutation_decimal_valid "$7" || return 1
         CODEX_STAT_TYPE=$1
         CODEX_STAT_UID=$2
         CODEX_STAT_MODE=$3
@@ -483,6 +494,8 @@ name' value"
 
         printf OUTSIDE >"$safe_hostile" || exit 9
         ln -s "$safe_hostile" "$safe_dir/dd-link" || exit 9
+        codex_mutation_stat_valid "$safe_dir/dd-link" || exit 1
+        case "$CODEX_STAT_TYPE" in a???) ;; *) exit 1 ;; esac
         if printf CHANGED | codex_mutation_stage "$safe_dir/dd-link" 2>/dev/null; then exit 1; fi
         [ "$(cat "$safe_hostile")" = OUTSIDE ] || exit 1
         if CODEX_HASH_DIGEST=$(codex_mutation_hash "$safe_dir/dd-link"); then exit 1; fi
@@ -490,6 +503,14 @@ name' value"
         safe_created=$safe_dir/created
         codex_mutation_link "$safe_tmp" "$safe_created" || exit 1
         if codex_mutation_link "$safe_tmp" "$safe_created" 2>/dev/null; then exit 1; fi
+        safe_link_directory=$safe_dir/link-directory
+        safe_directory_link=$safe_dir/directory-link
+        mkdir -m 700 -- "$safe_link_directory" || exit 9
+        ln -s "$safe_link_directory" "$safe_directory_link" || exit 9
+        if codex_mutation_link "$safe_tmp" "$safe_directory_link" 2>/dev/null; then exit 1; fi
+        safe_nested_link=$safe_link_directory/${safe_tmp##*/}
+        [ -L "$safe_directory_link" ] || exit 1
+        [ ! -e "$safe_nested_link" ] && [ ! -L "$safe_nested_link" ] || exit 1
         codex_mutation_remove "$safe_created" || exit 1
         [ ! -e "$safe_created" ] && [ ! -L "$safe_created" ] || exit 1
         safe_replaced=$safe_dir/replaced

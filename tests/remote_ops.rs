@@ -576,6 +576,75 @@ async fn task5_stale_write_sentinel_invalidates_only_a_future_request() {
 }
 
 #[tokio::test]
+async fn task5_missing_required_write_command_is_a_future_only_capability_mismatch() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let marker = controls.path().join("missing-path-used");
+    let empty_path = controls.path().join("empty-path");
+    let scratch = controls.path().join("scratch");
+    std::fs::create_dir(&empty_path).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", empty_path.join("sh")).unwrap();
+    std::fs::create_dir(&scratch).unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+            (
+                "FAKE_SSH_LOCAL_FIXED_PATH_ONCE",
+                empty_path.as_os_str().to_owned(),
+            ),
+            (
+                "FAKE_SSH_LOCAL_FIXED_PATH_MARKER",
+                marker.as_os_str().to_owned(),
+            ),
+            ("TMPDIR", scratch.as_os_str().to_owned()),
+        ],
+    );
+
+    let first = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "first".to_owned(),
+                content: "first payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(first.code, ErrorCode::RemoteCapabilityMissing);
+    assert_eq!(std::fs::read_dir(remote.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+    assert_eq!(ssh_call_count(&log, "P"), 1);
+    assert_eq!(ssh_call_count(&log, "C"), 1);
+
+    bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "second".to_owned(),
+                content: "second payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(remote.path().join("second")).unwrap(),
+        b"second payload"
+    );
+    assert_eq!(ssh_call_count(&log, "P"), 2);
+    assert_eq!(ssh_call_count(&log, "C"), 2);
+}
+
+#[tokio::test]
 async fn task5_write_exact_form_sentinel_matrix_is_semantic_and_future_only() {
     struct Case {
         form: &'static str,
@@ -598,6 +667,14 @@ esac"#,
             rule: r#"case " $* " in
   *" --printf=%f:%u:%a:%s:%d:%i:%h\n -- "*codex-sentinel-safe-write*/work/.codex-ssh-bridge.*)
     if [ ! -e "$marker" ]; then : >"$marker"; printf '8180:0:600:8:0:0:1\n'; exit 0; fi;;
+esac"#,
+        },
+        Case {
+            form: "lstat-symlink-no-follow",
+            tool: "stat",
+            rule: r#"case " $* " in
+  *" --printf=%f:%u:%a:%s:%d:%i:%h\n -- "*codex-sentinel-safe-write*/work/link*)
+    if [ ! -e "$marker" ]; then : >"$marker"; printf '8180:0:600:7:0:0:1\n'; exit 0; fi;;
 esac"#,
         },
         Case {
@@ -631,7 +708,7 @@ fi"#,
             form: "ln",
             tool: "ln",
             rule: r#"case " $* " in
-  *" -- "*codex-sentinel-safe-write*/work/.codex-ssh-bridge.*codex-sentinel-safe-write*/work/created*)
+  *" -T -- "*codex-sentinel-safe-write*/work/.codex-ssh-bridge.*codex-sentinel-safe-write*/work/created*)
     destination=; for destination do :; done
     if [ -e "$destination" ] && [ ! -e "$marker" ]; then : >"$marker"; exit 0; fi;;
 esac"#,
@@ -1141,6 +1218,75 @@ async fn task5_create_collisions_hostile_names_empty_content_and_parent_symlink(
 }
 
 #[tokio::test]
+async fn task5_create_link_race_never_follows_a_symlink_to_an_outside_directory() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let outside = controls.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"unchanged").unwrap();
+    let log = controls.path().join("ssh.log");
+    let shim = tempfile::TempDir::new().unwrap();
+    let ln = shim.path().join("ln");
+    std::fs::write(
+        &ln,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" -T -- \"*\" ./target \"*) /usr/bin/rm -f -- ./target; /usr/bin/ln -s -- {} ./target;; esac\nexec /usr/bin/ln \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(outside.to_str().unwrap()).unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ln, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("PATH", path), ("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+
+    let error = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "target".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        std::fs::symlink_metadata(remote.path().join("target"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_link(remote.path().join("target")).unwrap(),
+        outside
+    );
+    assert_eq!(
+        std::fs::read(controls.path().join("outside/keep")).unwrap(),
+        b"unchanged"
+    );
+    assert_eq!(
+        std::fs::read_dir(controls.path().join("outside"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(error.code, ErrorCode::WriteConflict);
+    assert_eq!(ssh_call_count(&log, "P"), 1);
+    assert_eq!(ssh_call_count(&log, "C"), 1);
+}
+
+#[tokio::test]
 async fn task5_parent_identity_race_fails_before_staging() {
     use std::os::unix::fs::symlink;
 
@@ -1538,11 +1684,15 @@ async fn task5_parent_domain_errors_are_closed_before_large_stdin() {
         None,
         &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
     );
-    for (path, expected) in [
-        ("missing-parent/target", ErrorCode::NotFound),
-        ("dangling-parent/target", ErrorCode::NotFound),
-        ("regular-parent/target", ErrorCode::NotDirectory),
-        ("denied-parent/target", ErrorCode::PermissionDenied),
+    for (path, expected, mutation_may_have_applied) in [
+        ("missing-parent/target", ErrorCode::NotFound, None),
+        (
+            "dangling-parent/target",
+            ErrorCode::MutationOutcomeUnknown,
+            Some(true),
+        ),
+        ("regular-parent/target", ErrorCode::NotDirectory, None),
+        ("denied-parent/target", ErrorCode::PermissionDenied, None),
     ] {
         let error = bridge
             .write(
@@ -1558,10 +1708,42 @@ async fn task5_parent_domain_errors_are_closed_before_large_stdin() {
             .await
             .unwrap_err();
         assert_eq!(error.code, expected, "path={path}");
+        assert_eq!(
+            error.details.mutation_may_have_applied, mutation_may_have_applied,
+            "path={path}"
+        );
     }
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(ssh_call_count(&log, "P"), 1);
     assert_eq!(ssh_call_count(&log, "C"), 4);
+}
+
+#[tokio::test]
+async fn task5_write_inaccessible_ancestor_is_not_reported_as_not_found() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let locked = remote.path().join("locked");
+    let parent = locked.join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+
+    let error = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "locked/parent/target".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert!(!parent.join("target").exists());
 }
 
 #[tokio::test]

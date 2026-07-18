@@ -21,6 +21,8 @@ const WRITE_PROTOCOL_LIMIT: u64 = 512;
 pub(super) const WRITE_SCRIPT: &str = r#"
 set -u
 
+[ "$#" -eq 7 ] || exit 2
+
 parent=$1
 basename=$2
 operation=$3
@@ -54,7 +56,7 @@ codex_mutation_stage() (
 )
 
 codex_mutation_link() {
-    ln -- "$1" "$2"
+    ln -T -- "$1" "$2"
 }
 
 codex_mutation_replace() {
@@ -69,6 +71,11 @@ codex_mutation_remove() {
     rm -f -- "$1"
 }
 
+codex_mutation_decimal_valid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 20 ]
+}
+
 codex_mutation_stat_parse() {
     codex_stat_line=$1
     case "$codex_stat_line" in ''|*[!0-9a-f:]*) return 1 ;; esac
@@ -77,9 +84,15 @@ codex_mutation_stat_parse() {
     set -- $codex_stat_line
     IFS=$codex_stat_old_ifs
     [ "$#" -eq 7 ] || return 1
-    case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
-    case "$2:$4:$5:$6:$7" in *[!0-9:]*) return 1 ;; esac
+    [ "${#1}" -eq 4 ] || return 1
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+    codex_mutation_decimal_valid "$2" || return 1
+    [ "${#3}" -le 4 ] || return 1
     case "$3" in ''|*[!0-7]*) return 1 ;; esac
+    codex_mutation_decimal_valid "$4" || return 1
+    codex_mutation_decimal_valid "$5" || return 1
+    codex_mutation_decimal_valid "$6" || return 1
+    codex_mutation_decimal_valid "$7" || return 1
     CODEX_STAT_TYPE=$1
     CODEX_STAT_UID=$2
     CODEX_STAT_MODE=$3
@@ -213,6 +226,14 @@ codex_safe_write_sentinel() (
     codex_sentinel_created=$codex_sentinel_work/created
     codex_mutation_link "$codex_sentinel_tmp" "$codex_sentinel_created" || exit 9
     if codex_mutation_link "$codex_sentinel_tmp" "$codex_sentinel_created" 2>/dev/null; then exit 1; fi
+    codex_sentinel_link_directory=$codex_sentinel_work/link-directory
+    codex_sentinel_directory_link=$codex_sentinel_work/directory-link
+    mkdir -m 700 -- "$codex_sentinel_link_directory" || exit 9
+    ln -s "$codex_sentinel_link_directory" "$codex_sentinel_directory_link" || exit 9
+    if codex_mutation_link "$codex_sentinel_tmp" "$codex_sentinel_directory_link" 2>/dev/null; then exit 1; fi
+    codex_sentinel_nested_link=$codex_sentinel_link_directory/${codex_sentinel_tmp##*/}
+    [ -L "$codex_sentinel_directory_link" ] || exit 1
+    [ ! -e "$codex_sentinel_nested_link" ] && [ ! -L "$codex_sentinel_nested_link" ] || exit 1
     codex_mutation_stat_valid "$codex_sentinel_created" || exit $?
     [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$codex_sentinel_stage_identity" ] || exit 1
     codex_mutation_remove "$codex_sentinel_created" || exit 9
@@ -233,6 +254,8 @@ codex_safe_write_sentinel() (
     printf OUTSIDE >"$codex_sentinel_outside" || exit 9
     chmod 0600 -- "$codex_sentinel_outside" || exit 9
     ln -s "$codex_sentinel_outside" "$codex_sentinel_link" || exit 9
+    codex_mutation_stat_valid "$codex_sentinel_link" || exit $?
+    case "$CODEX_STAT_TYPE" in a???) ;; *) exit 1 ;; esac
     if printf CHANGED | codex_mutation_stage "$codex_sentinel_link" 2>/dev/null; then exit 1; fi
     codex_sentinel_hash_status=0
     codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_link") || codex_sentinel_hash_status=$?
@@ -247,6 +270,17 @@ codex_safe_write_sentinel() (
     trap - 0 HUP INT TERM
     exit 0
 )
+
+codex_safe_write_preflight() {
+    for codex_required_command in stat mktemp dd sha256sum ln mv chmod rm mkdir id cat; do
+        command -v "$codex_required_command" >/dev/null 2>&1 || return 1
+    done
+}
+
+if ! codex_safe_write_preflight; then
+    printf 'STATUS=CAPABILITY_MISMATCH\000CAPABILITY=safe_write\000'
+    exit 0
+fi
 
 codex_sentinel_status=0
 codex_safe_write_sentinel || codex_sentinel_status=$?
@@ -296,15 +330,44 @@ emit_one() {
     exit 0
 }
 
+codex_classify_unreachable_parent() {
+    codex_parent_candidate=$parent
+    codex_parent_unresolved=0
+    while :; do
+        codex_parent_lstat_status=0
+        codex_mutation_stat_valid "$codex_parent_candidate" || codex_parent_lstat_status=$?
+        if [ "$codex_parent_lstat_status" -eq 0 ]; then
+            case "$CODEX_STAT_TYPE" in
+                4???)
+                    if [ ! -x "$codex_parent_candidate" ]; then emit_one PERMISSION_DENIED; fi
+                    [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_FOUND
+                    return 1
+                    ;;
+                a???)
+                    codex_parent_follow_status=0
+                    codex_mutation_parent_stat_follow_valid "$codex_parent_candidate" || codex_parent_follow_status=$?
+                    [ "$codex_parent_follow_status" -eq 0 ] || return 1
+                    case "$CODEX_STAT_TYPE" in
+                        4???)
+                            if [ ! -x "$codex_parent_candidate" ]; then emit_one PERMISSION_DENIED; fi
+                            [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_FOUND
+                            return 1
+                            ;;
+                        *) [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_DIRECTORY; return 1 ;;
+                    esac
+                    ;;
+                *) [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_DIRECTORY; return 1 ;;
+            esac
+        fi
+        [ "$codex_parent_candidate" = / ] && return 1
+        codex_parent_candidate=${codex_parent_candidate%/*}
+        [ -n "$codex_parent_candidate" ] || codex_parent_candidate=/
+        codex_parent_unresolved=$((codex_parent_unresolved + 1))
+    done
+}
+
 codex_parent_line=$(codex_mutation_parent_stat_follow "$parent") || {
-    if codex_mutation_stat_valid "$parent"; then
-        case "$CODEX_STAT_TYPE" in
-            4???) exit 3 ;;
-            a???) emit_one NOT_FOUND ;;
-            *) emit_one NOT_DIRECTORY ;;
-        esac
-    fi
-    if [ ! -e "$parent" ] && [ ! -L "$parent" ]; then emit_one NOT_FOUND; fi
+    codex_classify_unreachable_parent
     exit 3
 }
 codex_mutation_stat_parse "$codex_parent_line" || exit 3
@@ -453,6 +516,8 @@ exit 0
 pub(super) const GUARDED_DELETE_SCRIPT: &str = r#"
 set -u
 
+[ "$#" -eq 3 ] || exit 2
+
 parent=$1
 basename=$2
 expected_hash=$3
@@ -472,6 +537,11 @@ codex_mutation_remove() {
     rm -f -- "$1"
 }
 
+codex_mutation_decimal_valid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 20 ]
+}
+
 codex_mutation_stat_parse() {
     codex_stat_line=$1
     case "$codex_stat_line" in ''|*[!0-9a-f:]*) return 1 ;; esac
@@ -480,9 +550,15 @@ codex_mutation_stat_parse() {
     set -- $codex_stat_line
     IFS=$codex_stat_old_ifs
     [ "$#" -eq 7 ] || return 1
-    case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
-    case "$2:$4:$5:$6:$7" in *[!0-9:]*) return 1 ;; esac
+    [ "${#1}" -eq 4 ] || return 1
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+    codex_mutation_decimal_valid "$2" || return 1
+    [ "${#3}" -le 4 ] || return 1
     case "$3" in ''|*[!0-7]*) return 1 ;; esac
+    codex_mutation_decimal_valid "$4" || return 1
+    codex_mutation_decimal_valid "$5" || return 1
+    codex_mutation_decimal_valid "$6" || return 1
+    codex_mutation_decimal_valid "$7" || return 1
     CODEX_STAT_TYPE=$1
     CODEX_STAT_UID=$2
     CODEX_STAT_MODE=$3
@@ -632,6 +708,17 @@ codex_guarded_delete_sentinel() (
     exit 0
 )
 
+codex_guarded_delete_preflight() {
+    for codex_required_command in stat mktemp dd sha256sum ln rm mkdir cat; do
+        command -v "$codex_required_command" >/dev/null 2>&1 || return 1
+    done
+}
+
+if ! codex_guarded_delete_preflight; then
+    printf 'STATUS=CAPABILITY_MISMATCH\000CAPABILITY=guarded_delete\000'
+    exit 0
+fi
+
 codex_sentinel_status=0
 codex_guarded_delete_sentinel || codex_sentinel_status=$?
 case "$codex_sentinel_status" in
@@ -652,15 +739,44 @@ emit_one() {
     exit 0
 }
 
+codex_classify_unreachable_parent() {
+    codex_parent_candidate=$parent
+    codex_parent_unresolved=0
+    while :; do
+        codex_parent_lstat_status=0
+        codex_mutation_stat_valid "$codex_parent_candidate" || codex_parent_lstat_status=$?
+        if [ "$codex_parent_lstat_status" -eq 0 ]; then
+            case "$CODEX_STAT_TYPE" in
+                4???)
+                    if [ ! -x "$codex_parent_candidate" ]; then emit_one PERMISSION_DENIED; fi
+                    [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_FOUND
+                    return 1
+                    ;;
+                a???)
+                    codex_parent_follow_status=0
+                    codex_mutation_parent_stat_follow_valid "$codex_parent_candidate" || codex_parent_follow_status=$?
+                    [ "$codex_parent_follow_status" -eq 0 ] || return 1
+                    case "$CODEX_STAT_TYPE" in
+                        4???)
+                            if [ ! -x "$codex_parent_candidate" ]; then emit_one PERMISSION_DENIED; fi
+                            [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_FOUND
+                            return 1
+                            ;;
+                        *) [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_DIRECTORY; return 1 ;;
+                    esac
+                    ;;
+                *) [ "$codex_parent_unresolved" -gt 0 ] && emit_one NOT_DIRECTORY; return 1 ;;
+            esac
+        fi
+        [ "$codex_parent_candidate" = / ] && return 1
+        codex_parent_candidate=${codex_parent_candidate%/*}
+        [ -n "$codex_parent_candidate" ] || codex_parent_candidate=/
+        codex_parent_unresolved=$((codex_parent_unresolved + 1))
+    done
+}
+
 codex_parent_line=$(codex_mutation_parent_stat_follow "$parent") || {
-    if codex_mutation_stat_valid "$parent"; then
-        case "$CODEX_STAT_TYPE" in
-            4???) exit 3 ;;
-            a???) emit_one NOT_FOUND ;;
-            *) emit_one NOT_DIRECTORY ;;
-        esac
-    fi
-    if [ ! -e "$parent" ] && [ ! -L "$parent" ]; then emit_one NOT_FOUND; fi
+    codex_classify_unreachable_parent
     exit 3
 }
 codex_mutation_stat_parse "$codex_parent_line" || exit 3
@@ -1551,6 +1667,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn task5_mutation_scripts_reject_extra_arguments_before_sentinel_io() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let hash = "0".repeat(64);
+        let write = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                super::WRITE_SCRIPT,
+                "probe",
+                "/definitely-missing-parent",
+                "target",
+                "CREATE",
+                "0",
+                &hash,
+                "0",
+                "",
+                "extra",
+            ])
+            .env("TMPDIR", scratch.path())
+            .output()
+            .unwrap();
+        assert_eq!(write.status.code(), Some(2));
+        assert!(write.stdout.is_empty());
+        assert!(write.stderr.is_empty());
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+
+        let delete = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                super::GUARDED_DELETE_SCRIPT,
+                "probe",
+                "/definitely-missing-parent",
+                "target",
+                &hash,
+                "extra",
+            ])
+            .env("TMPDIR", scratch.path())
+            .output()
+            .unwrap();
+        assert_eq!(delete.status.code(), Some(2));
+        assert!(delete.stdout.is_empty());
+        assert!(delete.stderr.is_empty());
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn task5_shell_stat_parsers_declare_closed_numeric_shapes() {
+        for script in [super::WRITE_SCRIPT, super::GUARDED_DELETE_SCRIPT] {
+            assert!(script.contains("[ \"${#1}\" -le 20 ]"));
+            assert!(script.contains("[ \"${#1}\" -eq 4 ] || return 1"));
+            assert!(script.contains("[ \"${#3}\" -le 4 ] || return 1"));
+            assert!(script.contains("codex_mutation_decimal_valid \"$2\" || return 1"));
+            assert!(script.contains("codex_mutation_decimal_valid \"$4\" || return 1"));
+            assert!(script.contains("codex_mutation_decimal_valid \"$5\" || return 1"));
+            assert!(script.contains("codex_mutation_decimal_valid \"$6\" || return 1"));
+            assert!(script.contains("codex_mutation_decimal_valid \"$7\" || return 1"));
+        }
+    }
+
     #[tokio::test]
     async fn task5_guarded_delete_rejects_missing_wrong_hash_and_non_regular_entries() {
         use std::os::unix::fs::symlink;
@@ -1634,6 +1809,33 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, expected, "path={path}");
         }
+    }
+
+    #[tokio::test]
+    async fn task5_delete_inaccessible_ancestor_is_not_reported_as_not_found() {
+        let remote = tempfile::TempDir::new().unwrap();
+        let locked = remote.path().join("locked");
+        let parent = locked.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("victim"), b"victim").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (_runtime, bridge) = delete_fixture(remote.path());
+
+        let error = bridge
+            .guarded_delete(
+                GuardedDeleteRequest {
+                    host: "dev".to_owned(),
+                    path: "locked/parent/victim".to_owned(),
+                    expected_sha256: sha256(b"victim"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_eq!(std::fs::read(parent.join("victim")).unwrap(), b"victim");
     }
 
     #[tokio::test]
@@ -1910,6 +2112,71 @@ mod tests {
             .unwrap();
         assert!(second.absence_confirmed);
         assert!(!target.exists());
+        assert_eq!(ssh_call_count(&log, "P"), 2);
+        assert_eq!(ssh_call_count(&log, "C"), 2);
+    }
+
+    #[tokio::test]
+    async fn task5_missing_required_delete_command_is_a_future_only_capability_mismatch() {
+        let remote = tempfile::TempDir::new().unwrap();
+        let first_target = remote.path().join("first");
+        let second_target = remote.path().join("second");
+        std::fs::write(&first_target, b"first payload").unwrap();
+        std::fs::write(&second_target, b"second payload").unwrap();
+        let controls = tempfile::TempDir::new().unwrap();
+        let log = controls.path().join("ssh.log");
+        let marker = controls.path().join("missing-path-used");
+        let empty_path = controls.path().join("empty-path");
+        let scratch = controls.path().join("scratch");
+        std::fs::create_dir(&empty_path).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", empty_path.join("sh")).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        let (_runtime, bridge) = delete_fixture_with_options(
+            remote.path(),
+            false,
+            &[
+                ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+                (
+                    "FAKE_SSH_LOCAL_FIXED_PATH_ONCE",
+                    empty_path.as_os_str().to_owned(),
+                ),
+                (
+                    "FAKE_SSH_LOCAL_FIXED_PATH_MARKER",
+                    marker.as_os_str().to_owned(),
+                ),
+                ("TMPDIR", scratch.as_os_str().to_owned()),
+            ],
+        );
+
+        let first = bridge
+            .guarded_delete(
+                GuardedDeleteRequest {
+                    host: "dev".to_owned(),
+                    path: "first".to_owned(),
+                    expected_sha256: sha256(b"first payload"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(first.code, ErrorCode::RemoteCapabilityMissing);
+        assert_eq!(std::fs::read(&first_target).unwrap(), b"first payload");
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(ssh_call_count(&log, "P"), 1);
+        assert_eq!(ssh_call_count(&log, "C"), 1);
+
+        bridge
+            .guarded_delete(
+                GuardedDeleteRequest {
+                    host: "dev".to_owned(),
+                    path: "second".to_owned(),
+                    expected_sha256: sha256(b"second payload"),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!second_target.exists());
         assert_eq!(ssh_call_count(&log, "P"), 2);
         assert_eq!(ssh_call_count(&log, "C"), 2);
     }
