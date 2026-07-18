@@ -20,6 +20,7 @@ mod metadata;
 mod patch;
 mod protocol;
 mod read;
+mod run;
 mod search;
 mod write;
 
@@ -162,6 +163,14 @@ impl RemoteBridge {
     ) -> BridgeResult<SearchResult> {
         let resolved = resolve_search(self.runner.config(), request)?;
         search::search(self, resolved, cancel).await
+    }
+
+    pub async fn run(
+        &self,
+        request: RemoteRunRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<RemoteRunResult> {
+        run::run(self, request, cancel).await
     }
 
     pub async fn write(

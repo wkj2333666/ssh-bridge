@@ -13,9 +13,10 @@ use codex_ssh_bridge::output::StreamKind;
 use codex_ssh_bridge::remote::{
     ApplyPatchRequest, ApplyPatchResult, EncodedValue, EntryError, EntryErrorCode, HostInfo,
     HostsResult, ListEntry, ListRequest, ListResult, OutputReadResult, ReadEntry, ReadRequest,
-    ReadResult, RemoteBridge, RemoteContext, RemoteFileKind, RemoteMetadata, SearchEngine,
-    SearchMatch, SearchRequest, SearchResult, ShellMetadata, ShellName, StatEntry, StatRequest,
-    StatResult, ValueEncoding, WriteEncoding, WriteMode, WriteOperation, WriteRequest, WriteResult,
+    ReadResult, RemoteBridge, RemoteContext, RemoteFileKind, RemoteMetadata, RemoteRunRequest,
+    RunShell, RunStdin, SearchEngine, SearchMatch, SearchRequest, SearchResult, ShellMetadata,
+    ShellName, StatEntry, StatRequest, StatResult, ValueEncoding, WriteEncoding, WriteMode,
+    WriteOperation, WriteRequest, WriteResult,
 };
 use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshRunner};
 use codex_ssh_bridge::{BridgeError, ErrorCode};
@@ -142,8 +143,6 @@ fn value(value: &str) -> EncodedValue {
 
 #[test]
 fn task78_remote_run_public_shapes_are_closed() {
-    use codex_ssh_bridge::remote::{RemoteRunRequest, RunShell, RunStdin, WriteEncoding};
-
     let request = RemoteRunRequest {
         host: "dev".to_owned(),
         command: "printf ok".to_owned(),
@@ -157,6 +156,275 @@ fn task78_remote_run_public_shapes_are_closed() {
     };
     assert_eq!(request.shell, RunShell::Sh);
     assert_eq!(request.timeout_ms, Some(1_250));
+}
+
+fn command_call_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == "C")
+        .count()
+}
+
+#[tokio::test]
+async fn task78_remote_run_is_bridge_owned_and_reports_explicit_shell() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(remote.path().join("sub dir")).unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "pwd; od -An -tx1".to_owned(),
+                cwd: Some("sub dir".to_owned()),
+                shell: RunShell::Sh,
+                timeout_ms: Some(2_000),
+                stdin: Some(RunStdin {
+                    encoding: WriteEncoding::Base64,
+                    value: "AAEJ".to_owned(),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.context.shell.kind, ShellName::Sh);
+    assert!(!result.context.shell.fallback);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("[[ ]]"))
+    );
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(
+        result.context.physical_root,
+        remote.path().to_str().unwrap()
+    );
+    assert!(result.stdout.head.value.contains("sub dir"));
+    assert!(result.stdout.head.value.contains("00 01 09"));
+}
+
+#[tokio::test]
+async fn task78_remote_run_rejects_read_only_path_escape_and_nul_before_command_child() {
+    let remote = tempfile::TempDir::new().unwrap();
+    for (name, read_only, command, cwd, expected) in [
+        (
+            "read-only",
+            true,
+            "printf unsafe",
+            Some("."),
+            ErrorCode::ReadOnlyHost,
+        ),
+        (
+            "escape",
+            false,
+            "printf unsafe",
+            Some("../escape"),
+            ErrorCode::PathOutsideRoot,
+        ),
+        (
+            "nul",
+            false,
+            "printf\0unsafe",
+            Some("."),
+            ErrorCode::InvalidArgument,
+        ),
+    ] {
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let log = log_dir.path().join(format!("{name}.log"));
+        let (_runtime, _runner, bridge) = fixture_with_patch_policy(
+            remote.path(),
+            None,
+            None,
+            read_only,
+            &[("FAKE_SSH_LOG", log.clone().into_os_string())],
+        );
+        let error = bridge
+            .run(
+                RemoteRunRequest {
+                    host: "dev".to_owned(),
+                    command: command.to_owned(),
+                    cwd: cwd.map(str::to_owned),
+                    shell: RunShell::Sh,
+                    timeout_ms: Some(2_000),
+                    stdin: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected, "{name}: {error:?}");
+        assert_eq!(command_call_count(&log), 0, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn task78_remote_run_requires_canonical_bounded_base64_before_command_child() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let remote = tempfile::TempDir::new().unwrap();
+    let oversized = STANDARD.encode(vec![0; codex_ssh_bridge::MAX_WRITE_BYTES + 1]);
+    for (name, value) in [
+        ("whitespace", "AAEJ\n".to_owned()),
+        ("missing-padding", "AAE".to_owned()),
+        ("url-safe", "__8=".to_owned()),
+        ("decoded-over-limit", oversized),
+    ] {
+        let log_dir = tempfile::TempDir::new().unwrap();
+        let log = log_dir.path().join(format!("{name}.log"));
+        let (_runtime, _runner, bridge) = fixture_with_options(
+            remote.path(),
+            false,
+            None,
+            &[("FAKE_SSH_LOG", log.clone().into_os_string())],
+        );
+        let error = bridge
+            .run(
+                RemoteRunRequest {
+                    host: "dev".to_owned(),
+                    command: "cat".to_owned(),
+                    cwd: None,
+                    shell: RunShell::Sh,
+                    timeout_ms: Some(2_000),
+                    stdin: Some(RunStdin {
+                        encoding: WriteEncoding::Base64,
+                        value,
+                    }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.code,
+                ErrorCode::InvalidArgument | ErrorCode::RequestTooLarge
+            ),
+            "{name}: {error:?}"
+        );
+        assert_eq!(command_call_count(&log), 0, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn task78_remote_run_auto_fallback_and_missing_bash_are_explicit() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_MODE", OsString::from("echo-command"))],
+    );
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "printf safe".to_owned(),
+                cwd: None,
+                shell: RunShell::Auto,
+                timeout_ms: Some(2_000),
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.context.shell.kind, ShellName::Sh);
+    assert!(result.context.shell.fallback);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("[[ ]]"))
+    );
+
+    let error = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "printf safe".to_owned(),
+                cwd: None,
+                shell: RunShell::Bash,
+                timeout_ms: Some(2_000),
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+}
+
+#[tokio::test]
+async fn task78_remote_run_errors_after_selection_carry_shell_context() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("error")),
+            ("FAKE_SSH_ERROR", OsString::from("remote")),
+        ],
+    );
+    let error = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "exit 7".to_owned(),
+                cwd: None,
+                shell: RunShell::Sh,
+                timeout_ms: Some(2_000),
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteExit);
+    assert_eq!(
+        error
+            .details
+            .shell
+            .as_ref()
+            .map(|shell| shell.kind.as_str()),
+        Some("sh")
+    );
+}
+
+#[tokio::test]
+async fn task78_remote_run_treats_hostile_cwd_bytes_as_literal_data() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let sentinel = controls.path().join("cwd-injection");
+    let component = format!(
+        "quote'\n* -leading `tick` $(printf injected); touch {}; printf unsafe",
+        sentinel.display()
+    );
+    std::fs::create_dir_all(remote.path().join(&component)).unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "pwd".to_owned(),
+                cwd: Some(component.clone()),
+                shell: RunShell::Sh,
+                timeout_ms: Some(2_000),
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.stdout.head.value,
+        format!("{}\n", remote.path().join(&component).display())
+    );
+    assert!(!sentinel.exists());
 }
 
 #[test]
@@ -4501,6 +4769,7 @@ async fn output_read_requires_and_uses_command_provenance() {
             RunRequest {
                 host: "dev".into(),
                 command: "head -c 300000 /dev/zero".into(),
+                cwd: remote.path().to_str().unwrap().into(),
                 shell: ShellRequest::Auto,
                 stdin: None,
                 timeout: Duration::from_secs(5),
