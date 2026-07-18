@@ -451,11 +451,11 @@ async fn task6_preparse_rejection_has_no_progress_details() {
 }
 
 #[tokio::test]
-async fn task6_postparse_local_failure_partitions_every_path() {
+async fn task6_postparse_prepared_mutations_execute_after_local_validation() {
     let remote = tempfile::TempDir::new().unwrap();
     std::fs::write(remote.path().join("a"), b"old\n").unwrap();
     let (_runtime, _runner, bridge) = fixture(remote.path(), false);
-    let error = bridge
+    let result = bridge
         .apply_patch(
             ApplyPatchRequest {
                 host: "dev".to_owned(),
@@ -468,15 +468,10 @@ async fn task6_postparse_local_failure_partitions_every_path() {
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
-    assert_eq!(error.details.failed_path, None);
-    assert_eq!(error.details.changed_paths, Some(Vec::new()));
-    assert_eq!(
-        error.details.not_changed_paths,
-        Some(vec!["a".to_owned(), "b".to_owned()])
-    );
-    assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+        .unwrap();
+    assert_eq!(result.changed_paths, vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(std::fs::read(remote.path().join("a")).unwrap(), b"new\n");
+    assert_eq!(std::fs::read(remote.path().join("b")).unwrap(), b"new\n");
 }
 
 #[tokio::test]
@@ -924,11 +919,11 @@ async fn task6_five_concurrent_large_snapshots_bound_rss_and_spools() {
                     CancellationToken::new(),
                 )
                 .await
-                .unwrap_err()
+                .unwrap()
         });
     }
     while let Some(result) = tasks.join_next().await {
-        assert_eq!(result.unwrap().code, ErrorCode::InvalidArgument);
+        assert_eq!(result.unwrap().changed_paths.len(), 1);
     }
     stop.cancel();
     monitor.await.unwrap();
@@ -1058,7 +1053,7 @@ async fn task6_snapshot_accepts_exact_write_limit_rejects_plus_one_and_cleans_sp
         &[("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned())],
     );
 
-    let exact_error = bridge
+    let exact_result = bridge
         .apply_patch(
             ApplyPatchRequest {
                 host: "dev".to_owned(),
@@ -1067,9 +1062,8 @@ async fn task6_snapshot_accepts_exact_write_limit_rejects_plus_one_and_cleans_sp
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(exact_error.code, ErrorCode::InvalidArgument);
-    assert_eq!(exact_error.details.failed_path, None);
+        .unwrap();
+    assert_eq!(exact_result.changed_paths, ["exact".to_owned()]);
 
     let plus_one_error = bridge
         .apply_patch(
@@ -1086,7 +1080,7 @@ async fn task6_snapshot_accepts_exact_write_limit_rejects_plus_one_and_cleans_sp
         plus_one_error.details.failed_path.as_deref(),
         Some("plus-one")
     );
-    assert_eq!(phase_log(&phases), ["S", "S"]);
+    assert_eq!(phase_log(&phases), ["S", "M", "S"]);
     assert_eq!(
         spool_file_count(&runtime.path().join("codex-ssh-bridge")),
         0
@@ -1198,7 +1192,7 @@ async fn task6_snapshot_reserves_protocol_within_the_host_output_limit() {
         false,
         &[("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned())],
     );
-    let error = bridge
+    let result = bridge
         .apply_patch(
             ApplyPatchRequest {
                 host: "dev".to_owned(),
@@ -1207,10 +1201,13 @@ async fn task6_snapshot_reserves_protocol_within_the_host_output_limit() {
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
-    assert_eq!(error.details.failed_path, None);
-    assert_eq!(phase_log(&phases), ["S"]);
+        .unwrap();
+    assert_eq!(result.changed_paths, ["target".to_owned()]);
+    assert_eq!(phase_log(&phases), ["S", "M"]);
+    assert_eq!(
+        std::fs::read(remote.path().join("target")).unwrap(),
+        b"new\n"
+    );
 }
 
 #[tokio::test]
@@ -1313,8 +1310,10 @@ async fn task6_aggregate_base_and_output_budgets_accept_exact_and_reject_plus_on
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(exact.code, ErrorCode::InvalidArgument);
+        .unwrap();
+    assert_eq!(exact.changed_paths, ["a".to_owned(), "b".to_owned()]);
+    std::fs::write(remote.path().join("a"), &half).unwrap();
+    std::fs::write(remote.path().join("b"), &half).unwrap();
 
     let output_plus_one = bridge
         .apply_patch(
@@ -1352,7 +1351,7 @@ async fn task6_aggregate_base_and_output_budgets_accept_exact_and_reject_plus_on
         .unwrap_err();
     assert_eq!(base_plus_one.code, ErrorCode::RequestTooLarge);
     assert_eq!(base_plus_one.details.failed_path.as_deref(), Some("b"));
-    assert_eq!(phase_log(&phases), ["S", "S", "S", "S", "S", "S"]);
+    assert_eq!(phase_log(&phases), ["S", "S", "M", "M", "S", "S", "S", "S"]);
 }
 
 #[tokio::test]
@@ -1384,6 +1383,7 @@ async fn task6_pre_cancel_is_zero_phase_with_every_path_known_not_changed() {
     assert_eq!(error.details.changed_paths, Some(Vec::new()));
     assert_eq!(error.details.not_changed_paths, Some(vec!["a".to_owned()]));
     assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+    assert_eq!(error.details.mutation_may_have_applied, None);
     assert_eq!(phase_log(&phases), Vec::<String>::new());
 }
 
@@ -1568,6 +1568,473 @@ async fn task6_second_snapshot_reprobe_physical_root_drift_is_zero_mutation_conf
     assert_eq!(phase_log(&phases), ["S", "S", "S"]);
     assert_eq!(std::fs::read(first_root.join("a")).unwrap(), b"old\n");
     assert_eq!(std::fs::read(second_root.join("b")).unwrap(), b"old\n");
+}
+
+#[tokio::test]
+async fn task6_prepared_create_update_delete_execute_in_patch_order() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("update"), b"old\n").unwrap();
+    std::fs::write(remote.path().join("delete"), b"gone\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned())],
+    );
+
+    let result = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: concat!(
+                    "--- /dev/null\n+++ b/create\n@@ -0,0 +1 @@\n+created\n",
+                    "--- a/update\n+++ b/update\n@@ -1 +1 @@\n-old\n+updated\n",
+                    "--- a/delete\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n",
+                )
+                .to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.changed_paths,
+        ["create", "update", "delete"].map(str::to_owned)
+    );
+    assert_eq!(result.context.host, "dev");
+    assert_eq!(phase_log(&phases), ["S", "S", "S", "M", "M", "M"]);
+    assert_eq!(
+        std::fs::read(remote.path().join("create")).unwrap(),
+        b"created\n"
+    );
+    assert_eq!(
+        std::fs::read(remote.path().join("update")).unwrap(),
+        b"updated\n"
+    );
+    assert!(!remote.path().join("delete").exists());
+}
+
+#[tokio::test]
+async fn task6_prepared_update_uses_the_complete_base_above_public_read_limit() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let base = b"x\n".repeat(600_000);
+    assert!(base.len() > 1024 * 1024);
+    std::fs::write(remote.path().join("large"), &base).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned())],
+    );
+
+    let result = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: "--- a/large\n+++ b/large\n@@ -1 +1 @@\n-x\n+y\n".to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let output = std::fs::read(remote.path().join("large")).unwrap();
+    assert_eq!(result.changed_paths, ["large".to_owned()]);
+    assert_eq!(output.len(), base.len());
+    assert_eq!(&output[..4], b"y\nx\n");
+    assert_eq!(phase_log(&phases), ["S", "M"]);
+}
+
+#[tokio::test]
+async fn task6_update_to_empty_is_a_guarded_replace_not_a_delete() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("empty"), b"old\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned())],
+    );
+
+    let result = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: "--- a/empty\n+++ b/empty\n@@ -1 +0,0 @@\n-old\n".to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.changed_paths, ["empty".to_owned()]);
+    assert!(remote.path().join("empty").is_file());
+    assert_eq!(std::fs::read(remote.path().join("empty")).unwrap(), b"");
+    assert_eq!(phase_log(&phases), ["S", "M"]);
+}
+
+#[tokio::test]
+async fn task6_second_definite_failure_reports_confirmed_prefix_and_stops_suffix() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("a"), b"old\n").unwrap();
+    std::fs::write(remote.path().join("b"), b"gone\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("mv"),
+        "#!/bin/sh\ntarget=\nfor argument do target=$argument; done\n/usr/bin/mv \"$@\"\nstatus=$?\nif [ \"$status\" -eq 0 ] && [ \"$target\" = ./a ]; then printf raced >./b; fi\nexit \"$status\"\n",
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("PATH", path),
+            ("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned()),
+        ],
+    );
+
+    let error = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: concat!(
+                    "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+                    "--- a/b\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n",
+                    "--- /dev/null\n+++ b/c\n@@ -0,0 +1 @@\n+later\n",
+                )
+                .to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert_eq!(error.details.failed_path.as_deref(), Some("b"));
+    assert_eq!(error.details.changed_paths, Some(vec!["a".to_owned()]));
+    assert_eq!(
+        error.details.not_changed_paths,
+        Some(vec!["b".to_owned(), "c".to_owned()])
+    );
+    assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+    assert_eq!(error.details.mutation_may_have_applied, None);
+    assert_eq!(phase_log(&phases), ["S", "S", "S", "M", "M"]);
+    assert_eq!(std::fs::read(remote.path().join("a")).unwrap(), b"new\n");
+    assert_eq!(std::fs::read(remote.path().join("b")).unwrap(), b"raced");
+    assert!(!remote.path().join("c").exists());
+}
+
+#[tokio::test]
+async fn task6_second_malformed_postcommit_is_only_current_unknown_and_stops_suffix() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("a"), b"old\n").unwrap();
+    std::fs::write(remote.path().join("b"), b"gone\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("rm"),
+        "#!/bin/sh\ntarget=\nfor argument do target=$argument; done\n/usr/bin/rm \"$@\"\nstatus=$?\nif [ \"$status\" -eq 0 ] && [ \"$target\" = ./b ]; then printf GARBAGE; fi\nexit \"$status\"\n",
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("PATH", path),
+            ("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned()),
+        ],
+    );
+
+    let error = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: concat!(
+                    "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+                    "--- a/b\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n",
+                    "--- /dev/null\n+++ b/c\n@@ -0,0 +1 @@\n+later\n",
+                )
+                .to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown, "{error:?}");
+    assert!(!error.retryable);
+    assert_eq!(error.details.mutation_may_have_applied, Some(true));
+    assert_eq!(error.details.failed_path.as_deref(), Some("b"));
+    assert_eq!(error.details.changed_paths, Some(vec!["a".to_owned()]));
+    assert_eq!(error.details.not_changed_paths, Some(vec!["c".to_owned()]));
+    assert_eq!(
+        error.details.outcome_unknown_paths,
+        Some(vec!["b".to_owned()])
+    );
+    assert_eq!(phase_log(&phases), ["S", "S", "S", "M", "M"]);
+    assert_eq!(std::fs::read(remote.path().join("a")).unwrap(), b"new\n");
+    assert!(!remote.path().join("b").exists());
+    assert!(!remote.path().join("c").exists());
+}
+
+async fn task6_assert_post_snapshot_context_drift_is_unknown(delete: bool) {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first_root = container.path().join("root-one");
+    let second_root = container.path().join("root-two");
+    let active_root = container.path().join("active");
+    std::fs::create_dir(&first_root).unwrap();
+    std::fs::create_dir(&second_root).unwrap();
+    for root in [&first_root, &second_root] {
+        std::fs::write(root.join("target"), b"old\n").unwrap();
+    }
+    symlink(&first_root, &active_root).unwrap();
+
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let ssh_log = controls.path().join("ssh.log");
+    let hash_count = controls.path().join("target-hash-count");
+    let snapshot_ready = controls.path().join("snapshot-ready");
+    let expected = controls.path().join("expected");
+    let gate = controls.path().join("snapshot-gate");
+    let stale_stat = controls.path().join("stale-stat");
+    std::fs::write(&expected, b"old\n").unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("sha256sum"),
+        format!(
+            "#!/bin/sh\ndata=$(/usr/bin/mktemp) || exit 9\ntrap '/usr/bin/rm -f -- \"$data\"' 0 HUP INT TERM\n/usr/bin/cat >\"$data\" || exit 9\nif /usr/bin/cmp -s -- \"$data\" {}; then marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); printf %s \"$count\" >\"$marker\"; if [ \"$count\" -eq 2 ]; then : >{}; /usr/bin/cat {} >/dev/null; fi; fi\n/usr/bin/sha256sum <\"$data\"\n",
+            codex_ssh_bridge::quote::shell_word(expected.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(hash_count.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(snapshot_ready.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(gate.to_str().unwrap()).unwrap(),
+        ),
+    );
+    write_executable(
+        &shim.path().join("stat"),
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --printf=%f -- \"*codex-sentinel-stat.*) marker={}; if [ ! -e \"$marker\" ]; then : >\"$marker\"; printf bad; exit 0; fi;; esac\nexec /usr/bin/stat \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(stale_stat.to_str().unwrap()).unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        &active_root,
+        false,
+        None,
+        &[
+            ("PATH", path),
+            ("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned()),
+            ("FAKE_SSH_LOG", ssh_log.as_os_str().to_owned()),
+        ],
+    );
+    let bridge = Arc::new(bridge);
+    let patch_bridge = Arc::clone(&bridge);
+    let patch = if delete {
+        "--- a/target\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+    } else {
+        "--- a/target\n+++ b/target\n@@ -1 +1 @@\n-old\n+new\n"
+    };
+    let task = tokio::spawn(async move {
+        patch_bridge
+            .apply_patch(
+                ApplyPatchRequest {
+                    host: "dev".to_owned(),
+                    patch: patch.to_owned(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !snapshot_ready.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("snapshot did not reach the post-read barrier");
+
+    std::fs::remove_file(&active_root).unwrap();
+    symlink(&second_root, &active_root).unwrap();
+    let reprobe = bridge
+        .stat(
+            StatRequest {
+                host: "dev".to_owned(),
+                paths: vec!["target".to_owned()],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reprobe.context.physical_root, second_root.to_str().unwrap());
+    std::fs::write(&gate, b"release").unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("patch did not finish after releasing the snapshot")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown, "{error:?}");
+    assert!(!error.retryable);
+    assert_eq!(error.details.mutation_may_have_applied, Some(true));
+    assert_eq!(error.details.failed_path.as_deref(), Some("target"));
+    assert_eq!(error.details.changed_paths, Some(Vec::new()));
+    assert_eq!(error.details.not_changed_paths, Some(Vec::new()));
+    assert_eq!(
+        error.details.outcome_unknown_paths,
+        Some(vec!["target".to_owned()])
+    );
+    assert_eq!(phase_log(&phases), ["S", "M"]);
+    assert_eq!(ssh_call_count(&ssh_log, "P"), 2);
+    assert_eq!(std::fs::read(first_root.join("target")).unwrap(), b"old\n");
+    if delete {
+        assert!(!second_root.join("target").exists());
+    } else {
+        assert_eq!(std::fs::read(second_root.join("target")).unwrap(), b"new\n");
+    }
+}
+
+#[tokio::test]
+async fn task6_successful_write_on_reprobed_root_is_current_unknown_not_changed() {
+    task6_assert_post_snapshot_context_drift_is_unknown(false).await;
+}
+
+#[tokio::test]
+async fn task6_successful_delete_on_reprobed_root_is_current_unknown_not_changed() {
+    task6_assert_post_snapshot_context_drift_is_unknown(true).await;
+}
+
+#[tokio::test]
+async fn task6_postspawn_cancel_on_second_mutation_marks_only_current_unknown_and_cleans_up() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let phases = controls.path().join("phases");
+    let ready = controls.path().join("second-ready");
+    let count = controls.path().join("dd-count");
+    let gate = controls.path().join("gate");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&gate)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("dd"),
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" of=./.codex-ssh-bridge.\"*\" bs=262144 \"*\" oflag=nofollow \"*) marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); printf %s \"$count\" >\"$marker\"; if [ \"$count\" -eq 2 ]; then : >{}; exec /usr/bin/cat {}; fi;; esac\nexec /usr/bin/dd \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(count.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(ready.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(gate.to_str().unwrap()).unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("PATH", path),
+            ("FAKE_SSH_PHASE_LOG", phases.as_os_str().to_owned()),
+        ],
+    );
+    let runtime_directory = runtime.path().join("codex-ssh-bridge");
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        bridge
+            .apply_patch(
+                ApplyPatchRequest {
+                    host: "dev".to_owned(),
+                    patch: concat!(
+                        "--- /dev/null\n+++ b/a\n@@ -0,0 +1 @@\n+first\n",
+                        "--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+second\n",
+                        "--- /dev/null\n+++ b/c\n@@ -0,0 +1 @@\n+third\n",
+                    )
+                    .to_owned(),
+                },
+                task_cancel,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !ready.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second mutation did not reach caller staging");
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancelled patch mutation did not terminate")
+        .unwrap()
+        .unwrap_err();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let has_remote_stage = std::fs::read_dir(remote.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".codex-ssh-bridge.")
+            });
+            if !has_remote_stage && spool_file_count(&runtime_directory) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled patch left mutation staging behind");
+
+    assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown, "{error:?}");
+    assert_eq!(error.details.mutation_may_have_applied, Some(true));
+    assert_eq!(error.details.failed_path.as_deref(), Some("b"));
+    assert_eq!(error.details.changed_paths, Some(vec!["a".to_owned()]));
+    assert_eq!(error.details.not_changed_paths, Some(vec!["c".to_owned()]));
+    assert_eq!(
+        error.details.outcome_unknown_paths,
+        Some(vec!["b".to_owned()])
+    );
+    assert_eq!(phase_log(&phases), ["S", "S", "S", "M", "M"]);
+    assert_eq!(std::fs::read(remote.path().join("a")).unwrap(), b"first\n");
+    assert!(!remote.path().join("c").exists());
 }
 
 #[tokio::test]
