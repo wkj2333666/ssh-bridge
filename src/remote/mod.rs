@@ -92,6 +92,16 @@ fn attach_remote_context(mut error: BridgeError, context: &RemoteContext) -> Bri
     error
 }
 
+fn attach_optional_remote_context(
+    error: BridgeError,
+    context: Option<&RemoteContext>,
+) -> BridgeError {
+    match context {
+        Some(context) => attach_remote_context(error, context),
+        None => error,
+    }
+}
+
 impl RemoteBridge {
     pub fn new(runner: Arc<SshRunner>) -> Self {
         Self { runner }
@@ -225,7 +235,8 @@ impl RemoteBridge {
                 let second = self
                     .runner
                     .execute_fixed_once(request.clone(), cancel)
-                    .await?;
+                    .await
+                    .map_err(|error| attach_fixed_result_context(error, &request.host, &first))?;
                 let second_mismatch =
                     protocol::capability_mismatch(&second, request.required_capabilities)
                         .await

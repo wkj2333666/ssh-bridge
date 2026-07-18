@@ -13,7 +13,7 @@ use super::protocol::{
 };
 use super::{
     EntryError, EntryErrorCode, ReadEntry, ReadResult, RemoteBridge, ResolvedRead,
-    attach_fixed_result_context, attach_remote_context,
+    attach_fixed_result_context, attach_optional_remote_context,
 };
 
 const READ_SCRIPT: &str = r#"
@@ -97,6 +97,10 @@ pub(super) async fn read(
             return Err(read_cancelled_error(operation_context.as_ref()));
         }
         let owner = InternalSpoolOwner::new();
+        let stdout_limit = (remaining as u64)
+            .checked_add(1)
+            .ok_or_else(|| protocol_error("read byte limit overflowed"))
+            .map_err(|error| attach_optional_remote_context(error, operation_context.as_ref()))?;
         let result = bridge
             .execute_readonly_fixed(
                 FixedRunRequest {
@@ -111,16 +115,15 @@ pub(super) async fn read(
                     ],
                     stdin: None,
                     required_capabilities: &["read_slice", "stat_printf", "sha256sum"],
-                    stdout_limit: (remaining as u64)
-                        .checked_add(1)
-                        .ok_or_else(|| protocol_error("read byte limit overflowed"))?,
+                    stdout_limit,
                     stderr_limit: 1024,
                     timeout: Duration::from_millis(limits.command_timeout_ms),
                     cleanup: owner.registration(),
                 },
                 cancel.clone(),
             )
-            .await?;
+            .await
+            .map_err(|error| attach_optional_remote_context(error, operation_context.as_ref()))?;
         if operation_context.is_none() {
             operation_context = Some(context(
                 request.host.clone(),
@@ -229,10 +232,7 @@ fn read_cancelled_error(operation_context: Option<&super::RemoteContext>) -> cra
         "remote read was cancelled",
         false,
     );
-    match operation_context {
-        Some(context) => attach_remote_context(error, context),
-        None => error,
-    }
+    attach_optional_remote_context(error, operation_context)
 }
 
 fn valid_hash(value: &str) -> bool {
@@ -264,5 +264,27 @@ mod tests {
         assert_eq!(error.details.host.as_deref(), Some("dev"));
         assert_eq!(error.details.physical_root.as_deref(), Some("/srv/app"));
         assert_eq!(error.details.shell.unwrap().kind, "sh");
+    }
+
+    #[test]
+    fn task78_read_next_step_error_uses_known_context_without_changing_code() {
+        let context = RemoteContext {
+            remote: true,
+            host: "dev".to_owned(),
+            physical_root: "/srv/app".to_owned(),
+            shell: ShellMetadata {
+                kind: ShellName::Sh,
+                version: None,
+                fallback: false,
+            },
+        };
+        let error = super::super::attach_optional_remote_context(
+            crate::BridgeError::new(ErrorCode::CommandTimeout, "timeout", false),
+            Some(&context),
+        );
+        assert_eq!(error.code, ErrorCode::CommandTimeout);
+        assert_eq!(error.message, "timeout");
+        assert_eq!(error.details.host.as_deref(), Some("dev"));
+        assert_eq!(error.details.physical_root.as_deref(), Some("/srv/app"));
     }
 }

@@ -292,12 +292,17 @@ pub(super) async fn search(
     .map_err(&attach_candidates)?;
     let mut builder = GlobSetBuilder::new();
     for glob in &request.globs {
-        builder.add(compile_glob(glob)?);
+        builder.add(compile_glob(glob).map_err(&attach_candidates)?);
     }
     let globs = builder
         .build()
-        .map_err(|_| BridgeError::invalid_argument("search glob is invalid"))?;
-    let configured_root = runner.config().host(&request.host)?.profile.root.as_bytes();
+        .map_err(|_| BridgeError::invalid_argument("search glob is invalid"))
+        .map_err(&attach_candidates)?;
+    let configured = runner
+        .config()
+        .host(&request.host)
+        .map_err(&attach_candidates)?;
+    let configured_root = configured.profile.root.as_bytes();
     let mut candidates = Vec::with_capacity(10_001);
     let mut candidate_count = 0usize;
     loop {
@@ -375,13 +380,15 @@ pub(super) async fn search(
             &["grep_nul", "xargs_nul", "search_bound"],
         )
     };
-    let command_reserve = render_fixed_command(script, &args)?.len();
+    let command_reserve = render_fixed_command(script, &args)
+        .map_err(&attach_candidates)?
+        .len();
     if command_reserve >= limits.max_frame_bytes {
-        return Err(BridgeError::new(
+        return Err(attach_candidates(BridgeError::new(
             ErrorCode::RequestTooLarge,
             "fixed request exceeds the configured frame limit",
             false,
-        ));
+        )));
     }
     let mut stdin = Vec::new();
     for candidate in &candidates {
@@ -426,7 +433,8 @@ pub(super) async fn search(
             },
             cancel,
         )
-        .await?;
+        .await
+        .map_err(&attach_candidates)?;
     let attach_engine = |error| attach_fixed_result_context(error, &request.host, &result);
     let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024)
         .await

@@ -11,7 +11,7 @@ use crate::ssh::{FixedOperationKind, FixedRunRequest};
 use super::protocol::{context, nul_fields, parse_u64, read_small_stream, utf8};
 use super::{
     ApplyPatchRequest, ApplyPatchResult, RemoteBridge, RemoteContext, WriteEncoding, WriteMode,
-    attach_fixed_result_context, attach_remote_context,
+    attach_fixed_result_context, attach_optional_remote_context, attach_remote_context,
 };
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -1322,23 +1322,23 @@ pub(super) async fn apply_patch(
             snapshot_file(bridge, &host, file, remaining_base_bytes, cancel.clone())
                 .await
                 .map_err(|error| {
-                    attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
+                    attach_optional_remote_context(
+                        attach_preparation_progress(error, Some(&file.patch.path), &all_paths),
+                        operation_context.as_ref(),
+                    )
                 })?;
-        if let Some(context) = &operation_context {
-            if context.host != snapshot_context.host
-                || context.physical_root != snapshot_context.physical_root
-            {
-                return Err(attach_remote_context(
-                    attach_preparation_progress(
-                        BridgeError::read_conflict(),
-                        Some(&file.patch.path),
-                        &all_paths,
-                    ),
-                    &snapshot_context,
-                ));
-            }
-        } else {
-            operation_context = Some(snapshot_context.clone());
+        if let Some(context) = &operation_context
+            && (context.host != snapshot_context.host
+                || context.physical_root != snapshot_context.physical_root)
+        {
+            return Err(attach_remote_context(
+                attach_preparation_progress(
+                    BridgeError::read_conflict(),
+                    Some(&file.patch.path),
+                    &all_paths,
+                ),
+                &snapshot_context,
+            ));
         }
         if let FileSnapshot::Regular { bytes, .. } = &snapshot {
             remaining_base_bytes =
@@ -1354,6 +1354,9 @@ pub(super) async fn apply_patch(
                             &snapshot_context,
                         )
                     })?;
+        }
+        if operation_context.is_none() {
+            operation_context = Some(snapshot_context);
         }
         snapshots.push(snapshot);
     }
