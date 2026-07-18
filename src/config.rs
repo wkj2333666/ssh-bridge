@@ -367,7 +367,7 @@ fn open_config(path: &Path) -> BridgeResult<fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
 
     options.open(path).map_err(|error| {
