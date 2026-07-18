@@ -1,7 +1,3 @@
-// The wire-facing error schema intentionally stores six optional strings inline,
-// and BridgeResult's exact public shape is Result<T, BridgeError>.
-#![allow(clippy::result_large_err)]
-
 pub mod config;
 pub mod error;
 pub mod path;

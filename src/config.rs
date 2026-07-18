@@ -1,7 +1,12 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "Task 1 requires BridgeResult<T> = Result<T, BridgeError> with inline ErrorDetails"
+)]
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -128,8 +133,11 @@ pub struct ResolvedHost<'a> {
 
 impl Config {
     pub fn load(path: &Path) -> BridgeResult<Self> {
-        validate_file_security(path)?;
-        let contents = fs::read_to_string(path).map_err(BridgeError::io)?;
+        let mut file = open_config(path)?;
+        validate_file_security(&file)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(BridgeError::io)?;
         let config: Self = toml::from_str(&contents).map_err(|error| {
             BridgeError::invalid_config(format!("invalid configuration: {error}"))
         })?;
@@ -352,11 +360,30 @@ fn nonempty_environment(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
-fn validate_file_security(path: &Path) -> BridgeResult<()> {
-    let metadata = fs::symlink_metadata(path).map_err(BridgeError::io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+fn open_config(path: &Path) -> BridgeResult<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    options.open(path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return BridgeError::invalid_config("configuration must not be a symlink");
+        }
+        BridgeError::io(error)
+    })
+}
+
+fn validate_file_security(file: &fs::File) -> BridgeResult<()> {
+    let metadata = file.metadata().map_err(BridgeError::io)?;
+    if !metadata.is_file() {
         return Err(BridgeError::invalid_config(
-            "configuration must be a regular file, not a symlink",
+            "configuration must be a regular file",
         ));
     }
 

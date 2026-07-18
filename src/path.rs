@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "Task 1 requires RemotePath::resolve to return the exact BridgeResult shape"
+)]
+
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
