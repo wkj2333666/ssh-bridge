@@ -20,6 +20,7 @@ use crate::config::{Config, ResolvedHost};
 use crate::error::{BridgeError, BridgeResult};
 
 pub use argv::build_ssh_argv;
+pub(crate) use process::FixedRunRequest;
 pub use process::{RunRequest, RunResult, SshRunner};
 
 const RUNTIME_DIRECTORY: &str = "codex-ssh-bridge";

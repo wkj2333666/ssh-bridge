@@ -14,6 +14,10 @@ pub enum ErrorCode {
     PathOutsideRoot,
     ReadOnlyHost,
     WriteConflict,
+    ReadConflict,
+    NotFound,
+    PermissionDenied,
+    NotDirectory,
     OutputLimit,
     RequestTooLarge,
     ProtocolError,
@@ -73,6 +77,34 @@ impl BridgeError {
 
     pub fn io(error: impl fmt::Display) -> Self {
         Self::new(ErrorCode::Io, error.to_string(), false)
+    }
+
+    pub(crate) fn read_conflict() -> Self {
+        Self::new(
+            ErrorCode::ReadConflict,
+            "remote file changed while being read",
+            false,
+        )
+    }
+
+    pub(crate) fn not_found() -> Self {
+        Self::new(ErrorCode::NotFound, "remote path was not found", false)
+    }
+
+    pub(crate) fn permission_denied() -> Self {
+        Self::new(
+            ErrorCode::PermissionDenied,
+            "remote path permission was denied",
+            false,
+        )
+    }
+
+    pub(crate) fn not_directory() -> Self {
+        Self::new(
+            ErrorCode::NotDirectory,
+            "remote path is not a directory",
+            false,
+        )
     }
 }
 

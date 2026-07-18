@@ -145,13 +145,36 @@ case "$remote_command" in
         printf 'TOOL_timeout=%s\0' "$fake_timeout"
         printf 'TOOL_ln=1\0'
         printf 'TOOL_mv=1\0'
+        printf 'TOOL_read_slice=%s\0' "${FAKE_SSH_HAS_READ_SLICE:-1}"
+        printf 'TOOL_find_nul=%s\0' "${FAKE_SSH_HAS_FIND_NUL:-1}"
+        printf 'TOOL_stat_printf=%s\0' "${FAKE_SSH_HAS_STAT_PRINTF:-1}"
+        printf 'TOOL_rg_json=%s\0' "${FAKE_SSH_HAS_RG_JSON:-1}"
+        printf 'TOOL_grep_nul=%s\0' "${FAKE_SSH_HAS_GREP_NUL:-1}"
+        printf 'TOOL_xargs_nul=%s\0' "${FAKE_SSH_HAS_XARGS_NUL:-1}"
+        printf 'TOOL_search_bound=%s\0' "${FAKE_SSH_HAS_SEARCH_BOUND:-1}"
         exit 0
         ;;
 esac
 
 log_call C "$@"
 
+if [ -n "${FAKE_SSH_MISMATCH_FILE:-}" ] && [ ! -e "$FAKE_SSH_MISMATCH_FILE" ]; then
+    : >"$FAKE_SSH_MISMATCH_FILE"
+    printf 'CODE=CAPABILITY_MISMATCH\0CAPABILITY=%s\0' "${FAKE_SSH_MISMATCH_KEY:-find_nul}" >&2
+    exit 0
+fi
+
+if [ -n "${FAKE_SSH_FIXED_SLEEP_SECONDS:-}" ]; then
+    if [ -n "${FAKE_SSH_FIXED_STDOUT_BYTES:-}" ]; then
+        emit_bytes "$FAKE_SSH_FIXED_STDOUT_BYTES" stdout
+    fi
+    run_fake_sleep "$FAKE_SSH_FIXED_SLEEP_SECONDS"
+fi
+
 case "${FAKE_SSH_MODE:-echo-argv}" in
+    local-fixed)
+        exec /bin/sh -c "$remote_command"
+        ;;
     echo-argv)
         for argument do
             printf '%s\0' "$argument"

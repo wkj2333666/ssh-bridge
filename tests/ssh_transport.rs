@@ -759,16 +759,38 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
         [
             "dd_nofollow",
             "find",
+            "find_nul",
             "grep",
+            "grep_nul",
             "ln",
             "mktemp",
             "mv",
+            "read_slice",
             "rg",
+            "rg_json",
+            "search_bound",
             "sha256sum",
             "stat",
+            "stat_printf",
             "timeout",
+            "xargs_nul",
         ]
     );
+    for key in [
+        "read_slice",
+        "find_nul",
+        "stat_printf",
+        "rg_json",
+        "grep_nul",
+        "xargs_nul",
+        "search_bound",
+    ] {
+        assert_eq!(
+            capability.tools.get(key),
+            Some(&true),
+            "functional probe {key}"
+        );
+    }
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
