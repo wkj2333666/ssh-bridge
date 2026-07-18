@@ -9,7 +9,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -33,9 +33,10 @@ impl RuntimePaths {
     pub fn discover() -> BridgeResult<Self> {
         match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
             Some(base) => {
-                let candidate = Self::ensure_from_base(Path::new(&base))?;
-                if candidate.has_control_path_budget() {
-                    Ok(candidate)
+                let base = Path::new(&base);
+                let directory = base.join(RUNTIME_DIRECTORY);
+                if control_path_candidate_is_usable(&directory) {
+                    Self::ensure_from_base(base)
                 } else {
                     Self::ensure_tmp_fallback()
                 }
@@ -45,6 +46,7 @@ impl RuntimePaths {
     }
 
     pub fn ensure_from_base(base: &Path) -> BridgeResult<Self> {
+        validate_openssh_config_path(&base.join(RUNTIME_DIRECTORY))?;
         Self::ensure_in_base(base, OsStr::new(RUNTIME_DIRECTORY), true)
     }
 
@@ -57,15 +59,6 @@ impl RuntimePaths {
         let uid = unsafe { libc::geteuid() };
         let leaf = OsString::from(format!("{RUNTIME_DIRECTORY}-{uid}"));
         Self::ensure_in_base(Path::new("/tmp"), &leaf, false)
-    }
-
-    fn has_control_path_budget(&self) -> bool {
-        self.directory
-            .join("x".repeat(CONTROL_FILENAME_BYTES))
-            .as_os_str()
-            .as_bytes()
-            .len()
-            <= UNIX_SOCKET_PATH_MAX_BYTES
     }
 
     fn ensure_in_base(
@@ -263,12 +256,7 @@ impl SshPolicy {
         let control_path = runtime_paths
             .directory
             .join(control_filename(host.alias, resolved_connection_identity));
-        if control_path.as_os_str().as_bytes().len() > UNIX_SOCKET_PATH_MAX_BYTES {
-            return Err(BridgeError::invalid_config(
-                "ControlPath exceeds the Unix socket path limit",
-            ));
-        }
-        let control_option = escaped_control_path_option(&control_path);
+        let control_option = encoded_control_path_option(&control_path)?;
 
         let mut options = Vec::new();
         for option in [
@@ -299,15 +287,43 @@ impl SshPolicy {
     }
 }
 
-fn escaped_control_path_option(control_path: &Path) -> OsString {
-    let mut encoded = b"ControlPath=".to_vec();
-    for byte in control_path.as_os_str().as_bytes() {
-        encoded.push(*byte);
-        if *byte == b'%' {
-            encoded.push(*byte);
+fn control_path_candidate_is_usable(directory: &Path) -> bool {
+    let control_path = directory.join("x".repeat(CONTROL_FILENAME_BYTES));
+    control_path.as_os_str().as_bytes().len() <= UNIX_SOCKET_PATH_MAX_BYTES
+        && validate_openssh_config_path(&control_path).is_ok()
+}
+
+fn validate_openssh_config_path(path: &Path) -> BridgeResult<&str> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| unsafe_runtime_path(path, "ControlPath must be valid UTF-8 for OpenSSH"))?;
+    if value.contains(['\n', '\r']) {
+        return Err(unsafe_runtime_path(
+            path,
+            "ControlPath cannot contain carriage returns or newlines",
+        ));
+    }
+    Ok(value)
+}
+
+fn encoded_control_path_option(control_path: &Path) -> BridgeResult<OsString> {
+    if control_path.as_os_str().as_bytes().len() > UNIX_SOCKET_PATH_MAX_BYTES {
+        return Err(BridgeError::invalid_config(
+            "ControlPath exceeds the Unix socket path limit",
+        ));
+    }
+    let value = validate_openssh_config_path(control_path)?;
+    let mut encoded = String::from("ControlPath=\"");
+    for character in value.chars() {
+        match character {
+            '"' => encoded.push_str("\\\""),
+            '\\' => encoded.push_str("\\\\"),
+            '%' => encoded.push_str("%%"),
+            _ => encoded.push(character),
         }
     }
-    OsString::from_vec(encoded)
+    encoded.push('"');
+    Ok(OsString::from(encoded))
 }
 
 fn control_filename(alias: &str, resolved_connection_identity: &str) -> String {

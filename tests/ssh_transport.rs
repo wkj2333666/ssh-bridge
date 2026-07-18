@@ -5,7 +5,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::Arc;
@@ -111,7 +111,7 @@ fn argv_uses_hardened_distinct_options_and_a_private_hashed_control_path() {
             "missing distinct option {expected:?} in {argv:?}"
         );
     }
-    let control_path = argv
+    let control_option = argv
         .iter()
         .find_map(|argument| {
             argument
@@ -119,9 +119,11 @@ fn argv_uses_hardened_distinct_options_and_a_private_hashed_control_path() {
                 .and_then(|value| value.strip_prefix("ControlPath="))
         })
         .expect("ControlPath option");
-    assert!(std::path::Path::new(control_path).starts_with(paths.directory()));
-    assert!(!control_path.contains("dev-box"));
-    assert!(!control_path.contains(identity));
+    assert!(ssh_policy.control_path().starts_with(paths.directory()));
+    assert!(control_option.starts_with('"'));
+    assert!(control_option.ends_with('"'));
+    assert!(!control_option.contains("dev-box"));
+    assert!(!control_option.contains(identity));
 
     let same = build_ssh_argv(&policy(&config, &paths, identity), "dev-box", "printf safe");
     assert_eq!(argv, same);
@@ -131,7 +133,7 @@ fn argv_uses_hardened_distinct_options_and_a_private_hashed_control_path() {
         "printf safe",
     );
     assert_ne!(
-        control_path,
+        control_option,
         changed
             .iter()
             .find_map(|argument| argument
@@ -172,26 +174,23 @@ fn hostile_host_text_is_only_an_operand_after_the_option_separator() {
 }
 
 #[test]
-fn openssh_receives_a_literal_control_path_when_runtime_components_contain_percent_tokens() {
+fn openssh_config_encoder_round_trips_every_control_path_metacharacter() {
     let container = TempDir::new().unwrap();
-    let base = container.path().join("literal-%h-%r-%p");
+    let base = container.path().join("s \t%h%r%p\"\\");
     fs::create_dir(&base).unwrap();
     let paths = RuntimePaths::ensure_from_base(&base).unwrap();
     let config = config_with_host("dev-box", "/srv/project");
     let policy = policy(&config, &paths, "stable identity");
     let literal = policy.control_path().to_str().unwrap().to_owned();
     let argv = build_ssh_argv(&policy, "example.invalid", "");
-    let encoded = argv
+    let control_argument = argv
         .iter()
         .find_map(|argument| {
             argument
                 .to_str()
-                .and_then(|value| value.strip_prefix("ControlPath="))
+                .filter(|value| value.starts_with("ControlPath="))
         })
         .unwrap();
-    assert!(encoded.contains("%%h"));
-    assert!(encoded.contains("%%r"));
-    assert!(encoded.contains("%%p"));
 
     let output = Command::new("/usr/bin/ssh")
         .args(["-F", "/dev/null", "-G"])
@@ -200,7 +199,8 @@ fn openssh_receives_a_literal_control_path_when_runtime_components_contain_perce
         .unwrap();
     assert!(
         output.status.success(),
-        "ssh -G failed: {}",
+        "ssh -G failed\nargv: {argv:?}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let rendered = String::from_utf8(output.stdout).unwrap();
@@ -208,8 +208,14 @@ fn openssh_receives_a_literal_control_path_when_runtime_components_contain_perce
         .lines()
         .find_map(|line| line.strip_prefix("controlpath "))
         .expect("ssh -G controlpath");
-    assert_eq!(encoded.replace("%%", "%"), literal);
-    assert_eq!(actual, literal);
+    assert!(control_argument.starts_with("ControlPath=\""));
+    assert!(control_argument.ends_with('"'));
+    assert!(control_argument.contains("%%h"));
+    assert!(control_argument.contains("%%r"));
+    assert!(control_argument.contains("%%p"));
+    assert!(control_argument.contains("\\\""));
+    assert!(control_argument.contains("\\\\"));
+    assert_eq!(actual, literal, "argv: {argv:?}");
 }
 
 #[test]
@@ -262,6 +268,65 @@ fn discover_falls_back_to_short_tmp_runtime_when_xdg_exceeds_control_path_budget
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        !long_base.join("codex-ssh-bridge").exists(),
+        "discover must preflight before creating an unusable XDG leaf"
+    );
+}
+
+#[test]
+fn explicit_runtime_base_rejects_unrepresentable_control_paths_before_creating_a_leaf() {
+    let container = TempDir::new().unwrap();
+    let names = [
+        OsString::from("line\nbreak"),
+        OsString::from("carriage\rreturn"),
+        OsString::from_vec(b"non-utf8-\xff".to_vec()),
+    ];
+
+    for name in names {
+        let base = container.path().join(name);
+        fs::create_dir(&base).unwrap();
+        let error = RuntimePaths::ensure_from_base(&base).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidConfig, "base: {base:?}");
+        assert!(
+            !base.join("codex-ssh-bridge").exists(),
+            "invalid base created a runtime leaf: {base:?}"
+        );
+    }
+}
+
+#[test]
+fn discover_falls_back_before_creating_an_unrepresentable_xdg_leaf() {
+    let container = TempDir::new().unwrap();
+    let bases = [
+        container.path().join("line\nbreak"),
+        container.path().join("carriage\rreturn"),
+        container
+            .path()
+            .join(OsString::from_vec(b"non-utf8-\xff".to_vec())),
+    ];
+
+    for base in bases {
+        fs::create_dir(&base).unwrap();
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        let expected = format!("/tmp/codex-ssh-bridge-{uid}");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "discover_long_xdg_fallback_child", "--nocapture"])
+            .env(LONG_XDG_CHILD_SENTINEL, &expected)
+            .env("XDG_RUNTIME_DIR", &base)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed for {base:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !base.join("codex-ssh-bridge").exists(),
+            "discover created an unusable XDG leaf: {base:?}"
+        );
+    }
 }
 
 #[test]
