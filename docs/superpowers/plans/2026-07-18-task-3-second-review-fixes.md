@@ -14,7 +14,8 @@
 - Use integer-only `secs.{millis:03}s` duration rendering and typed rejection of zero.
 - Keep TERM 50 ms plus bounded drain/join within the existing 250 ms forced-return budget.
 - Never mutate process-global umask in the test runner; set it only in an exec-isolated child.
-- Make one final review-fix commit containing code, tests, design, plan, and report updates.
+- Make one focused commit per completed review round containing its code, tests,
+  design, and plan updates; keep ignored workspace records synchronized.
 
 ---
 
@@ -213,3 +214,88 @@ git commit -m "fix: complete SSH runner lifecycle hardening"
 ```
 
 Leave the unrelated `ssh_bridge/__pycache__/` and `tests/__pycache__/` untracked and untouched.
+
+### Task 6: Gate status-255 classification by bootstrap phase
+
+**Files:**
+- Modify: `tests/fixtures/fake-ssh.sh`
+- Modify: `tests/ssh_transport.rs`
+- Modify: `src/ssh/process.rs`
+- Modify: `.superpowers/sdd/task-3-clarifications.md` (workspace binding record, intentionally ignored)
+- Modify: `.superpowers/sdd/task-3-report.md` (workspace report, intentionally ignored)
+
+**Interfaces:**
+- Produces: `Phase::allows_transport_classification(self) -> bool`.
+- Preserves: exact `LC_ALL=C` line scanning and bootstrap transport error codes.
+
+- [ ] **Step 1: Separate bootstrap and command-phase fixtures**
+
+Add `FAKE_SSH_PROBE_ERROR` handling before the fake probe emits NUL records.
+Reuse the same canonical host-key, authentication, and connect-timeout output
+templates for probe failures and command failures.
+
+- [ ] **Step 2: Write the failing command-spoof matrix**
+
+After a successful probe, execute sh, Bash, and Login requests whose command
+fixture emits each exact canonical transport line and exits 255. Assert:
+
+```rust
+assert_eq!(error.code, ErrorCode::RemoteExit);
+assert!(!error.retryable);
+assert_eq!(error.details.exit_status, Some(255));
+assert_eq!(error.details.remote_process_may_continue, Some(true));
+assert_eq!(error.message, "remote command exited unsuccessfully");
+```
+
+Move the existing typed host/auth/connect cases to `FAKE_SSH_PROBE_ERROR` and
+keep their current codes/retryability. Continue testing ordinary command exit 7
+as `RemoteExit`.
+
+- [ ] **Step 3: Verify RED**
+
+Run:
+
+```bash
+cargo test --test ssh_transport command_phase_exit_255 -- --nocapture
+```
+
+Expected: canonical command lines are still classified as host/auth/connect and
+do not set `remote_process_may_continue`.
+
+- [ ] **Step 4: Implement the minimal phase gate**
+
+In `classify_exit`, call `classify_ssh_255` only when `code == 255` and
+`phase.allows_transport_classification()`. Return `RemoteExit` for command-phase
+255 and set the conservative flag only for that case. Define:
+
+```rust
+fn allows_transport_classification(self) -> bool {
+    matches!(self, Self::Resolve | Self::Probe)
+}
+```
+
+- [ ] **Step 5: Verify GREEN and full gates**
+
+```bash
+cargo test --test ssh_transport command_phase_exit_255 -- --nocapture
+cargo test --test ssh_transport transport_and_remote_failures_have_stable_codes_without_diagnostics -- --exact --nocapture
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --test ssh_transport -- --nocapture
+cargo test --all-targets --all-features
+git diff --check
+```
+
+Expected: all commands exit zero; command spoofs are nonretryable `RemoteExit`
+with the conservative flag, while bootstrap typed classifications remain stable.
+
+- [ ] **Step 6: Commit the third-review fix**
+
+```bash
+git add src/ssh/process.rs tests/fixtures/fake-ssh.sh tests/ssh_transport.rs docs/superpowers/specs/2026-07-18-task-3-second-review-fixes-design.md docs/superpowers/plans/2026-07-18-task-3-second-review-fixes.md
+git diff --cached --check
+git commit -m "fix: gate SSH transport errors by phase"
+```
+
+Preserve the feature branch/worktree and leave both unrelated `__pycache__/`
+directories untouched.

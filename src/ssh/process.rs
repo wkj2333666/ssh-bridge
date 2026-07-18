@@ -577,7 +577,7 @@ impl SshRunner {
         }
         let error_code = if phase.remote_timeout_wrapped() && code == 124 {
             ErrorCode::CommandTimeout
-        } else if code == 255 {
+        } else if code == 255 && phase.allows_transport_classification() {
             classify_ssh_255(output.stderr_signals)
         } else {
             ErrorCode::RemoteExit
@@ -596,7 +596,9 @@ impl SshRunner {
         error.details.elapsed_ms = Some(elapsed_ms(elapsed));
         error.details.exit_status = Some(code);
         error.details.bytes_seen = Some(output.aggregate_bytes);
-        if error_code == ErrorCode::CommandTimeout {
+        if error_code == ErrorCode::CommandTimeout
+            || (code == 255 && matches!(phase, Phase::Command { .. }))
+        {
             error.details.remote_process_may_continue = Some(true);
         }
         self.output_store.discard(&output).await;
@@ -640,6 +642,10 @@ impl Phase {
                 remote_timeout_wrapped: true
             }
         )
+    }
+
+    fn allows_transport_classification(self) -> bool {
+        matches!(self, Self::Resolve | Self::Probe)
     }
 
     fn timeout_error(self, bytes_seen: u64) -> BridgeError {

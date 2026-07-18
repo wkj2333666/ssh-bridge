@@ -55,8 +55,42 @@ emit_bytes() {
     fi
 }
 
+emit_fake_error() {
+    case "$1" in
+        host-key)
+            printf '%s\n' 'Host key verification failed.' 'VERY_SECRET_HOST_DIAGNOSTIC' >&2
+            ;;
+        host-key-ed25519)
+            printf '%s\n' 'No ED25519 host key is known for fake.internal and you have requested strict checking.' >&2
+            ;;
+        host-key-rsa)
+            printf '%s\n' 'No RSA host key is known for fake.internal and you have requested strict checking.' >&2
+            ;;
+        host-key-ecdsa)
+            printf '%s\n' 'No ECDSA host key is known for fake.internal and you have requested strict checking.' >&2
+            ;;
+        auth)
+            printf '%s\n' 'fixture@fake.internal: Permission denied (publickey).' 'VERY_SECRET_AUTH_DIAGNOSTIC' >&2
+            ;;
+        connect-timeout)
+            printf '%s\n' 'ssh: connect to host fake.internal port 22: Connection timed out' 'VERY_SECRET_CONNECT_DIAGNOSTIC' >&2
+            ;;
+        diagnostic)
+            printf '%s\n' "${FAKE_SSH_DIAGNOSTIC:-}" >&2
+            ;;
+        remote)
+            printf '%s\n' 'VERY_SECRET_REMOTE_DIAGNOSTIC' >&2
+            exit "${FAKE_SSH_EXIT_STATUS:-7}"
+            ;;
+    esac
+    exit "${FAKE_SSH_ERROR_STATUS:-255}"
+}
+
 if [ "$is_config" = 1 ]; then
     log_call G "$@"
+    if [ -n "${FAKE_SSH_G_ERROR:-}" ]; then
+        emit_fake_error "$FAKE_SSH_G_ERROR"
+    fi
     if [ -n "${FAKE_SSH_G_SLEEP_SECONDS:-}" ]; then
         run_fake_sleep "$FAKE_SSH_G_SLEEP_SECONDS"
     fi
@@ -82,6 +116,9 @@ done
 case "$remote_command" in
     *CODEX_SSH_PROBE*)
         log_call P "$@"
+        if [ -n "${FAKE_SSH_PROBE_ERROR:-}" ]; then
+            emit_fake_error "$FAKE_SSH_PROBE_ERROR"
+        fi
         if [ -n "${FAKE_SSH_PROBE_SLEEP_SECONDS:-}" ]; then
             run_fake_sleep "$FAKE_SSH_PROBE_SLEEP_SECONDS"
         fi
@@ -182,40 +219,7 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
         exit 0
         ;;
     error)
-        case "${FAKE_SSH_ERROR:-remote}" in
-            host-key)
-                printf '%s\n' 'Host key verification failed.' 'VERY_SECRET_HOST_DIAGNOSTIC' >&2
-                exit 255
-                ;;
-            host-key-ed25519)
-                printf '%s\n' 'No ED25519 host key is known for fake.internal and you have requested strict checking.' >&2
-                exit 255
-                ;;
-            host-key-rsa)
-                printf '%s\n' 'No RSA host key is known for fake.internal and you have requested strict checking.' >&2
-                exit 255
-                ;;
-            host-key-ecdsa)
-                printf '%s\n' 'No ECDSA host key is known for fake.internal and you have requested strict checking.' >&2
-                exit 255
-                ;;
-            auth)
-                printf '%s\n' 'fixture@fake.internal: Permission denied (publickey).' 'VERY_SECRET_AUTH_DIAGNOSTIC' >&2
-                exit 255
-                ;;
-            connect-timeout)
-                printf '%s\n' 'ssh: connect to host fake.internal port 22: Connection timed out' 'VERY_SECRET_CONNECT_DIAGNOSTIC' >&2
-                exit 255
-                ;;
-            diagnostic)
-                printf '%s\n' "${FAKE_SSH_DIAGNOSTIC:-}" >&2
-                exit 255
-                ;;
-            remote)
-                printf '%s\n' 'VERY_SECRET_REMOTE_DIAGNOSTIC' >&2
-                exit "${FAKE_SSH_EXIT_STATUS:-7}"
-                ;;
-        esac
+        emit_fake_error "${FAKE_SSH_ERROR:-remote}"
         ;;
     *)
         printf '%s\n' 'unknown fake SSH mode' >&2

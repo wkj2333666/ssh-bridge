@@ -2,8 +2,9 @@
 
 ## Scope
 
-This design addresses only the four binding findings from the second Task 3
-review. Existing runner APIs, output paging, process-group semantics, and limits
+This design records the focused fixes from the second and third Task 3 reviews:
+the four second-review findings plus the command-phase status-255 provenance
+gate. Existing runner APIs, output paging, process-group semantics, and limits
 remain unchanged.
 
 ## Timeout rendering and capability
@@ -39,6 +40,21 @@ confirming the owned stdout file is removed.
 Each `create_new` file is explicitly changed to mode 0600 through its open file
 handle before use. A child test launched through `/bin/sh` under umask 0777
 avoids process-global umask races and proves exact modes plus successful paging.
+
+## Phase-bound status-255 classification
+
+Canonical stderr text is not sufficient to prove a transport failure after a
+user command starts, because that command can emit the same text and explicitly
+exit 255. The bounded scanner remains unchanged, but its signals are consumed
+only for status 255 in bootstrap phases: local `ssh -G` resolution and the fixed
+capability probe. Other statuses are never reclassified from these signals.
+
+Every command-phase status 255 is a fixed-message, nonretryable `RemoteExit`,
+including exact host-key, authentication, and connection-timeout lines. Its
+`remote_process_may_continue` detail is conservatively true because the runner
+cannot distinguish an explicit remote exit from a connection interruption. A
+fixture matrix proves bootstrap typed errors separately from successful-probe
+sh, Bash, and Login command spoof cases. No protocol marker is added.
 
 ## Verification
 
