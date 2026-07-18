@@ -1743,10 +1743,26 @@ struct PendingSpool {
 impl Drop for PendingSpool {
     fn drop(&mut self) {
         if self.armed {
-            let mut paths = vec![self.stdout_path.clone()];
-            if self.stderr.is_some() {
-                paths.push(self.stderr_path.clone());
+            if self.stderr.is_none() {
+                // A partial spool has only created stdout; no retained bytes have
+                // been written yet. Its cleanup lease must keep the shared entry
+                // slot, but must not inherit reservations intended for a later
+                // retry or for the in-memory capture being abandoned.
+                let accounting = Arc::new(FileAccounting::new(
+                    Arc::clone(&self.accounting.stdout.quota),
+                    Arc::clone(&self.accounting.slot),
+                ));
+                cleanup_targets(
+                    vec![CleanupTarget {
+                        path: self.stdout_path.clone(),
+                        _accounting: Some(accounting),
+                    }],
+                    &self.tombstones,
+                );
+                return;
             }
+            let mut paths = vec![self.stdout_path.clone()];
+            paths.push(self.stderr_path.clone());
             cleanup_paths(paths, vec![Arc::clone(&self.accounting)], &self.tombstones);
         }
     }
@@ -2115,6 +2131,58 @@ mod tests {
             std::fs::read(&stderr_path).unwrap(),
             b"pre-existing sentinel"
         );
+    }
+
+    #[test]
+    fn failed_partial_spool_unlink_keeps_only_a_zero_byte_slot_lease() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let stdout_path = directory.path().join("partial-unlink.stdout");
+        let stderr_path = directory.path().join("partial-unlink.stderr");
+        let stdout = create_private_file(&stdout_path).unwrap();
+        let quota = Arc::new(ByteQuota::new(1024));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let accounting = Arc::new(EntryAccounting::new(Arc::clone(&quota)));
+        assert!(accounting.reserve(super::StreamKind::Stdout, 23));
+        accounting
+            .attach_slot(Arc::clone(&slots).try_acquire_owned().unwrap())
+            .unwrap();
+        let tombstones = Arc::new(StdMutex::new(Vec::new()));
+
+        std::fs::remove_file(&stdout_path).unwrap();
+        std::fs::create_dir(&stdout_path).unwrap();
+        let blocker = stdout_path.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let spool = PendingSpool {
+            token: "partial-unlink".to_owned(),
+            stdout_path: stdout_path.clone(),
+            stderr_path,
+            stdout: tokio::fs::File::from_std(stdout),
+            stderr: None,
+            armed: true,
+            accounting: Arc::clone(&accounting),
+            tombstones: Arc::clone(&tombstones),
+        };
+
+        drop(spool);
+        assert_eq!(
+            quota.used(),
+            23,
+            "reservations for a subsequent retry stay with the active accounting"
+        );
+        drop(accounting);
+
+        assert_eq!(quota.used(), 0, "the abandoned stdout file is empty");
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the failed unlink still owns the shared entry slot"
+        );
+        assert_eq!(tombstones.lock().unwrap().len(), 1);
+
+        std::fs::remove_file(blocker).unwrap();
+        std::fs::remove_dir(stdout_path).unwrap();
+        retry_tombstones(&tombstones);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[test]
