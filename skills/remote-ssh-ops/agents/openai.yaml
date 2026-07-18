@@ -1,0 +1,10 @@
+interface:
+  display_name: "Remote SSH Ops"
+  short_description: "Operate allowlisted SSH hosts without remote Codex"
+  default_prompt: "Use $remote-ssh-ops to inspect and work on my configured SSH host."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "ssh-bridge"
+      description: "Local stdio MCP server that invokes the local OpenSSH client"
+      transport: "stdio"
