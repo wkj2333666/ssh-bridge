@@ -21,7 +21,7 @@ use codex_ssh_bridge::error::{BridgeError, ErrorCode};
 use codex_ssh_bridge::output::{CaptureLimits, OutputReference, OutputStore, StreamKind};
 use codex_ssh_bridge::path::RemotePath;
 use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshPolicy, SshRunner, build_ssh_argv};
-use codex_ssh_bridge::{MAX_OUTPUT_BYTES, MAX_READ_BYTES};
+use codex_ssh_bridge::{MAX_OUTPUT_BYTES, MAX_READ_BYTES, MAX_WRITE_BYTES};
 use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
@@ -43,6 +43,7 @@ const HARDENED_OPTIONS: &[&str] = &[
     "ControlPersist=300",
 ];
 const LONG_XDG_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_LONG_XDG_CHILD_EXPECTED";
+const RESTRICTIVE_UMASK_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_RESTRICTIVE_UMASK_BASE";
 
 fn option_is_distinct(argv: &[OsString], expected: &str) -> bool {
     argv.windows(2)
@@ -1046,8 +1047,42 @@ async fn selected_shell_and_remote_gnu_timeout_are_reported_and_rendered_exactly
     assert!(!result.remote_process_may_continue);
     assert_eq!(
         preview_bytes(&result.output.stdout),
-        b"exec timeout --signal=TERM --kill-after=1s 123ms sh -c 'printf safe'"
+        b"exec timeout --signal=TERM --kill-after=1s 0.123s sh -c 'printf safe'"
     );
+}
+
+#[test]
+fn capability_probe_functionally_rejects_an_incompatible_timeout() {
+    let filesystem = TempDir::new().unwrap();
+    let root = filesystem.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let fake_bin = filesystem.path().join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let fake_timeout = fake_bin.join("timeout");
+    fs::write(&fake_timeout, "#!/bin/sh\nexit 125\n").unwrap();
+    fs::set_permissions(&fake_timeout, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(fake_bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let expected = RemotePath::resolve(root.to_str().unwrap(), ".").unwrap();
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            CAPABILITY_PROBE_SCRIPT,
+            "probe",
+            root.to_str().unwrap(),
+        ])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let capability = parse_probe_output(&output.stdout, &expected).unwrap();
+    assert_eq!(capability.tools.get("timeout"), Some(&false));
 }
 
 #[tokio::test]
@@ -1545,6 +1580,120 @@ async fn deadline_still_kills_pipe_inheriting_descendants_after_ssh_parent_exit(
 }
 
 #[tokio::test]
+async fn cancellation_kills_an_orphan_stdin_holder_after_ssh_parent_exit() {
+    let files = TempDir::new().unwrap();
+    let pid_file = files.path().join("child.pid");
+    let ready_file = files.path().join("child.ready");
+    let parent_exit = files.path().join("parent.exit");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "orphan-stdin".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_CHILD_PID_FILE", pid_file.display().to_string()),
+            (
+                "FAKE_SSH_CHILD_READY_FILE",
+                ready_file.display().to_string(),
+            ),
+            (
+                "FAKE_SSH_PARENT_EXIT_FILE",
+                parent_exit.display().to_string(),
+            ),
+        ],
+    );
+    let cancel = CancellationToken::new();
+    let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(20));
+    run.stdin = Some(vec![b'x'; MAX_WRITE_BYTES]);
+    let mut task = {
+        let runner = Arc::clone(&fixture.runner);
+        let token = cancel.clone();
+        tokio::spawn(async move { runner.execute(run, token).await })
+    };
+    wait_for_file(&pid_file).await;
+    wait_for_file(&ready_file).await;
+    wait_for_file(&parent_exit).await;
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    sleep(Duration::from_millis(20)).await;
+    let cancelled_at = Instant::now();
+    cancel.cancel();
+    let result = timeout(Duration::from_millis(250), &mut task).await;
+    let error = match result {
+        Ok(result) => result.unwrap().unwrap_err(),
+        Err(_) => {
+            force_kill_process(pid);
+            let _ = timeout(Duration::from_millis(250), &mut task).await;
+            task.abort();
+            panic!("cancel was ignored while an orphan retained stdin")
+        }
+    };
+    assert!(cancelled_at.elapsed() < Duration::from_millis(250));
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
+async fn deadline_kills_an_orphan_stdin_holder_after_ssh_parent_exit() {
+    let files = TempDir::new().unwrap();
+    let pid_file = files.path().join("child.pid");
+    let ready_file = files.path().join("child.ready");
+    let parent_exit = files.path().join("parent.exit");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "orphan-stdin".to_owned()),
+            ("FAKE_SSH_SLEEP_SECONDS", "10".to_owned()),
+            ("FAKE_SSH_CHILD_PID_FILE", pid_file.display().to_string()),
+            (
+                "FAKE_SSH_CHILD_READY_FILE",
+                ready_file.display().to_string(),
+            ),
+            (
+                "FAKE_SSH_PARENT_EXIT_FILE",
+                parent_exit.display().to_string(),
+            ),
+        ],
+    );
+    let mut run = request("dev", ShellRequest::Auto, Duration::from_millis(80));
+    run.stdin = Some(vec![b'x'; MAX_WRITE_BYTES]);
+    let started = Instant::now();
+    let mut task = {
+        let runner = Arc::clone(&fixture.runner);
+        tokio::spawn(async move { runner.execute(run, CancellationToken::new()).await })
+    };
+    wait_for_file(&pid_file).await;
+    wait_for_file(&ready_file).await;
+    wait_for_file(&parent_exit).await;
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let result = timeout(Duration::from_millis(350), &mut task).await;
+    let error = match result {
+        Ok(result) => result.unwrap().unwrap_err(),
+        Err(_) => {
+            force_kill_process(pid);
+            let _ = timeout(Duration::from_millis(250), &mut task).await;
+            task.abort();
+            panic!("deadline was ignored while an orphan retained stdin")
+        }
+    };
+    assert!(started.elapsed() < Duration::from_millis(330));
+    assert_eq!(error.code, ErrorCode::CommandTimeout);
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    wait_for_process_exit(pid).await;
+}
+
+#[tokio::test]
 async fn output_capture_honors_a_pre_cancelled_token() {
     let base = TempDir::new().unwrap();
     let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
@@ -1769,6 +1918,63 @@ fn private_spool_files(runtime: &RuntimePaths) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+#[test]
+fn spool_files_are_mode_0600_under_restrictive_umask() {
+    let base = TempDir::new().unwrap();
+    let _runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let output = Command::new("/bin/sh")
+        .args(["-c", "umask 0777; exec \"$@\"", "umask-child"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "spool_mode_under_restrictive_umask_child",
+            "--nocapture",
+        ])
+        .env(RESTRICTIVE_UMASK_CHILD_SENTINEL, base.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spool_mode_under_restrictive_umask_child() {
+    let Some(base) = std::env::var_os(RESTRICTIVE_UMASK_CHILD_SENTINEL) else {
+        return;
+    };
+    let runtime = RuntimePaths::ensure_from_base(std::path::Path::new(&base)).unwrap();
+    let store = OutputStore::new(&runtime).unwrap();
+    let (mut writer, reader) = tokio::io::duplex(512 * 1024);
+    let writer_task = tokio::spawn(async move {
+        writer.write_all(&vec![b'x'; 300 * 1024]).await.unwrap();
+        writer.shutdown().await.unwrap();
+    });
+    let captured = store
+        .capture(
+            reader,
+            tokio::io::empty(),
+            CaptureLimits {
+                preview_bytes: 16,
+                max_output_bytes: 1024 * 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    writer_task.await.unwrap();
+    assert_eq!(private_spool_files(&runtime).len(), 2);
+    let reference = captured.reference.as_ref().unwrap();
+    let page = store
+        .read(reference, StreamKind::Stdout, 0, 17)
+        .await
+        .unwrap();
+    assert_eq!(page.bytes, vec![b'x'; 17]);
 }
 
 #[tokio::test]

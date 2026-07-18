@@ -653,7 +653,9 @@ impl Drop for PendingSpool {
     fn drop(&mut self) {
         if self.armed {
             let _ = std::fs::remove_file(&self.stdout_path);
-            let _ = std::fs::remove_file(&self.stderr_path);
+            if self.stderr.is_some() {
+                let _ = std::fs::remove_file(&self.stderr_path);
+            }
         }
     }
 }
@@ -690,11 +692,17 @@ fn create_spool(directory: &Path) -> BridgeResult<PendingSpool> {
 }
 
 fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
 }
 
 fn random_token() -> String {
@@ -806,7 +814,7 @@ fn is_single_diagnostic_field(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::create_spool;
+    use super::{PendingSpool, create_private_file, create_spool};
 
     #[test]
     fn dropping_an_unregistered_spool_removes_both_files() {
@@ -821,5 +829,30 @@ mod tests {
 
         assert!(!stdout_path.exists());
         assert!(!stderr_path.exists());
+    }
+
+    #[test]
+    fn dropping_a_partial_spool_preserves_an_unowned_stderr_collision() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let stdout_path = directory.path().join("partial.stdout");
+        let stderr_path = directory.path().join("partial.stderr");
+        let stdout = create_private_file(&stdout_path).unwrap();
+        std::fs::write(&stderr_path, b"pre-existing sentinel").unwrap();
+        let spool = PendingSpool {
+            token: "partial".to_owned(),
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            stdout: tokio::fs::File::from_std(stdout),
+            stderr: None,
+            armed: true,
+        };
+
+        drop(spool);
+
+        assert!(!stdout_path.exists());
+        assert_eq!(
+            std::fs::read(&stderr_path).unwrap(),
+            b"pre-existing sentinel"
+        );
     }
 }

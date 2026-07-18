@@ -428,7 +428,7 @@ impl SshRunner {
             .take()
             .ok_or_else(|| BridgeError::new(ErrorCode::Io, "SSH stderr pipe is missing", false))?;
         let child_stdin = child.stdin.take();
-        let stdin_task = tokio::spawn(write_stdin(child_stdin, spec.stdin));
+        let mut stdin_task = tokio::spawn(write_stdin(child_stdin, spec.stdin));
         let output_limit = CancellationToken::new();
         let mut capture_task = {
             let store = Arc::clone(&self.output_store);
@@ -449,6 +449,7 @@ impl SshRunner {
         let mut wait_task = tokio::spawn(async move { child.wait().await });
         let mut status = None;
         let mut capture = None;
+        let mut stdin_finished = false;
         let deadline = tokio::time::sleep(spec.deadline);
         tokio::pin!(deadline);
 
@@ -463,7 +464,7 @@ impl SshRunner {
                         Ok(exit_status) => status = Some(exit_status),
                         Err(error) => break Stop::InternalError(error),
                     }
-                    if capture.is_some() {
+                    if capture.is_some() && stdin_finished {
                         break Stop::Completed;
                     }
                 }
@@ -480,7 +481,16 @@ impl SshRunner {
                     if let Some(stop) = stop_for_error {
                         break stop;
                     }
-                    if status.is_some() {
+                    if status.is_some() && stdin_finished {
+                        break Stop::Completed;
+                    }
+                }
+                result = &mut stdin_task, if !stdin_finished => {
+                    stdin_finished = true;
+                    if let Err(error) = joined_stdin(result) {
+                        break Stop::InternalError(error);
+                    }
+                    if status.is_some() && capture.is_some() {
                         break Stop::Completed;
                     }
                 }
@@ -491,7 +501,6 @@ impl SshRunner {
             Stop::Completed => {
                 let status = status.expect("completed child status");
                 let output = capture.expect("completed capture")?;
-                finish_stdin(stdin_task).await?;
                 self.classify_exit(status, output, spec.phase, host, started.elapsed())
                     .await
             }
@@ -500,11 +509,20 @@ impl SshRunner {
                 if status.is_none() {
                     let _ = finish_wait(wait_task).await;
                 }
-                let _ = finish_stdin(stdin_task).await;
-                let capture = match capture {
-                    Some(capture) => capture,
-                    None => finish_capture_bounded(capture_task).await,
+                // stdin and capture share one drain-grace window so forced
+                // return remains inside the 250 ms acceptance budget.
+                let stdin_finish = async move {
+                    if !stdin_finished {
+                        let _ = finish_stdin_bounded(stdin_task).await;
+                    }
                 };
+                let capture_finish = async move {
+                    match capture {
+                        Some(capture) => capture,
+                        None => finish_capture_bounded(capture_task).await,
+                    }
+                };
+                let (_, capture) = tokio::join!(stdin_finish, capture_finish);
                 let bytes_seen = capture
                     .as_ref()
                     .ok()
@@ -709,7 +727,8 @@ fn render_remote_command(
     }
     let quoted = shell_word(command)?;
     let timeout_prefix = if remote_timeout {
-        format!("timeout --signal=TERM --kill-after=1s {timeout_ms}ms ")
+        let duration = format_timeout_duration(timeout_ms)?;
+        format!("timeout --signal=TERM --kill-after=1s {duration} ")
     } else {
         String::new()
     };
@@ -720,6 +739,17 @@ fn render_remote_command(
         ShellKind::PosixSh => Ok(format!("exec {timeout_prefix}sh -c {quoted}")),
         ShellKind::Login => unreachable!(),
     }
+}
+
+fn format_timeout_duration(timeout_ms: u64) -> BridgeResult<String> {
+    if timeout_ms == 0 {
+        return Err(BridgeError::invalid_argument(
+            "command timeout must be positive",
+        ));
+    }
+    let seconds = timeout_ms / 1000;
+    let milliseconds = timeout_ms % 1000;
+    Ok(format!("{seconds}.{milliseconds:03}s"))
 }
 
 fn capability_probe_command(root: &str) -> BridgeResult<String> {
@@ -746,10 +776,25 @@ async fn write_stdin(
     Ok(())
 }
 
-async fn finish_stdin(task: JoinHandle<std::io::Result<()>>) -> BridgeResult<()> {
-    task.await
+fn joined_stdin(result: Result<std::io::Result<()>, tokio::task::JoinError>) -> BridgeResult<()> {
+    result
         .map_err(|error| BridgeError::new(ErrorCode::Io, error.to_string(), false))?
         .map_err(BridgeError::io)
+}
+
+async fn finish_stdin_bounded(mut task: JoinHandle<std::io::Result<()>>) -> BridgeResult<()> {
+    match timeout(DRAIN_GRACE, &mut task).await {
+        Ok(result) => joined_stdin(result),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(BridgeError::new(
+                ErrorCode::Io,
+                "SSH stdin writer did not stop after termination",
+                false,
+            ))
+        }
+    }
 }
 
 fn joined_capture(
@@ -846,8 +891,9 @@ fn elapsed_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::capability_probe_command;
-    use crate::capability::parse_probe_output;
+    use super::{capability_probe_command, render_remote_command};
+    use crate::capability::{ShellKind, parse_probe_output};
+    use crate::error::ErrorCode;
     use crate::path::RemotePath;
 
     #[test]
@@ -873,5 +919,39 @@ mod tests {
             let capability = parse_probe_output(&output.stdout, &expected).unwrap();
             assert_eq!(capability.physical_root, root);
         }
+    }
+
+    #[test]
+    fn remote_timeout_uses_gnu_decimal_seconds() {
+        let command = render_remote_command("exit 0", &ShellKind::PosixSh, true, 123).unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("PATH", "/usr/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "command={command:?}\nstatus={:?}\nstderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            command,
+            "exec timeout --signal=TERM --kill-after=1s 0.123s sh -c 'exit 0'"
+        );
+        assert_eq!(
+            render_remote_command("exit 0", &ShellKind::PosixSh, true, 1000).unwrap(),
+            "exec timeout --signal=TERM --kill-after=1s 1.000s sh -c 'exit 0'"
+        );
+        assert_eq!(
+            render_remote_command("exit 0", &ShellKind::PosixSh, true, u64::MAX).unwrap(),
+            "exec timeout --signal=TERM --kill-after=1s 18446744073709551.615s sh -c 'exit 0'"
+        );
+        assert_eq!(
+            render_remote_command("exit 0", &ShellKind::PosixSh, true, 0)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
     }
 }
