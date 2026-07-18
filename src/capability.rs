@@ -136,13 +136,9 @@ pub fn select_shell(
                 shell: shell.clone(),
                 fallback: false,
             }),
-            ShellKind::PosixSh => Ok(ShellSelection {
+            ShellKind::PosixSh | ShellKind::Login => Ok(ShellSelection {
                 shell: ShellKind::PosixSh,
                 fallback: true,
-            }),
-            ShellKind::Login => Ok(ShellSelection {
-                shell: ShellKind::Login,
-                fallback: false,
             }),
         },
         ShellRequest::Bash => match &capability.shell {

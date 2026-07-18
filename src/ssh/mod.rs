@@ -5,11 +5,13 @@
 
 mod argv;
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt::Write as _;
-use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -19,6 +21,8 @@ use crate::error::{BridgeError, BridgeResult};
 pub use argv::build_ssh_argv;
 
 const RUNTIME_DIRECTORY: &str = "codex-ssh-bridge";
+const CONTROL_FILENAME_BYTES: usize = 3 + 32;
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -28,48 +32,74 @@ pub struct RuntimePaths {
 impl RuntimePaths {
     pub fn discover() -> BridgeResult<Self> {
         match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
-            Some(base) => Self::ensure_from_base(Path::new(&base)),
-            None => {
-                // SAFETY: geteuid has no preconditions and only reads process credentials.
-                let uid = unsafe { libc::geteuid() };
-                Self::ensure_directory(PathBuf::from(format!("/tmp/{RUNTIME_DIRECTORY}-{uid}")))
+            Some(base) => {
+                let candidate = Self::ensure_from_base(Path::new(&base))?;
+                if candidate.has_control_path_budget() {
+                    Ok(candidate)
+                } else {
+                    Self::ensure_tmp_fallback()
+                }
             }
+            None => Self::ensure_tmp_fallback(),
         }
     }
 
     pub fn ensure_from_base(base: &Path) -> BridgeResult<Self> {
-        validate_runtime_base(base)?;
-        Self::ensure_directory(base.join(RUNTIME_DIRECTORY))
+        Self::ensure_in_base(base, OsStr::new(RUNTIME_DIRECTORY), true)
     }
 
     pub fn directory(&self) -> &Path {
         &self.directory
     }
 
-    fn ensure_directory(directory: PathBuf) -> BridgeResult<Self> {
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        match builder.create(&directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(BridgeError::io(error)),
-        }
-
-        let metadata = fs::symlink_metadata(&directory).map_err(BridgeError::io)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(unsafe_runtime_directory(
-                "runtime path must be a real directory",
-            ));
-        }
+    fn ensure_tmp_fallback() -> BridgeResult<Self> {
         // SAFETY: geteuid has no preconditions and only reads process credentials.
         let uid = unsafe { libc::geteuid() };
-        if metadata.uid() != uid {
-            return Err(unsafe_runtime_directory(
-                "runtime directory must be owned by the current user",
+        let leaf = OsString::from(format!("{RUNTIME_DIRECTORY}-{uid}"));
+        Self::ensure_in_base(Path::new("/tmp"), &leaf, false)
+    }
+
+    fn has_control_path_budget(&self) -> bool {
+        self.directory
+            .join("x".repeat(CONTROL_FILENAME_BYTES))
+            .as_os_str()
+            .as_bytes()
+            .len()
+            <= UNIX_SOCKET_PATH_MAX_BYTES
+    }
+
+    fn ensure_in_base(
+        base: &Path,
+        leaf: &OsStr,
+        require_current_user_base: bool,
+    ) -> BridgeResult<Self> {
+        let base_directory = open_secure_absolute_directory(base, require_current_user_base)?;
+        let leaf_name = path_component(leaf)?;
+        // SAFETY: base_directory is an open directory and leaf_name is a live
+        // NUL-terminated component. mkdirat does not retain either pointer.
+        let created =
+            unsafe { libc::mkdirat(base_directory.as_raw_fd(), leaf_name.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(BridgeError::io(error));
+            }
+        }
+
+        let directory = base.join(leaf);
+        let runtime_directory = openat_directory(&base_directory, leaf, &directory)?;
+        let metadata = runtime_directory.metadata().map_err(BridgeError::io)?;
+        // SAFETY: geteuid has no preconditions and only reads process credentials.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || metadata.uid() != uid {
+            return Err(unsafe_runtime_path(
+                &directory,
+                "runtime path must be a directory owned by the current user",
             ));
         }
-        if metadata.permissions().mode() & 0o7777 != 0o700 {
-            return Err(unsafe_runtime_directory(
+        if metadata.mode() & 0o7777 != 0o700 {
+            return Err(unsafe_runtime_path(
+                &directory,
                 "runtime directory permissions must be 0700",
             ));
         }
@@ -78,31 +108,142 @@ impl RuntimePaths {
     }
 }
 
-fn validate_runtime_base(base: &Path) -> BridgeResult<()> {
-    let metadata = fs::symlink_metadata(base).map_err(BridgeError::io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(unsafe_runtime_directory(
-            "runtime base must be a real directory",
-        ));
+fn open_secure_absolute_directory(
+    path: &Path,
+    require_current_user_base: bool,
+) -> BridgeResult<File> {
+    if !path.is_absolute() {
+        return Err(unsafe_runtime_path(path, "runtime base must be absolute"));
     }
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut directory = options.open("/").map_err(BridgeError::io)?;
+    let root_metadata = directory.metadata().map_err(BridgeError::io)?;
+    let trusted_system_uid = root_metadata.uid();
     // SAFETY: geteuid has no preconditions and only reads process credentials.
-    let uid = unsafe { libc::geteuid() };
-    if metadata.uid() != uid {
-        return Err(unsafe_runtime_directory(
-            "runtime base must be owned by the current user",
+    let current_uid = unsafe { libc::geteuid() };
+    validate_ancestor(
+        Path::new("/"),
+        &root_metadata,
+        trusted_system_uid,
+        current_uid,
+    )?;
+
+    let mut resolved = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                resolved.push(name);
+                directory = openat_directory(&directory, name, &resolved)?;
+                validate_ancestor(
+                    &resolved,
+                    &directory.metadata().map_err(BridgeError::io)?,
+                    trusted_system_uid,
+                    current_uid,
+                )?;
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(unsafe_runtime_path(
+                    path,
+                    "runtime base must be a normalized absolute path",
+                ));
+            }
+        }
+    }
+
+    if require_current_user_base {
+        let metadata = directory.metadata().map_err(BridgeError::io)?;
+        if metadata.uid() != current_uid {
+            return Err(unsafe_runtime_path(
+                path,
+                "runtime base must be owned by the current user",
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(unsafe_runtime_path(
+                path,
+                "runtime base must not be writable by group or other users",
+            ));
+        }
+    }
+
+    Ok(directory)
+}
+
+fn openat_directory(parent: &File, name: &OsStr, path: &Path) -> BridgeResult<File> {
+    let name = path_component(name)?;
+    // SAFETY: parent is an open directory and name is a live NUL-terminated
+    // component. openat does not retain the pointer. A successful fd is owned
+    // immediately by File below.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => Err(unsafe_runtime_path(
+                path,
+                "runtime path components must be real directories",
+            )),
+            _ => Err(BridgeError::io(error)),
+        };
+    }
+    // SAFETY: descriptor was returned uniquely owned by openat above.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn validate_ancestor(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    trusted_system_uid: u32,
+    current_uid: u32,
+) -> BridgeResult<()> {
+    if !metadata.is_dir() {
+        return Err(unsafe_runtime_path(
+            path,
+            "runtime ancestors must be directories",
         ));
     }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(unsafe_runtime_directory(
-            "runtime base must not be writable by group or other users",
+    if metadata.uid() != trusted_system_uid && metadata.uid() != current_uid {
+        return Err(unsafe_runtime_path(
+            path,
+            "runtime ancestors must be owned by root or the current user",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0
+        && !(path == Path::new("/tmp")
+            && metadata.uid() == trusted_system_uid
+            && metadata.mode() & 0o1000 != 0)
+    {
+        return Err(unsafe_runtime_path(
+            path,
+            "runtime ancestors must not be writable by group or other users",
         ));
     }
     Ok(())
 }
 
+fn path_component(value: &OsStr) -> BridgeResult<CString> {
+    if value.is_empty() || value.as_bytes().contains(&b'/') {
+        return Err(unsafe_runtime_directory("invalid runtime path component"));
+    }
+    CString::new(value.as_bytes())
+        .map_err(|_| unsafe_runtime_directory("runtime paths cannot contain NUL"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshPolicy {
     options: Vec<OsString>,
+    control_path: PathBuf,
 }
 
 impl SshPolicy {
@@ -122,8 +263,12 @@ impl SshPolicy {
         let control_path = runtime_paths
             .directory
             .join(control_filename(host.alias, resolved_connection_identity));
-        let mut control_option = OsString::from("ControlPath=");
-        control_option.push(control_path);
+        if control_path.as_os_str().as_bytes().len() > UNIX_SOCKET_PATH_MAX_BYTES {
+            return Err(BridgeError::invalid_config(
+                "ControlPath exceeds the Unix socket path limit",
+            ));
+        }
+        let control_option = escaped_control_path_option(&control_path);
 
         let mut options = Vec::new();
         for option in [
@@ -143,8 +288,26 @@ impl SshPolicy {
         options.push(OsString::from("-o"));
         options.push(control_option);
 
-        Ok(Self { options })
+        Ok(Self {
+            options,
+            control_path,
+        })
     }
+
+    pub fn control_path(&self) -> &Path {
+        &self.control_path
+    }
+}
+
+fn escaped_control_path_option(control_path: &Path) -> OsString {
+    let mut encoded = b"ControlPath=".to_vec();
+    for byte in control_path.as_os_str().as_bytes() {
+        encoded.push(*byte);
+        if *byte == b'%' {
+            encoded.push(*byte);
+        }
+    }
+    OsString::from_vec(encoded)
 }
 
 fn control_filename(alias: &str, resolved_connection_identity: &str) -> String {
@@ -163,4 +326,10 @@ fn control_filename(alias: &str, resolved_connection_identity: &str) -> String {
 
 fn unsafe_runtime_directory(message: &str) -> BridgeError {
     BridgeError::invalid_config(message)
+}
+
+fn unsafe_runtime_path(path: &Path, message: &str) -> BridgeError {
+    let mut error = unsafe_runtime_directory(message);
+    error.details.path = Some(path.to_string_lossy().into_owned());
+    error
 }
