@@ -906,6 +906,31 @@ pub(super) struct ResolvedDelete {
     expected_sha256: String,
 }
 
+#[derive(Debug)]
+pub(super) struct PreparedMutationPath {
+    host: String,
+    path: RemotePath,
+    parent: String,
+    basename: String,
+}
+
+impl PreparedMutationPath {
+    pub(super) fn parent(&self) -> &str {
+        &self.parent
+    }
+
+    pub(super) fn basename(&self) -> &str {
+        &self.basename
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MutationTarget {
+    Write,
+    Delete,
+    Patch,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum WriteProtocol {
     Success {
@@ -930,7 +955,15 @@ pub(super) async fn write(
     request: WriteRequest,
     cancel: CancellationToken,
 ) -> BridgeResult<WriteResult> {
-    let mut resolved = preflight_write(bridge, request)?;
+    let resolved = preflight_write(bridge, request)?;
+    execute_preflighted_write(bridge, resolved, cancel).await
+}
+
+pub(super) async fn execute_preflighted_write(
+    bridge: &RemoteBridge,
+    mut resolved: ResolvedWrite,
+    cancel: CancellationToken,
+) -> BridgeResult<WriteResult> {
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
     let args = fixed_args(&resolved);
     let stdin = std::mem::take(&mut resolved.content);
@@ -990,6 +1023,16 @@ pub(super) async fn guarded_delete(
     cancel: CancellationToken,
 ) -> BridgeResult<GuardedDeleteResult> {
     let resolved = preflight_delete(bridge, request)?;
+    execute_preflighted_delete(bridge, resolved, cancel)
+        .await
+        .map(|(result, _context)| result)
+}
+
+pub(super) async fn execute_preflighted_delete(
+    bridge: &RemoteBridge,
+    resolved: ResolvedDelete,
+    cancel: CancellationToken,
+) -> BridgeResult<(GuardedDeleteResult, super::RemoteContext)> {
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
     let owner = InternalSpoolOwner::new();
     let request = FixedRunRequest {
@@ -1010,12 +1053,19 @@ pub(super) async fn guarded_delete(
         .await
         .map_err(|_| BridgeError::mutation_outcome_unknown())?;
     match protocol {
-        DeleteProtocol::Success { sha256 } => Ok(GuardedDeleteResult {
-            actual_path: encode_bytes(resolved.path.absolute().as_bytes()),
-            relative_path: encode_bytes(resolved.path.relative().as_bytes()),
-            deleted_sha256: sha256,
-            absence_confirmed: true,
-        }),
+        DeleteProtocol::Success { sha256 } => Ok((
+            GuardedDeleteResult {
+                actual_path: encode_bytes(resolved.path.absolute().as_bytes()),
+                relative_path: encode_bytes(resolved.path.relative().as_bytes()),
+                deleted_sha256: sha256,
+                absence_confirmed: true,
+            },
+            context(
+                resolved.host,
+                result.capability.physical_root.clone(),
+                &result.shell,
+            ),
+        )),
         DeleteProtocol::Domain(code) => Err(delete_domain_error(code)),
         DeleteProtocol::CapabilityMismatch => {
             bridge.runner.invalidate_capability(&resolved.host).await;
@@ -1060,25 +1110,18 @@ pub(super) fn preflight_write(
         encoding,
         mode,
     } = request;
-    let resolved_host = bridge.runner.config().host(&host)?;
-    let read_only = resolved_host.profile.read_only;
-    let root = resolved_host.profile.root.clone();
-    let limits = resolved_host.limits;
-    if read_only {
-        return Err(BridgeError::new(
-            ErrorCode::ReadOnlyHost,
-            "remote host is configured read-only",
-            false,
-        ));
-    }
-    validate_write_path(&path)?;
-    let resolved_path = RemotePath::resolve(&root, &path)?;
-    if resolved_path.relative().is_empty() {
-        return Err(BridgeError::invalid_argument(
-            "write target must not be the configured root",
-        ));
-    }
-    let (parent, basename) = split_parent_basename(resolved_path.absolute())?;
+    let path = prepare_mutation_path(bridge, host, &path, MutationTarget::Write)?;
+    preflight_write_resolved(bridge, path, content, encoding, mode)
+}
+
+pub(super) fn preflight_write_resolved(
+    bridge: &RemoteBridge,
+    prepared: PreparedMutationPath,
+    content: String,
+    encoding: WriteEncoding,
+    mode: WriteMode,
+) -> BridgeResult<ResolvedWrite> {
+    let limits = bridge.runner.config().host(&prepared.host)?.limits;
     let (operation, expected_sha256) = match mode {
         WriteMode::Create => (WriteOperation::Create, None),
         WriteMode::Replace { expected_sha256 } => {
@@ -1109,9 +1152,15 @@ pub(super) fn preflight_write(
     let raw_bytes = u64::try_from(content.len())
         .map_err(|_| BridgeError::new(ErrorCode::RequestTooLarge, "write is too large", false))?;
     let sha256 = format!("{:x}", Sha256::digest(&content));
+    let PreparedMutationPath {
+        host,
+        path,
+        parent,
+        basename,
+    } = prepared;
     let resolved = ResolvedWrite {
         host,
-        path: resolved_path,
+        path,
         parent,
         basename,
         content,
@@ -1140,29 +1189,39 @@ pub(super) fn preflight_delete(
         path,
         expected_sha256,
     } = request;
-    let resolved_host = bridge.runner.config().host(&host)?;
-    let read_only = resolved_host.profile.read_only;
-    let root = resolved_host.profile.root.clone();
-    let max_frame_bytes = resolved_host.limits.max_frame_bytes;
-    if read_only {
-        return Err(BridgeError::new(
-            ErrorCode::ReadOnlyHost,
-            "remote host is configured read-only",
-            false,
-        ));
-    }
-    validate_write_path(&path)?;
+    let path = prepare_mutation_path(bridge, host, &path, MutationTarget::Delete)?;
+    preflight_delete_resolved(bridge, path, expected_sha256)
+}
+
+pub(super) fn prepare_patch_path(
+    bridge: &RemoteBridge,
+    host: &str,
+    requested: &str,
+) -> BridgeResult<PreparedMutationPath> {
+    prepare_mutation_path(bridge, host.to_owned(), requested, MutationTarget::Patch)
+}
+
+pub(super) fn preflight_delete_resolved(
+    bridge: &RemoteBridge,
+    prepared: PreparedMutationPath,
+    expected_sha256: String,
+) -> BridgeResult<ResolvedDelete> {
+    let max_frame_bytes = bridge
+        .runner
+        .config()
+        .host(&prepared.host)?
+        .limits
+        .max_frame_bytes;
     validate_hash(&expected_sha256)?;
-    let resolved_path = RemotePath::resolve(&root, &path)?;
-    if resolved_path.relative().is_empty() {
-        return Err(BridgeError::invalid_argument(
-            "delete target must not be the configured root",
-        ));
-    }
-    let (parent, basename) = split_parent_basename(resolved_path.absolute())?;
+    let PreparedMutationPath {
+        host,
+        path,
+        parent,
+        basename,
+    } = prepared;
     let resolved = ResolvedDelete {
         host,
-        path: resolved_path,
+        path,
         parent,
         basename,
         expected_sha256,
@@ -1172,6 +1231,39 @@ pub(super) fn preflight_delete(
         return Err(request_too_large());
     }
     Ok(resolved)
+}
+
+fn prepare_mutation_path(
+    bridge: &RemoteBridge,
+    host: String,
+    requested: &str,
+    target: MutationTarget,
+) -> BridgeResult<PreparedMutationPath> {
+    let resolved_host = bridge.runner.config().host(&host)?;
+    if resolved_host.profile.read_only {
+        return Err(BridgeError::new(
+            ErrorCode::ReadOnlyHost,
+            "remote host is configured read-only",
+            false,
+        ));
+    }
+    validate_write_path(requested)?;
+    let path = RemotePath::resolve(&resolved_host.profile.root, requested)?;
+    if path.relative().is_empty() {
+        let message = match target {
+            MutationTarget::Write => "write target must not be the configured root",
+            MutationTarget::Delete => "delete target must not be the configured root",
+            MutationTarget::Patch => "patch target must not be the configured root",
+        };
+        return Err(BridgeError::invalid_argument(message));
+    }
+    let (parent, basename) = split_parent_basename(path.absolute())?;
+    Ok(PreparedMutationPath {
+        host,
+        path,
+        parent,
+        basename,
+    })
 }
 
 fn fixed_args(resolved: &ResolvedWrite) -> Vec<String> {

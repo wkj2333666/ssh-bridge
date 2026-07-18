@@ -6,13 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::path::RemotePath;
 use crate::ssh::{FixedOperationKind, FixedRunRequest};
 
 use super::protocol::{context, nul_fields, parse_u64, read_small_stream, utf8};
 use super::{
-    ApplyPatchRequest, ApplyPatchResult, GuardedDeleteRequest, RemoteBridge, RemoteContext,
-    WriteEncoding, WriteMode, WriteRequest,
+    ApplyPatchRequest, ApplyPatchResult, RemoteBridge, RemoteContext, WriteEncoding, WriteMode,
 };
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -986,9 +984,7 @@ fn write_conflict(message: &'static str) -> BridgeError {
 #[derive(Debug)]
 struct ResolvedFilePatch {
     patch: FilePatch,
-    path: RemotePath,
-    parent: String,
-    basename: String,
+    path: super::write::PreparedMutationPath,
 }
 
 #[derive(Debug)]
@@ -1018,41 +1014,22 @@ enum PreparedMutation {
     Delete(Box<super::write::ResolvedDelete>),
 }
 
-impl PreparedMutation {
-    fn retain(&self) {
-        match self {
-            Self::Write(prepared) => {
-                let _ = prepared.as_ref();
-            }
-            Self::Delete(prepared) => {
-                let _ = prepared.as_ref();
-            }
-        }
-    }
-}
-
 fn resolve_patch_files(
     bridge: &RemoteBridge,
     host: &str,
     patches: Vec<FilePatch>,
 ) -> BridgeResult<Vec<ResolvedFilePatch>> {
-    let configured = bridge.runner.config().host(host)?;
-    let root = configured.profile.root.clone();
     patches
         .into_iter()
         .map(|patch| {
-            let path = RemotePath::resolve(&root, &patch.path)?;
-            if path.relative().is_empty() {
-                return Err(invalid_patch(
-                    "patch target must not be the configured root",
-                ));
-            }
-            let (parent, basename) = super::write::split_parent_basename(path.absolute())?;
-            Ok(ResolvedFilePatch {
-                patch,
-                path,
-                parent,
-                basename,
+            let failed_path = patch.path.clone();
+            (|| {
+                let path = super::write::prepare_patch_path(bridge, host, &patch.path)?;
+                Ok(ResolvedFilePatch { patch, path })
+            })()
+            .map_err(|mut error: BridgeError| {
+                error.details.failed_path = Some(failed_path);
+                error
             })
         })
         .collect()
@@ -1089,8 +1066,8 @@ async fn snapshot_file(
                 host: host.to_owned(),
                 script: PATCH_SNAPSHOT_SCRIPT,
                 args: vec![
-                    resolved.parent.clone(),
-                    resolved.basename.clone(),
+                    resolved.path.parent().to_owned(),
+                    resolved.path.basename().to_owned(),
                     snapshot_maximum.to_string(),
                 ],
                 stdin: None,
@@ -1254,10 +1231,34 @@ fn attach_preparation_progress(
     failed_path: Option<&str>,
     all_paths: &[String],
 ) -> BridgeError {
-    error.details.failed_path = failed_path.map(str::to_owned);
+    if let Some(failed_path) = failed_path {
+        error.details.failed_path = Some(failed_path.to_owned());
+    }
     error.details.changed_paths = Some(Vec::new());
     error.details.not_changed_paths = Some(all_paths.to_vec());
     error.details.outcome_unknown_paths = Some(Vec::new());
+    error
+}
+
+fn attach_mutation_progress(
+    mut error: BridgeError,
+    current: usize,
+    all_paths: &[String],
+) -> BridgeError {
+    let current_path = &all_paths[current];
+    let outcome_unknown = error.code == ErrorCode::MutationOutcomeUnknown
+        || error.details.mutation_may_have_applied == Some(true);
+    error.details.changed_paths = Some(all_paths[..current].to_vec());
+    if outcome_unknown {
+        error.details.failed_path = Some(current_path.clone());
+        error.details.not_changed_paths = Some(all_paths[current + 1..].to_vec());
+        error.details.outcome_unknown_paths = Some(vec![current_path.clone()]);
+    } else {
+        error.details.failed_path =
+            (error.code != ErrorCode::Cancelled).then(|| current_path.clone());
+        error.details.not_changed_paths = Some(all_paths[current..].to_vec());
+        error.details.outcome_unknown_paths = Some(Vec::new());
+    }
     error
 }
 
@@ -1379,15 +1380,15 @@ pub(super) async fn apply_patch(
                         &all_paths,
                     )
                 })?;
-                let request = WriteRequest {
-                    host: host.clone(),
-                    path: file.path.relative().to_owned(),
-                    content,
-                    encoding: WriteEncoding::Utf8,
-                    mode,
-                };
                 PreparedMutation::Write(Box::new(
-                    super::write::preflight_write(bridge, request).map_err(|error| {
+                    super::write::preflight_write_resolved(
+                        bridge,
+                        file.path,
+                        content,
+                        WriteEncoding::Utf8,
+                        mode,
+                    )
+                    .map_err(|error| {
                         attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
                     })?,
                 ))
@@ -1401,37 +1402,62 @@ pub(super) async fn apply_patch(
                     )
                 })?;
                 PreparedMutation::Delete(Box::new(
-                    super::write::preflight_delete(
-                        bridge,
-                        GuardedDeleteRequest {
-                            host: host.clone(),
-                            path: file.path.relative().to_owned(),
-                            expected_sha256,
-                        },
-                    )
-                    .map_err(|error| {
-                        attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
-                    })?,
+                    super::write::preflight_delete_resolved(bridge, file.path, expected_sha256)
+                        .map_err(|error| {
+                            attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
+                        })?,
                 ))
             }
         };
         prepared_mutations.push(prepared);
     }
-    for prepared in &prepared_mutations {
-        prepared.retain();
-    }
-    if cancel.is_cancelled() {
-        return Err(attach_preparation_progress(
-            BridgeError::new(ErrorCode::Cancelled, "remote patch was cancelled", false),
+    let operation_context = operation_context.ok_or_else(|| {
+        attach_preparation_progress(
+            invalid_patch("patch contains no file operations"),
             None,
             &all_paths,
-        ));
+        )
+    })?;
+    let mut changed_paths = Vec::with_capacity(prepared_mutations.len());
+    for (index, prepared) in prepared_mutations.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(attach_mutation_progress(
+                BridgeError::new(ErrorCode::Cancelled, "remote patch was cancelled", false),
+                index,
+                &all_paths,
+            ));
+        }
+        let result = match prepared {
+            PreparedMutation::Write(resolved) => {
+                super::write::execute_preflighted_write(bridge, *resolved, cancel.clone())
+                    .await
+                    .map(|result| result.context)
+            }
+            PreparedMutation::Delete(resolved) => {
+                super::write::execute_preflighted_delete(bridge, *resolved, cancel.clone())
+                    .await
+                    .map(|(_result, context)| context)
+            }
+        };
+        match result {
+            Ok(context)
+                if context.host != operation_context.host
+                    || context.physical_root != operation_context.physical_root =>
+            {
+                return Err(attach_mutation_progress(
+                    BridgeError::mutation_outcome_unknown(),
+                    index,
+                    &all_paths,
+                ));
+            }
+            Ok(_) => changed_paths.push(all_paths[index].clone()),
+            Err(error) => return Err(attach_mutation_progress(error, index, &all_paths)),
+        }
     }
-    let mut error = BridgeError::invalid_argument("remote patch orchestration is not implemented");
-    error.details.changed_paths = Some(Vec::new());
-    error.details.not_changed_paths = Some(all_paths);
-    error.details.outcome_unknown_paths = Some(Vec::new());
-    Err(error)
+    Ok(ApplyPatchResult {
+        context: operation_context,
+        changed_paths,
+    })
 }
 
 #[cfg(test)]
@@ -1440,7 +1466,7 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use crate::ErrorCode;
+    use crate::{BridgeError, ErrorCode};
 
     fn apply(base: Option<&[u8]>, patch: &str) -> crate::BridgeResult<super::PatchedFile> {
         let parsed = super::parse_patch(patch)?;
@@ -1451,6 +1477,44 @@ mod tests {
             &parsed[0],
             super::MAX_PATCH_BYTES,
         )
+    }
+
+    #[test]
+    fn task6_mutation_progress_classifies_pre_spawn_cancel_as_definite_suffix() {
+        let paths = ["a", "b", "c"].map(str::to_owned);
+        let error = super::attach_mutation_progress(
+            BridgeError::new(ErrorCode::Cancelled, "keep this cancellation", false),
+            1,
+            &paths,
+        );
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.message, "keep this cancellation");
+        assert_eq!(error.details.failed_path, None);
+        assert_eq!(error.details.changed_paths, Some(vec!["a".to_owned()]));
+        assert_eq!(
+            error.details.not_changed_paths,
+            Some(vec!["b".to_owned(), "c".to_owned()])
+        );
+        assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+        assert_eq!(error.details.mutation_may_have_applied, None);
+    }
+
+    #[test]
+    fn task6_patch_preflight_consumes_the_already_resolved_path() {
+        let production = include_str!("patch.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let resolved_write = concat!("preflight_write", "_resolved(");
+        let resolved_delete = concat!("preflight_delete", "_resolved(");
+        let public_write = concat!("preflight_", "write(bridge");
+        let public_delete = concat!("preflight_", "delete(");
+
+        assert!(production.contains(resolved_write));
+        assert!(production.contains(resolved_delete));
+        assert!(!production.contains(public_write));
+        assert!(!production.contains(public_delete));
     }
 
     #[test]
