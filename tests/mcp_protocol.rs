@@ -2047,6 +2047,7 @@ struct ClosingTaskState {
     dropped: AtomicBool,
     live: AtomicUsize,
     token: StdMutex<Option<tokio_util::sync::CancellationToken>>,
+    ready_trigger: StdMutex<Option<ReadyClosingTrigger>>,
     gate: Semaphore,
 }
 
@@ -2060,6 +2061,7 @@ impl ClosingTaskState {
             dropped: AtomicBool::new(false),
             live: AtomicUsize::new(0),
             token: StdMutex::new(None),
+            ready_trigger: StdMutex::new(None),
             gate: Semaphore::new(0),
         }
     }
@@ -2075,6 +2077,11 @@ impl ClosingTaskState {
                 .expect("Closing matrix task must enter");
         }
     }
+}
+
+enum ReadyClosingTrigger {
+    Input { input: DuplexStream, partial: bool },
+    Writer(Arc<ClosingWriterState>),
 }
 
 struct ClosingTaskGuard {
@@ -2134,6 +2141,17 @@ impl ToolService for ClosingTools {
                         .await
                         .expect("Closing matrix gate stays open")
                         .forget();
+                    let trigger = state.ready_trigger.lock().unwrap().take();
+                    match trigger {
+                        Some(ReadyClosingTrigger::Input { mut input, partial }) => {
+                            if partial {
+                                input.write_all(b"{").await.unwrap();
+                            }
+                            input.shutdown().await.unwrap();
+                        }
+                        Some(ReadyClosingTrigger::Writer(writer)) => writer.arm_writer(),
+                        None => {}
+                    }
                     state.completed.store(true, Ordering::Release);
                     CallToolResult::text("already ready")
                 }
@@ -2147,15 +2165,19 @@ struct ClosingWriterState {
     wrote: Notify,
     blocked: AtomicBool,
     blocked_notify: Notify,
+    writer_armed: AtomicBool,
+    writer_waker: StdMutex<Option<std::task::Waker>>,
 }
 
 impl ClosingWriterState {
-    fn new() -> Self {
+    fn new(writer_armed: bool) -> Self {
         Self {
             bytes: StdMutex::new(Vec::new()),
             wrote: Notify::new(),
             blocked: AtomicBool::new(false),
             blocked_notify: Notify::new(),
+            writer_armed: AtomicBool::new(writer_armed),
+            writer_waker: StdMutex::new(None),
         }
     }
 
@@ -2199,6 +2221,13 @@ impl ClosingWriterState {
         self.blocked.store(true, Ordering::Release);
         self.blocked_notify.notify_waiters();
     }
+
+    fn arm_writer(&self) {
+        self.writer_armed.store(true, Ordering::Release);
+        if let Some(waker) = self.writer_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
 }
 
 struct ClosingWriter {
@@ -2209,7 +2238,7 @@ struct ClosingWriter {
 impl AsyncWrite for ClosingWriter {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut bytes = self.state.bytes.lock().unwrap();
@@ -2235,8 +2264,26 @@ impl AsyncWrite for ClosingWriter {
                 self.state.mark_blocked();
                 Poll::Pending
             }
-            ClosingSource::WriterWriteZero => Poll::Ready(Ok(0)),
+            ClosingSource::WriterWriteZero => {
+                if !self.state.writer_armed.load(Ordering::Acquire) {
+                    *self.state.writer_waker.lock().unwrap() = Some(cx.waker().clone());
+                    if !self.state.writer_armed.load(Ordering::Acquire) {
+                        drop(bytes);
+                        self.state.mark_blocked();
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(Ok(0))
+            }
             ClosingSource::WriterPanic => {
+                if !self.state.writer_armed.load(Ordering::Acquire) {
+                    *self.state.writer_waker.lock().unwrap() = Some(cx.waker().clone());
+                    if !self.state.writer_armed.load(Ordering::Acquire) {
+                        drop(bytes);
+                        self.state.mark_blocked();
+                        return Poll::Pending;
+                    }
+                }
                 drop(bytes);
                 panic!("HOSTILE Closing matrix writer panic")
             }
@@ -2285,7 +2332,12 @@ async fn run_closing_matrix_case(source: ClosingSource, active_kind: ClosingActi
         active_kind,
         state: Arc::clone(&task_state),
     });
-    let writer_state = Arc::new(ClosingWriterState::new());
+    let writer_starts_armed = active_kind != ClosingActiveKind::AlreadyReady
+        || !matches!(
+            source,
+            ClosingSource::WriterWriteZero | ClosingSource::WriterPanic
+        );
+    let writer_state = Arc::new(ClosingWriterState::new(writer_starts_armed));
     let writer = ClosingWriter {
         source,
         state: Arc::clone(&writer_state),
@@ -2320,11 +2372,16 @@ async fn run_closing_matrix_case(source: ClosingSource, active_kind: ClosingActi
     let started = Instant::now();
     match source {
         ClosingSource::PartialEof => {
-            input.write_all(b"{").await.unwrap();
             if active_kind == ClosingActiveKind::AlreadyReady {
+                *task_state.ready_trigger.lock().unwrap() = Some(ReadyClosingTrigger::Input {
+                    input,
+                    partial: true,
+                });
                 task_state.gate.add_permits(1);
+            } else {
+                input.write_all(b"{").await.unwrap();
+                input.shutdown().await.unwrap();
             }
-            input.shutdown().await.unwrap();
         }
         ClosingSource::QueueBackpressure => {
             send_closing_frame(
@@ -2360,19 +2417,29 @@ async fn run_closing_matrix_case(source: ClosingSource, active_kind: ClosingActi
         }
         ClosingSource::WriterWriteZero | ClosingSource::WriterPanic => {
             if active_kind == ClosingActiveKind::AlreadyReady {
-                task_state.gate.add_permits(1);
+                *task_state.ready_trigger.lock().unwrap() =
+                    Some(ReadyClosingTrigger::Writer(Arc::clone(&writer_state)));
             }
             let _ = send_closing_frame(
                 &mut input,
                 json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{}}),
             )
             .await;
+            if active_kind == ClosingActiveKind::AlreadyReady {
+                writer_state.wait_until_blocked().await;
+                task_state.gate.add_permits(1);
+            }
         }
         ClosingSource::ShutdownFailure => {
             if active_kind == ClosingActiveKind::AlreadyReady {
+                *task_state.ready_trigger.lock().unwrap() = Some(ReadyClosingTrigger::Input {
+                    input,
+                    partial: false,
+                });
                 task_state.gate.add_permits(1);
+            } else {
+                input.shutdown().await.unwrap();
             }
-            input.shutdown().await.unwrap();
         }
         ClosingSource::PendingAfterPrefix => {
             if active_kind == ClosingActiveKind::AlreadyReady {
