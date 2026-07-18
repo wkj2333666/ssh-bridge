@@ -11,6 +11,7 @@ use crate::ssh::{FixedOperationKind, FixedRunRequest};
 use super::protocol::{context, nul_fields, parse_u64, read_small_stream, utf8};
 use super::{
     ApplyPatchRequest, ApplyPatchResult, RemoteBridge, RemoteContext, WriteEncoding, WriteMode,
+    attach_fixed_result_context,
 };
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -1086,6 +1087,7 @@ async fn snapshot_file(
         result.capability.physical_root.clone(),
         &result.shell,
     );
+    let attach = |error| attach_fixed_result_context(error, host, &result);
     let stderr = read_small_stream(&result.output, StreamKind::Stderr, SNAPSHOT_PROTOCOL_BYTES)
         .await
         .map_err(|error| {
@@ -1094,7 +1096,8 @@ async fn snapshot_file(
             } else {
                 error
             }
-        })?;
+        })
+        .map_err(&attach)?;
     let stdout = read_small_stream(&result.output, StreamKind::Stdout, snapshot_read_limit)
         .await
         .map_err(|error| {
@@ -1103,8 +1106,9 @@ async fn snapshot_file(
             } else {
                 error
             }
-        })?;
-    let snapshot = parse_snapshot_protocol(&stderr, stdout, snapshot_maximum)?;
+        })
+        .map_err(&attach)?;
+    let snapshot = parse_snapshot_protocol(&stderr, stdout, snapshot_maximum).map_err(&attach)?;
     drop(owner);
     Ok((snapshot, operation_context))
 }

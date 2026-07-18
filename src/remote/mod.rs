@@ -9,7 +9,9 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EffectiveLimits};
-use crate::error::{BridgeError, BridgeResult, ErrorCode};
+use crate::error::{
+    BridgeError, BridgeResult, ErrorCode, ErrorShellMetadata, attach_available_remote_context,
+};
 use crate::output::StreamKind;
 use crate::path::RemotePath;
 use crate::ssh::{FixedRunRequest, FixedRunResult, SshRunner};
@@ -39,6 +41,31 @@ const MAX_LINES: u64 = 100_000;
 
 pub struct RemoteBridge {
     runner: Arc<SshRunner>,
+}
+
+fn attach_fixed_result_context(
+    mut error: BridgeError,
+    host: &str,
+    result: &FixedRunResult,
+) -> BridgeError {
+    let metadata = protocol::shell_selection_metadata(&result.shell);
+    let shell = ErrorShellMetadata {
+        kind: match metadata.kind {
+            ShellName::Bash => "bash",
+            ShellName::Sh => "sh",
+            ShellName::Login => "login",
+        }
+        .to_owned(),
+        version: metadata.version,
+        fallback: metadata.fallback,
+    };
+    attach_available_remote_context(
+        &mut error,
+        Some(host),
+        Some(&result.capability.physical_root),
+        Some(&shell),
+    );
+    error
 }
 
 impl RemoteBridge {
@@ -163,7 +190,10 @@ impl RemoteBridge {
             .runner
             .execute_fixed_once(request.clone(), cancel.clone())
             .await?;
-        match protocol::capability_mismatch(&first, request.required_capabilities).await? {
+        let first_mismatch = protocol::capability_mismatch(&first, request.required_capabilities)
+            .await
+            .map_err(|error| attach_fixed_result_context(error, &request.host, &first))?;
+        match first_mismatch {
             None => Ok(first),
             Some(_) => {
                 self.runner.invalidate_capability(&request.host).await;
@@ -171,12 +201,22 @@ impl RemoteBridge {
                     .runner
                     .execute_fixed_once(request.clone(), cancel)
                     .await?;
-                match protocol::capability_mismatch(&second, request.required_capabilities).await? {
+                let second_mismatch =
+                    protocol::capability_mismatch(&second, request.required_capabilities)
+                        .await
+                        .map_err(|error| {
+                            attach_fixed_result_context(error, &request.host, &second)
+                        })?;
+                match second_mismatch {
                     None => Ok(second),
-                    Some(_) => Err(BridgeError::new(
-                        ErrorCode::RemoteCapabilityMissing,
-                        "remote read capability remained unavailable after reprobe",
-                        false,
+                    Some(_) => Err(attach_fixed_result_context(
+                        BridgeError::new(
+                            ErrorCode::RemoteCapabilityMissing,
+                            "remote read capability remained unavailable after reprobe",
+                            false,
+                        ),
+                        &request.host,
+                        &second,
                     )),
                 }
             }
@@ -462,6 +502,30 @@ pub enum WriteEncoding {
     Base64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunShell {
+    Auto,
+    Bash,
+    Sh,
+    Login,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStdin {
+    pub encoding: WriteEncoding,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRunRequest {
+    pub host: String,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub shell: RunShell,
+    pub timeout_ms: Option<u64>,
+    pub stdin: Option<RunStdin>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteMode {
     Create,
@@ -543,6 +607,28 @@ pub enum ValueEncoding {
 pub struct EncodedValue {
     pub encoding: ValueEncoding,
     pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EncodedOutputPreview {
+    pub head: EncodedValue,
+    pub tail: EncodedValue,
+    pub raw_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteRunResult {
+    #[serde(flatten)]
+    pub context: RemoteContext,
+    pub exit_status: i32,
+    pub elapsed_ms: u64,
+    pub stdout: EncodedOutputPreview,
+    pub stderr: EncodedOutputPreview,
+    pub aggregate_bytes: u64,
+    pub output_ref: Option<String>,
+    pub remote_process_may_continue: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

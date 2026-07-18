@@ -11,7 +11,10 @@ use super::protocol::{
     context, encode_bytes, entry_error, nul_fields, parse_u64, protocol_error, read_small_stream,
     utf8,
 };
-use super::{EntryError, EntryErrorCode, ReadEntry, ReadResult, RemoteBridge, ResolvedRead};
+use super::{
+    EntryError, EntryErrorCode, ReadEntry, ReadResult, RemoteBridge, ResolvedRead,
+    attach_fixed_result_context,
+};
 
 const READ_SCRIPT: &str = r#"
 path=$1
@@ -129,13 +132,16 @@ pub(super) async fn read(
                 &result.shell,
             ));
         }
-        let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
-        let fields = nul_fields(&stderr)?;
+        let attach = |error| attach_fixed_result_context(error, &request.host, &result);
+        let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024)
+            .await
+            .map_err(&attach)?;
+        let fields = nul_fields(&stderr).map_err(&attach)?;
         let actual_path = encode_bytes(path.absolute().as_bytes());
         let relative_path = encode_bytes(path.relative().as_bytes());
         if fields.first() != Some(&b"OK".as_slice()) {
             if fields.len() != 1 {
-                return Err(protocol_error("read error record is invalid"));
+                return Err(attach(protocol_error("read error record is invalid")));
             }
             files.push(ReadEntry::Error {
                 actual_path,
@@ -143,27 +149,32 @@ pub(super) async fn read(
                 error: entry_error(
                     fields
                         .first()
-                        .ok_or_else(|| protocol_error("read metadata is missing"))?,
-                )?,
+                        .ok_or_else(|| protocol_error("read metadata is missing"))
+                        .map_err(&attach)?,
+                )
+                .map_err(&attach)?,
             });
             continue;
         }
         if fields.len() != 5 {
-            return Err(protocol_error("read metadata field count is invalid"));
+            return Err(attach(protocol_error(
+                "read metadata field count is invalid",
+            )));
         }
-        let size = parse_u64(fields[1])?;
-        let total_lines = parse_u64(fields[2])?;
-        let hash1 = utf8(fields[3])?;
-        let hash2 = utf8(fields[4])?;
+        let size = parse_u64(fields[1]).map_err(&attach)?;
+        let total_lines = parse_u64(fields[2]).map_err(&attach)?;
+        let hash1 = utf8(fields[3]).map_err(&attach)?;
+        let hash2 = utf8(fields[4]).map_err(&attach)?;
         if !valid_hash(hash1) || !valid_hash(hash2) {
-            return Err(protocol_error("read hash is invalid"));
+            return Err(attach(protocol_error("read hash is invalid")));
         }
         let stdout = read_small_stream(
             &result.output,
             StreamKind::Stdout,
             remaining.saturating_add(1),
         )
-        .await?;
+        .await
+        .map_err(&attach)?;
         if hash1 != hash2 {
             let conflict = crate::error::BridgeError::read_conflict();
             debug_assert_eq!(conflict.code, crate::error::ErrorCode::ReadConflict);
@@ -194,7 +205,8 @@ pub(super) async fn read(
         remaining -= retained.len();
         returned_raw_bytes = returned_raw_bytes
             .checked_add(retained.len() as u64)
-            .ok_or_else(|| protocol_error("read byte count overflowed"))?;
+            .ok_or_else(|| protocol_error("read byte count overflowed"))
+            .map_err(&attach)?;
         files.push(ReadEntry::Success {
             actual_path,
             relative_path,
