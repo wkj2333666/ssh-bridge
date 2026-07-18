@@ -198,9 +198,16 @@ mod tests {
             .env(CHILD_ENV, "1")
             .output()
             .unwrap();
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{stdout}");
+        eprint!("{stderr}");
         assert!(output.status.success(), "fresh Base64 RSS child failed");
+        assert!(
+            stdout.contains("Base64 admission release RSS:")
+                || stderr.contains("Base64 admission release RSS:"),
+            "fresh Base64 RSS child did not run the requested test"
+        );
     }
 
     fn base64_admission_rss_child() {
