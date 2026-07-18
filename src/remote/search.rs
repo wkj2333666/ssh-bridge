@@ -12,7 +12,10 @@ use crate::output::{InternalSpoolOwner, StreamKind};
 use crate::ssh::{FixedOperationKind, FixedRunRequest, render_fixed_command};
 
 use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
-use super::{RemoteBridge, ResolvedSearch, SearchEngine, SearchMatch, SearchResult, compile_glob};
+use super::{
+    RemoteBridge, ResolvedSearch, SearchEngine, SearchMatch, SearchResult,
+    attach_fixed_result_context, compile_glob,
+};
 
 macro_rules! bounded_sentinel {
     () => {
@@ -266,21 +269,27 @@ pub(super) async fn search(
             cancel.clone(),
         )
         .await?;
-    let stderr = read_small_stream(&candidates_result.output, StreamKind::Stderr, 1024).await?;
+    let attach_candidates =
+        |error| attach_fixed_result_context(error, &request.host, &candidates_result);
+    let stderr = read_small_stream(&candidates_result.output, StreamKind::Stderr, 1024)
+        .await
+        .map_err(&attach_candidates)?;
     let candidate_capped = stderr == b"CAPPED\0";
     if !stderr.is_empty() && !candidate_capped {
-        return match stderr.as_slice() {
-            b"NOT_FOUND\0" => Err(BridgeError::not_found()),
-            b"PERMISSION_DENIED\0" => Err(BridgeError::permission_denied()),
-            b"NOT_DIRECTORY\0" => Err(BridgeError::not_directory()),
-            _ => Err(protocol_error("search candidate control record is invalid")),
+        let error = match stderr.as_slice() {
+            b"NOT_FOUND\0" => BridgeError::not_found(),
+            b"PERMISSION_DENIED\0" => BridgeError::permission_denied(),
+            b"NOT_DIRECTORY\0" => BridgeError::not_directory(),
+            _ => protocol_error("search candidate control record is invalid"),
         };
+        return Err(attach_candidates(error));
     }
     let mut cursor = SpoolCursor::new(
         &candidates_result.output,
         StreamKind::Stdout,
         limits.max_frame_bytes + 1,
-    )?;
+    )
+    .map_err(&attach_candidates)?;
     let mut builder = GlobSetBuilder::new();
     for glob in &request.globs {
         builder.add(compile_glob(glob)?);
@@ -293,18 +302,27 @@ pub(super) async fn search(
     let mut candidate_count = 0usize;
     loop {
         let path = if candidate_capped {
-            cursor.next_field_capped(limits.max_frame_bytes).await?
+            cursor
+                .next_field_capped(limits.max_frame_bytes)
+                .await
+                .map_err(&attach_candidates)?
         } else {
-            cursor.next_field(limits.max_frame_bytes).await?
+            cursor
+                .next_field(limits.max_frame_bytes)
+                .await
+                .map_err(&attach_candidates)?
         };
         let Some(path) = path else { break };
         if path.is_empty() {
-            return Err(protocol_error("search candidate path is empty"));
+            return Err(attach_candidates(protocol_error(
+                "search candidate path is empty",
+            )));
         }
         candidate_count = candidate_count
             .checked_add(1)
-            .ok_or_else(|| protocol_error("search candidate count overflowed"))?;
-        let relative = relative(configured_root, &path)?;
+            .ok_or_else(|| protocol_error("search candidate count overflowed"))
+            .map_err(&attach_candidates)?;
+        let relative = relative(configured_root, &path).map_err(&attach_candidates)?;
         if candidates.len() < 10_001
             && (request.globs.is_empty()
                 || globs.is_match(Path::new(&OsString::from_vec(relative.to_vec()))))
@@ -313,7 +331,9 @@ pub(super) async fn search(
         }
     }
     if candidate_capped && cursor.discarded_incomplete() && candidate_count == 0 {
-        return Err(protocol_error("search candidate record is oversized"));
+        return Err(attach_candidates(protocol_error(
+            "search candidate record is oversized",
+        )));
     }
     candidates.sort_by(|left, right| {
         relative(configured_root, left)
@@ -324,11 +344,11 @@ pub(super) async fn search(
     candidates.truncate(10_000);
     let rg = candidates_result.capability.tools.get("rg_json") == Some(&true);
     if request.binary && !rg {
-        return Err(BridgeError::new(
+        return Err(attach_candidates(BridgeError::new(
             ErrorCode::RemoteCapabilityMissing,
             "binary search requires remote rg JSON support",
             false,
-        ));
+        )));
     }
     let engine = if rg {
         SearchEngine::Rg
@@ -407,16 +427,22 @@ pub(super) async fn search(
             cancel,
         )
         .await?;
-    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024).await?;
+    let attach_engine = |error| attach_fixed_result_context(error, &request.host, &result);
+    let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024)
+        .await
+        .map_err(&attach_engine)?;
     let content_capped = stderr == b"CAPPED\0";
     if !stderr.is_empty() && !content_capped {
-        return Err(protocol_error("search engine control record is invalid"));
+        return Err(attach_engine(protocol_error(
+            "search engine control record is invalid",
+        )));
     }
     let mut cursor = SpoolCursor::new(
         &result.output,
         StreamKind::Stdout,
         limits.max_frame_bytes + 1,
-    )?;
+    )
+    .map_err(&attach_engine)?;
     let (mut matches, result_lookahead) = if rg {
         parse_rg(
             &mut cursor,
@@ -425,7 +451,8 @@ pub(super) async fn search(
             request.max_results.saturating_add(1),
             limits.max_frame_bytes,
         )
-        .await?
+        .await
+        .map_err(&attach_engine)?
     } else {
         parse_grep(
             &mut cursor,
@@ -435,7 +462,8 @@ pub(super) async fn search(
             request.max_results.saturating_add(1),
             limits.max_frame_bytes,
         )
-        .await?
+        .await
+        .map_err(&attach_engine)?
     };
     matches.sort_by(|left, right| {
         decoded_path(&left.relative_path)

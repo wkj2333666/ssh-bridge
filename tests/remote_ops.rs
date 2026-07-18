@@ -293,6 +293,163 @@ async fn task78_domain_error_remote_context_is_attached_after_fixed_exit_zero() 
     assert_task78_fixed_context(&patch_error, patch_root.path());
 }
 
+#[tokio::test]
+async fn task78_metadata_and_candidate_search_malicious_exit_zero_errors_keep_context() {
+    let list_root = tempfile::TempDir::new().unwrap();
+    std::fs::write(list_root.path().join("entry"), b"x").unwrap();
+    let (_runtime, _runner, list_bridge) = fixture_with_options(
+        list_root.path(),
+        false,
+        None,
+        &[("FAKE_SSH_LOCAL_FIXED_POST", OsString::from("stderr"))],
+    );
+    let list_error = list_bridge
+        .list(
+            ListRequest {
+                host: "dev".to_owned(),
+                path: None,
+                depth: None,
+                include_hidden: None,
+                max_entries: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(list_error.code, ErrorCode::ProtocolError);
+    assert_task78_fixed_context(&list_error, list_root.path());
+
+    let stat_root = tempfile::TempDir::new().unwrap();
+    std::fs::write(stat_root.path().join("entry"), b"x").unwrap();
+    let (_runtime, _runner, stat_bridge) = fixture_with_options(
+        stat_root.path(),
+        false,
+        None,
+        &[("FAKE_SSH_LOCAL_FIXED_POST", OsString::from("stderr"))],
+    );
+    let stat_error = stat_bridge
+        .stat(
+            StatRequest {
+                host: "dev".to_owned(),
+                paths: vec!["entry".to_owned()],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stat_error.code, ErrorCode::ProtocolError);
+    assert_task78_fixed_context(&stat_error, stat_root.path());
+
+    let candidate_root = tempfile::TempDir::new().unwrap();
+    std::fs::write(candidate_root.path().join("entry"), b"needle\n").unwrap();
+    let (_runtime, _runner, candidate_bridge) = fixture_with_options(
+        candidate_root.path(),
+        false,
+        None,
+        &[("FAKE_SSH_LOCAL_FIXED_POST", OsString::from("stderr"))],
+    );
+    let candidate_error = candidate_bridge
+        .search(
+            SearchRequest {
+                host: "dev".to_owned(),
+                query: "needle".to_owned(),
+                path: None,
+                globs: Vec::new(),
+                max_results: None,
+                binary: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(candidate_error.code, ErrorCode::ProtocolError);
+    assert_task78_fixed_context(&candidate_error, candidate_root.path());
+}
+
+#[tokio::test]
+async fn task78_search_engine_malicious_exit_zero_cursor_error_keeps_context() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let target = remote.path().join("entry");
+    std::fs::write(&target, b"needle\n").unwrap();
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("grep"),
+        format!(
+            "#!/bin/sh\nlast=\nfor last do :; done\ncase \" $* \" in *\" -- needle \"*) if [ \"$last\" = {} ]; then printf 'BROKEN\\n'; exit 0; fi;; esac\nexec /usr/bin/grep \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(target.to_str().unwrap()).unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) =
+        fixture_with_options(remote.path(), false, None, &[("PATH", path)]);
+    let error = bridge
+        .search(
+            SearchRequest {
+                host: "dev".to_owned(),
+                query: "needle".to_owned(),
+                path: None,
+                globs: Vec::new(),
+                max_results: None,
+                binary: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProtocolError);
+    assert_task78_fixed_context(&error, remote.path());
+}
+
+#[tokio::test]
+async fn task78_patch_mutation_result_corruption_keeps_context_and_progress_truth() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("ln"),
+        "#!/bin/sh\ncase \" $* \" in *\" ./malformed\"*) /usr/bin/ln \"$@\"; status=$?; printf GARBAGE; exit \"$status\";; esac\nexec /usr/bin/ln \"$@\"\n",
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) =
+        fixture_with_options(remote.path(), false, None, &[("PATH", path)]);
+    let error = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: concat!(
+                    "--- /dev/null\n+++ b/malformed\n@@ -0,0 +1 @@\n+first\n",
+                    "--- /dev/null\n+++ b/later\n@@ -0,0 +1 @@\n+second\n",
+                )
+                .to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+    assert_eq!(error.details.failed_path.as_deref(), Some("malformed"));
+    assert_eq!(error.details.changed_paths, Some(Vec::new()));
+    assert_eq!(
+        error.details.outcome_unknown_paths,
+        Some(vec!["malformed".to_owned()])
+    );
+    assert_eq!(
+        error.details.not_changed_paths,
+        Some(vec!["later".to_owned()])
+    );
+    assert_task78_fixed_context(&error, remote.path());
+    assert_eq!(
+        std::fs::read(remote.path().join("malformed")).unwrap(),
+        b"first\n"
+    );
+    assert!(!remote.path().join("later").exists());
+}
+
 fn metadata() -> RemoteMetadata {
     RemoteMetadata {
         kind: RemoteFileKind::File,
@@ -1327,6 +1484,7 @@ async fn task6_preparation_preflights_every_future_mutation_frame_before_first_m
         Some(vec!["first".to_owned(), "second".to_owned()])
     );
     assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+    assert_task78_fixed_context(&error, remote.path());
     assert_eq!(phase_log(&phases), ["S", "S"]);
     assert!(!remote.path().join("first").exists());
     assert!(!remote.path().join("second").exists());
@@ -1718,6 +1876,7 @@ async fn task6_second_snapshot_reprobe_physical_root_drift_is_zero_mutation_conf
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::ReadConflict);
     assert_eq!(error.details.failed_path.as_deref(), Some("b"));
+    assert_task78_fixed_context(&error, &second_root);
     assert_eq!(phase_log(&phases), ["S", "S", "S"]);
     assert_eq!(std::fs::read(first_root.join("a")).unwrap(), b"old\n");
     assert_eq!(std::fs::read(second_root.join("b")).unwrap(), b"old\n");
@@ -2067,6 +2226,7 @@ async fn task6_assert_post_snapshot_context_drift_is_unknown(delete: bool) {
         error.details.outcome_unknown_paths,
         Some(vec!["target".to_owned()])
     );
+    assert_task78_fixed_context(&error, &second_root);
     assert_eq!(phase_log(&phases), ["S", "M"]);
     assert_eq!(ssh_call_count(&ssh_log, "P"), 2);
     assert_eq!(std::fs::read(first_root.join("target")).unwrap(), b"old\n");
@@ -2185,6 +2345,7 @@ async fn task6_postspawn_cancel_on_second_mutation_marks_only_current_unknown_an
         error.details.outcome_unknown_paths,
         Some(vec!["b".to_owned()])
     );
+    assert_task78_fixed_context(&error, remote.path());
     assert_eq!(phase_log(&phases), ["S", "S", "S", "M", "M"]);
     assert_eq!(std::fs::read(remote.path().join("a")).unwrap(), b"first\n");
     assert!(!remote.path().join("c").exists());
@@ -4187,6 +4348,48 @@ async fn output_read_requires_and_uses_command_provenance() {
     assert_eq!(page.context.host, "dev");
     assert_eq!(page.data.encoding, ValueEncoding::Base64);
     assert_eq!(page.next_offset, 16);
+
+    let offset_error = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref: reference.as_str().into(),
+                stream: StreamKind::Stdout,
+                offset: 300_001,
+                max_bytes: 16,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(offset_error.code, ErrorCode::InvalidArgument);
+    assert_eq!(offset_error.details.host.as_deref(), Some("dev"));
+    assert_eq!(
+        offset_error.details.physical_root.as_deref(),
+        remote.path().to_str()
+    );
+    assert!(offset_error.details.shell.is_some());
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let cancel_error = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref: reference.as_str().into(),
+                stream: StreamKind::Stdout,
+                offset: 0,
+                max_bytes: 16,
+            },
+            cancel,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(cancel_error.code, ErrorCode::Cancelled);
+    assert_eq!(cancel_error.details.host.as_deref(), Some("dev"));
+    assert_eq!(
+        cancel_error.details.physical_root.as_deref(),
+        remote.path().to_str()
+    );
+    assert!(cancel_error.details.shell.is_some());
 }
 
 #[tokio::test]

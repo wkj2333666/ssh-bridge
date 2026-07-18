@@ -573,6 +573,65 @@ fn task78_physical_root_byte_bound_bash_version_and_spoofed_values_are_enforced(
     assert_eq!(capability.bash_version.as_deref(), Some(spoofed));
 }
 
+#[tokio::test]
+async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() {
+    let root = format!("/{}a", "é".repeat(32_767));
+    let version = format!("{}aa", "é".repeat(127));
+    assert_eq!(root.len(), 65_536);
+    assert_eq!(version.len(), 256);
+
+    let base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let log = base.path().join("cache.log");
+    let environment = BTreeMap::from([
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("echo-command"),
+        ),
+        (OsString::from("FAKE_SSH_ROOT"), OsString::from(&root)),
+        (OsString::from("FAKE_SSH_SHELL"), OsString::from("bash")),
+        (
+            OsString::from("FAKE_SSH_BASH_VERSION"),
+            OsString::from(&version),
+        ),
+        (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
+    ]);
+    let runner = SshRunner::with_executable(
+        Arc::new(config_with_host("dev", &root)),
+        runtime,
+        store,
+        fake_ssh_path(),
+        environment,
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let result = runner
+            .execute(
+                request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.physical_root, root);
+        assert_eq!(
+            result.shell.shell,
+            ShellKind::Bash {
+                version: version.clone()
+            }
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "P")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_cache_callers_share_one_probe_and_one_capability() {
     let cache = Arc::new(CapabilityCache::default());

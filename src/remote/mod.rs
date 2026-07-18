@@ -44,11 +44,20 @@ pub struct RemoteBridge {
 }
 
 fn attach_fixed_result_context(
-    mut error: BridgeError,
+    error: BridgeError,
     host: &str,
     result: &FixedRunResult,
 ) -> BridgeError {
-    let metadata = protocol::shell_selection_metadata(&result.shell);
+    attach_shell_selection_context(error, host, &result.capability.physical_root, &result.shell)
+}
+
+fn attach_shell_selection_context(
+    mut error: BridgeError,
+    host: &str,
+    physical_root: &str,
+    shell: &crate::capability::ShellSelection,
+) -> BridgeError {
+    let metadata = protocol::shell_selection_metadata(shell);
     let shell = ErrorShellMetadata {
         kind: match metadata.kind {
             ShellName::Bash => "bash",
@@ -59,10 +68,25 @@ fn attach_fixed_result_context(
         version: metadata.version,
         fallback: metadata.fallback,
     };
+    attach_available_remote_context(&mut error, Some(host), Some(physical_root), Some(&shell));
+    error
+}
+
+fn attach_remote_context(mut error: BridgeError, context: &RemoteContext) -> BridgeError {
+    let shell = ErrorShellMetadata {
+        kind: match context.shell.kind {
+            ShellName::Bash => "bash",
+            ShellName::Sh => "sh",
+            ShellName::Login => "login",
+        }
+        .to_owned(),
+        version: context.shell.version.clone(),
+        fallback: context.shell.fallback,
+    };
     attach_available_remote_context(
         &mut error,
-        Some(host),
-        Some(&result.capability.physical_root),
+        Some(&context.host),
+        Some(&context.physical_root),
         Some(&shell),
     );
     error
@@ -162,17 +186,18 @@ impl RemoteBridge {
     ) -> BridgeResult<OutputReadResult> {
         let reference = crate::output::OutputReference::parse(&request.output_ref)?;
         let provenance = self.runner.output_provenance(&reference).await?;
+        let context = RemoteContext {
+            remote: true,
+            host: provenance.host,
+            physical_root: provenance.physical_root,
+            shell: protocol::shell_selection_metadata(&provenance.shell),
+        };
         let page = tokio::select! { biased;
-            () = cancel.cancelled() => return Err(BridgeError::new(ErrorCode::Cancelled, "output read was cancelled", false)),
-            page = self.runner.read_output(&reference, request.stream, request.offset, request.max_bytes) => page?,
+            () = cancel.cancelled() => return Err(attach_remote_context(BridgeError::new(ErrorCode::Cancelled, "output read was cancelled", false), &context)),
+            page = self.runner.read_output(&reference, request.stream, request.offset, request.max_bytes) => page.map_err(|error| attach_remote_context(error, &context))?,
         };
         Ok(OutputReadResult {
-            context: RemoteContext {
-                remote: true,
-                host: provenance.host,
-                physical_root: provenance.physical_root,
-                shell: protocol::shell_selection_metadata(&provenance.shell),
-            },
+            context,
             stream: request.stream,
             offset: page.offset,
             next_offset: page.next_offset,

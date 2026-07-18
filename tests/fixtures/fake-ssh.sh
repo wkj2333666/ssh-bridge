@@ -136,7 +136,7 @@ case "$remote_command" in
         fake_shell=${FAKE_SSH_SHELL:-sh}
         fake_timeout=${FAKE_SSH_HAS_TIMEOUT:-0}
         if [ "$fake_shell" = bash ]; then
-            bash_version=5.2.15
+            bash_version=${FAKE_SSH_BASH_VERSION:-5.2.15}
         else
             bash_version=
         fi

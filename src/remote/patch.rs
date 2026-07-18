@@ -11,7 +11,7 @@ use crate::ssh::{FixedOperationKind, FixedRunRequest};
 use super::protocol::{context, nul_fields, parse_u64, read_small_stream, utf8};
 use super::{
     ApplyPatchRequest, ApplyPatchResult, RemoteBridge, RemoteContext, WriteEncoding, WriteMode,
-    attach_fixed_result_context,
+    attach_fixed_result_context, attach_remote_context,
 };
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -1266,6 +1266,15 @@ fn attach_mutation_progress(
     error
 }
 
+fn attach_mutation_progress_context(
+    error: BridgeError,
+    current: usize,
+    all_paths: &[String],
+    context: &RemoteContext,
+) -> BridgeError {
+    attach_remote_context(attach_mutation_progress(error, current, all_paths), context)
+}
+
 pub(super) async fn apply_patch(
     bridge: &RemoteBridge,
     request: ApplyPatchRequest,
@@ -1299,11 +1308,15 @@ pub(super) async fn apply_patch(
     let mut operation_context: Option<RemoteContext> = None;
     for file in &resolved {
         if cancel.is_cancelled() {
-            return Err(attach_preparation_progress(
+            let error = attach_preparation_progress(
                 BridgeError::new(ErrorCode::Cancelled, "remote patch was cancelled", false),
                 None,
                 &all_paths,
-            ));
+            );
+            return Err(match &operation_context {
+                Some(context) => attach_remote_context(error, context),
+                None => error,
+            });
         }
         let (snapshot, snapshot_context) =
             snapshot_file(bridge, &host, file, remaining_base_bytes, cancel.clone())
@@ -1315,46 +1328,63 @@ pub(super) async fn apply_patch(
             if context.host != snapshot_context.host
                 || context.physical_root != snapshot_context.physical_root
             {
-                return Err(attach_preparation_progress(
-                    BridgeError::read_conflict(),
-                    Some(&file.patch.path),
-                    &all_paths,
+                return Err(attach_remote_context(
+                    attach_preparation_progress(
+                        BridgeError::read_conflict(),
+                        Some(&file.patch.path),
+                        &all_paths,
+                    ),
+                    &snapshot_context,
                 ));
             }
         } else {
-            operation_context = Some(snapshot_context);
+            operation_context = Some(snapshot_context.clone());
         }
         if let FileSnapshot::Regular { bytes, .. } = &snapshot {
             remaining_base_bytes =
                 remaining_base_bytes
                     .checked_sub(bytes.len())
                     .ok_or_else(|| {
-                        attach_preparation_progress(
-                            patch_too_large("patch bases exceed the aggregate write limit"),
-                            Some(&file.patch.path),
-                            &all_paths,
+                        attach_remote_context(
+                            attach_preparation_progress(
+                                patch_too_large("patch bases exceed the aggregate write limit"),
+                                Some(&file.patch.path),
+                                &all_paths,
+                            ),
+                            &snapshot_context,
                         )
                     })?;
         }
         snapshots.push(snapshot);
     }
 
+    let operation_context = operation_context.ok_or_else(|| {
+        attach_preparation_progress(
+            invalid_patch("patch contains no file operations"),
+            None,
+            &all_paths,
+        )
+    })?;
+    let attach_after_snapshots = |error, failed_path: Option<String>| {
+        attach_remote_context(
+            attach_preparation_progress(error, failed_path.as_deref(), &all_paths),
+            &operation_context,
+        )
+    };
+
     let mut outputs = Vec::with_capacity(resolved.len());
     let mut remaining_output_bytes = maximum_bytes;
     for (file, snapshot) in resolved.into_iter().zip(snapshots) {
         let output = apply_file_patch(snapshot.base(), &file.patch, remaining_output_bytes)
-            .map_err(|error| {
-                attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
-            })?;
+            .map_err(|error| attach_after_snapshots(error, Some(file.patch.path.clone())))?;
         if let PatchedFile::Write(bytes) = &output {
             remaining_output_bytes =
                 remaining_output_bytes
                     .checked_sub(bytes.len())
                     .ok_or_else(|| {
-                        attach_preparation_progress(
+                        attach_after_snapshots(
                             patch_too_large("patch outputs exceed the aggregate write limit"),
-                            Some(&file.patch.path),
-                            &all_paths,
+                            Some(file.patch.path.clone()),
                         )
                     })?;
         }
@@ -1370,18 +1400,16 @@ pub(super) async fn apply_patch(
                     FilePatchOperation::Create => WriteMode::Create,
                     FilePatchOperation::Update => WriteMode::Replace { expected_sha256 },
                     FilePatchOperation::Delete => {
-                        return Err(attach_preparation_progress(
+                        return Err(attach_after_snapshots(
                             invalid_patch("patch delete produced a write frame"),
-                            Some(&file.patch.path),
-                            &all_paths,
+                            Some(file.patch.path.clone()),
                         ));
                     }
                 };
                 let content = String::from_utf8(bytes).map_err(|_| {
-                    attach_preparation_progress(
+                    attach_after_snapshots(
                         snapshot_protocol_error("prepared patch output is not UTF-8"),
-                        Some(&file.patch.path),
-                        &all_paths,
+                        Some(file.patch.path.clone()),
                     )
                 })?;
                 PreparedMutation::Write(Box::new(
@@ -1393,42 +1421,35 @@ pub(super) async fn apply_patch(
                         mode,
                     )
                     .map_err(|error| {
-                        attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
+                        attach_after_snapshots(error, Some(file.patch.path.clone()))
                     })?,
                 ))
             }
             PatchedFile::Delete => {
                 let expected_sha256 = expected_sha256.ok_or_else(|| {
-                    attach_preparation_progress(
+                    attach_after_snapshots(
                         write_conflict("patch delete has no regular base"),
-                        Some(&file.patch.path),
-                        &all_paths,
+                        Some(file.patch.path.clone()),
                     )
                 })?;
                 PreparedMutation::Delete(Box::new(
                     super::write::preflight_delete_resolved(bridge, file.path, expected_sha256)
                         .map_err(|error| {
-                            attach_preparation_progress(error, Some(&file.patch.path), &all_paths)
+                            attach_after_snapshots(error, Some(file.patch.path.clone()))
                         })?,
                 ))
             }
         };
         prepared_mutations.push(prepared);
     }
-    let operation_context = operation_context.ok_or_else(|| {
-        attach_preparation_progress(
-            invalid_patch("patch contains no file operations"),
-            None,
-            &all_paths,
-        )
-    })?;
     let mut changed_paths = Vec::with_capacity(prepared_mutations.len());
     for (index, prepared) in prepared_mutations.into_iter().enumerate() {
         if cancel.is_cancelled() {
-            return Err(attach_mutation_progress(
+            return Err(attach_mutation_progress_context(
                 BridgeError::new(ErrorCode::Cancelled, "remote patch was cancelled", false),
                 index,
                 &all_paths,
+                &operation_context,
             ));
         }
         let result = match prepared {
@@ -1448,14 +1469,22 @@ pub(super) async fn apply_patch(
                 if context.host != operation_context.host
                     || context.physical_root != operation_context.physical_root =>
             {
-                return Err(attach_mutation_progress(
+                return Err(attach_mutation_progress_context(
                     BridgeError::mutation_outcome_unknown(),
                     index,
                     &all_paths,
+                    &context,
                 ));
             }
             Ok(_) => changed_paths.push(all_paths[index].clone()),
-            Err(error) => return Err(attach_mutation_progress(error, index, &all_paths)),
+            Err(error) => {
+                return Err(attach_mutation_progress_context(
+                    error,
+                    index,
+                    &all_paths,
+                    &operation_context,
+                ));
+            }
         }
     }
     Ok(ApplyPatchResult {
@@ -1502,6 +1531,38 @@ mod tests {
         );
         assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
         assert_eq!(error.details.mutation_may_have_applied, None);
+    }
+
+    #[test]
+    fn task78_local_post_snapshot_cancel_retains_context_and_definite_suffix() {
+        let paths = ["a", "b", "c"].map(str::to_owned);
+        let context = super::RemoteContext {
+            remote: true,
+            host: "dev".to_owned(),
+            physical_root: "/srv/app".to_owned(),
+            shell: super::super::ShellMetadata {
+                kind: super::super::ShellName::Sh,
+                version: None,
+                fallback: false,
+            },
+        };
+        let error = super::attach_mutation_progress_context(
+            BridgeError::new(ErrorCode::Cancelled, "cancelled", false),
+            1,
+            &paths,
+            &context,
+        );
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.details.failed_path, None);
+        assert_eq!(error.details.changed_paths, Some(vec!["a".to_owned()]));
+        assert_eq!(
+            error.details.not_changed_paths,
+            Some(vec!["b".to_owned(), "c".to_owned()])
+        );
+        assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+        assert_eq!(error.details.host.as_deref(), Some("dev"));
+        assert_eq!(error.details.physical_root.as_deref(), Some("/srv/app"));
+        assert_eq!(error.details.shell.unwrap().kind, "sh");
     }
 
     #[test]
