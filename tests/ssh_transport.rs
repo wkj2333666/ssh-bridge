@@ -923,6 +923,16 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
         ),
         (
             "safe_write",
+            "stat",
+            "case \" $* \" in *\" --printf=%f:%u:%a:%s:%d:%i:%h\\n -- \"*codex-probe-safe-write*) line=$(/usr/bin/stat \"$@\") || exit $?; old_ifs=$IFS; IFS=:; set -- $line; IFS=$old_ifs; printf '%s:%s:%s:%s:123456789012345678901:123456789012345678901:%s\\n' \"$1\" \"$2\" \"$3\" \"$4\" \"$7\"; exit 0;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "stat",
+            "case \" $* \" in *\" --printf=%f:%u:%a:%s:%d:%i:%h\\n -- \"*codex-probe-safe-write/dd-link*) printf '8180:0:600:7:1:2:1\\n'; exit 0;; esac\nexec /usr/bin/stat \"$@\"\n",
+        ),
+        (
+            "safe_write",
             "id",
             "case \" $* \" in *\" -u \"*) exit 64;; esac\nexec /usr/bin/id \"$@\"\n",
         ),
@@ -950,6 +960,11 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
             "safe_write",
             "ln",
             "case \" $* \" in *codex-probe-safe-write*created*) exit 0;; esac\nexec /usr/bin/ln \"$@\"\n",
+        ),
+        (
+            "safe_write",
+            "ln",
+            "case \" $* \" in *\" -T -- \"*codex-probe-safe-write*directory-link*) shift 2; exec /usr/bin/ln -- \"$@\";; esac\nexec /usr/bin/ln \"$@\"\n",
         ),
         (
             "safe_write",

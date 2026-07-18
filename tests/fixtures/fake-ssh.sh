@@ -178,6 +178,13 @@ fi
 
 case "${FAKE_SSH_MODE:-echo-argv}" in
     local-fixed)
+        if [ -n "${FAKE_SSH_LOCAL_FIXED_PATH_ONCE:-}" ] &&
+           [ -n "${FAKE_SSH_LOCAL_FIXED_PATH_MARKER:-}" ] &&
+           [ ! -e "$FAKE_SSH_LOCAL_FIXED_PATH_MARKER" ]; then
+            : >"$FAKE_SSH_LOCAL_FIXED_PATH_MARKER"
+            PATH=$FAKE_SSH_LOCAL_FIXED_PATH_ONCE
+            export PATH
+        fi
         case "${FAKE_SSH_LOCAL_FIXED_POST:-}" in
             disconnect)
                 if /bin/sh -c "$remote_command" >/dev/null; then

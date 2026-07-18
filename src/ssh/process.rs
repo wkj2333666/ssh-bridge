@@ -1776,8 +1776,9 @@ mod tests {
         assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
 
         // A closed registration forces internal capture setup to fail after
-        // local spawn but before the fixture reaches its remote-command log.
-        // The pending spool is armed and unlinked on drop, and the configured
+        // local spawn. The child races that asynchronous setup and may reach
+        // the fixture log first, which is precisely why the mutation outcome
+        // is unknown. The pending spool is armed and unlinked on drop, and the
         // child remains kill-on-drop if any post-spawn pid/pipe invariant ever
         // fails before the wait task takes ownership.
         let setup_log = logs.path().join("capture-setup.log");
@@ -1805,7 +1806,7 @@ mod tests {
             .unwrap();
         assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
         assert_eq!(error.details.mutation_may_have_applied, Some(true));
-        assert_eq!(task5_call_count(&setup_log, "C"), 0);
+        assert!(task5_call_count(&setup_log, "C") <= 1);
         assert_eq!(task5_internal_spool_file_count(&fixture.runtime), 0);
     }
 }
