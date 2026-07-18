@@ -1012,6 +1012,7 @@ struct StubTools {
     definitions: Arc<Vec<ToolDefinition>>,
     synchronous_calls: Arc<AtomicUsize>,
     first_polls: Arc<AtomicUsize>,
+    bridge_ops: Arc<AtomicUsize>,
     observed_cancel: Arc<AtomicBool>,
     entered: Arc<AtomicBool>,
     entered_notify: Arc<Notify>,
@@ -1032,6 +1033,7 @@ impl ToolService for StubTools {
     ) -> ToolFuture {
         self.synchronous_calls.fetch_add(1, Ordering::SeqCst);
         let first_polls = Arc::clone(&self.first_polls);
+        let bridge_ops = Arc::clone(&self.bridge_ops);
         let observed_cancel = Arc::clone(&self.observed_cancel);
         let entered = Arc::clone(&self.entered);
         let entered_notify = Arc::clone(&self.entered_notify);
@@ -1043,6 +1045,7 @@ impl ToolService for StubTools {
             entered.store(true, Ordering::Release);
             entered_notify.notify_waiters();
             if name == "block" {
+                bridge_ops.fetch_add(1, Ordering::SeqCst);
                 tokio::select! {
                     () = context.cancel.cancelled() => {
                         observed_cancel.store(true, Ordering::SeqCst);
@@ -1055,7 +1058,10 @@ impl ToolService for StubTools {
             }
             if name == "echo" {
                 return match arguments.get("text").and_then(Value::as_str) {
-                    Some(text) => CallToolResult::text(text),
+                    Some(text) => {
+                        bridge_ops.fetch_add(1, Ordering::SeqCst);
+                        CallToolResult::text(text)
+                    }
                     None => CallToolResult::invalid_argument(
                         "provide arguments.text as a string",
                     ),
@@ -1070,7 +1076,8 @@ impl ToolService for StubTools {
 Use exact closed test definitions for `block` and `echo`; do not use the final
 nine-tool registry in protocol-core tests.
 The synchronous counter records `ToolService::call`; the first-poll counter
-records actual future admission. Separate gates prove whether a future was
+records actual future admission; `bridge_ops` records only valid work after
+known-tool argument decoding. Separate gates prove whether a future was
 only constructed or also consumed a slot and was first polled. Record the
 received `ToolCallContext`, compare both `WireBudget` fields exactly, cancel
 the recorded token from the test and observe the service's clone, then cancel
@@ -1099,8 +1106,8 @@ definitions and the Task 5 result-only fallback exactly zero, assert:
   `BridgeError::invalid_argument` messages containing no ID, definition, or
   serde text;
 - nominal 1 MiB succeeds whenever the exact tools/list frame fits it; and
-- a nonzero direct calculator case proves `required_mcp_frame_bytes` and every
-  `WireBudget::for_response` use the same unmodified result-only byte count.
+- accepted calls prove `McpServer` propagates its one stored Task 5 zero
+  result-only fallback unchanged into every per-ID `WireBudget`.
 
 Run `cargo test --test mcp_protocol task7_constructor_ -- --nocapture` and
 observe the expected compile failure because `McpServer` is absent.
@@ -1214,9 +1221,13 @@ frames and reads complete response lines. Cover:
 - notification-only `notifications/initialized` and
   `notifications/cancelled` with a valid nonduplicate ID returning fixed
   `-32600 Invalid Request` for that ID and producing no state/cancellation
-  effect (a duplicate legal ID follows the earlier global duplicate rule);
+  effect (an ID matching an active tool task follows the active-task duplicate
+  rule);
 - invalid params container types and extra JSON-RPC envelope keys; and
-- validation failures leaving the service counters and registry at zero.
+- malformed envelope, lifecycle, and unknown-name failures leaving
+  `synchronous_calls == 0`, `first_polls == 0`, and `bridge_ops == 0`; while a
+  known-tool invalid argument returns its normal error with
+  `synchronous_calls == 1`, `first_polls == 1`, and `bridge_ops == 0`.
 
 This Task 5 suite also counting-serializes initialize, ping, and every fixed
 protocol error with the maximum wire ID and proves each fits the compiled
@@ -1226,8 +1237,9 @@ exact value and rejects one byte less, and proves the nominal 1 MiB floor is
 accepted whenever tools/list does not exceed it. These production assertions
 were intentionally not claimed by Task 4. The stub also records the
 `ToolCallContext` and proves its `wire_budget.compact_fallback_bytes` is exactly
-the server's stored result-only value; a nonzero shared-calculator case proves
-constructor minimum and per-ID budget use the identical unmodified count.
+the server's stored zero result-only value. Task 5 does not claim nonzero server
+propagation: Task 7 replaces the initializer with the real nonzero fallback and
+owns that end-to-end constructor/per-ID propagation test.
 
 The initialize frame used by all positive tests is:
 
@@ -1247,7 +1259,7 @@ fixed `-32600` with `id=null` and is never notification-shaped. Request-only
 methods received as notifications are ignored with zero effect. Notification-
 only methods received as nonduplicate requests return the fixed invalid-request
 response for their trusted ID and have zero effect. A duplicate legal ID is
-handled earlier by the global duplicate rule. Malformed notifications never emit
+handled earlier only when it matches an active tool task. Malformed notifications never emit
 a response and never change state, cancel a token, invoke the service, or poll
 a future. Malformed requests with a trusted ID receive the method-appropriate
 fixed error.
@@ -1258,65 +1270,83 @@ does state advance to `AwaitInitialized`; only a valid ID-less initialized
 notification advances to `Ready`. Run `task7_lifecycle_` to GREEN before adding
 dispatch.
 
-Use a dependency-free conservative absolute-URI validator. Validate the UTF-8
-byte ceiling first; require ASCII only; reject whitespace, controls, backslash,
-and ASCII byte values `0x22, 0x3c, 0x3e, 0x5e, 0x60, 0x7b, 0x7c, 0x7d`
-(`"`, `<`, `>`, `^`, grave accent, `{`, `|`, `}`); require a scheme matching
-`[A-Za-z][A-Za-z0-9+.-]*`, a colon, and a
-nonempty suffix; admit only RFC 3986 unreserved, gen-delim, and sub-delim bytes
-after the colon; and require each percent sign to have exactly two hexadecimal
-digits. For `http` and `https`, require the suffix to begin `//`; define
-authority as the bytes after `//` through the first `/`, `?`, `#`, or end, and
-require that slice to be nonempty. For any URI with `//`, reject userinfo;
-validate a bracketed host by parsing its interior with
-`std::net::Ipv6Addr`; otherwise accept `std::net::Ipv4Addr` or a DNS-like host
-of nonempty at-most-63-byte labels containing only ASCII alphanumeric or
-interior `-`, with no leading/trailing `-` and total host length at most 253.
-If a dotted host contains only digits and dots, require successful IPv4 parse
-rather than accepting it as DNS-like text.
-An optional port follows the host as `:` plus one or more ASCII digits and must
-parse as `u16`; unbracketed IPv6, empty labels/host/port, and trailing authority
-junk are rejected. This scanner allocates no normalized URL and performs no
-name resolution. Tests
-accept `https://example.test/a`, `urn:example:test`, and `data:,hello`; reject a
-relative path, empty scheme/suffix, whitespace, control, backslash, non-ASCII,
-each explicitly forbidden ASCII byte, malformed percent escape, and empty
-HTTP(S) authority, userinfo, malformed IPv4/IPv6, empty/invalid DNS label,
-nonnumeric/empty/out-of-range port, and authority trailing junk at exact and +1
-byte bounds. Add accepted bracketed IPv6, IPv4, DNS, and port cases. No URI is
-fetched, reflected, or logged. November's method-field closure is an explicit project security
+Use a dependency-free, allocation-free RFC 3986 state machine. Validate the
+UTF-8 byte ceiling, ASCII-only requirement, forbidden whitespace/control/
+backslash, and ASCII bytes `0x22, 0x3c, 0x3e, 0x5e, 0x60, 0x7b, 0x7c, 0x7d`
+before scanning. States and transitions are exact:
+
+1. `scheme`: first byte ASCII alpha, then ASCII alphanumeric/`+-.`, terminated
+   by one required `:` with at least one following suffix byte; compare
+   HTTP/HTTPS ASCII-case-insensitively;
+2. `authority`: enter only when the two bytes immediately after `:` are `//`;
+   stop at the first `/`, `?`, `#`, or end. Internal `//` after path begins is
+   path data, never a late authority transition;
+3. `path`: scan RFC `pchar` or `/` until the first `?` or `#`; `[` and `]` are
+   illegal here;
+4. `query`: at most one transition on the first `?`, then scan `pchar`, `/`, or
+   `?` until `#` (later `?` is query data, not a second transition); and
+5. `fragment`: at most one transition on `#`, then scan `pchar`, `/`, or `?` to
+   end; a second `#` is illegal.
+
+In every component, `%` consumes exactly two following hexadecimal digits.
+`pchar` is precisely unreserved, sub-delims, `:`, or `@`; brackets are admitted
+only around an authority IPv6 host. HTTP/HTTPS, in any ASCII case, requires the
+immediate authority transition. For any authority reject userinfo; parse a
+bracketed host interior with `std::net::Ipv6Addr`; otherwise accept
+`std::net::Ipv4Addr` or DNS-like nonempty labels of at most 63 bytes and 253
+bytes total, with ASCII-alphanumeric edges and only interior `-`. A dotted
+digits-only host must parse as IPv4. An optional port is `:` plus nonempty ASCII
+digits parsed as `u16`; reject unbracketed IPv6, empty labels/host/port, and
+trailing authority junk. No state allocates a normalized URL or resolves a
+name.
+
+Tests accept lower/upper-case HTTPS, `urn:example:test`, `data:,hello`, internal
+path `//`, query data containing `?`, bracketed IPv6, IPv4, DNS, and ports.
+Reject relative/empty input, a second `#`, brackets in path, malformed percent
+escapes, forbidden bytes, non-ASCII, userinfo, malformed authority/IP/DNS/port,
+and exact-limit +1 input. No URI is fetched, reflected, or logged. November's
+method-field closure is an explicit project security
 policy layered on the supported protocol version, not a claim that the upstream
 schema mechanically enforces closure.
 
-- [ ] **Step 6: Add RED dispatch, duplicate-ID, saturation, panic, and ordering tests**
+- [ ] **Step 6: Add RED dispatch, active-task duplicate-ID, saturation, panic, and ordering tests**
 
-Start two gated calls and prove responses may complete out of request order
-with exact IDs and without line interleaving. With `max_inflight=2`, submit a
+Start a first `block` call and wait for its durable entered predicate. Then send
+a second immediate `echo`, read the echo response first, release the first
+call's semaphore, and read its response second. This deterministic test does
+not depend on semaphore waiter wake order and proves exact out-of-request-order
+IDs without line interleaving. With `max_inflight=2`, submit a
 third valid unique known-name request and assert fixed `-32000 Server busy`,
 `synchronous_calls == 2`, and `first_polls == 2`.
 
-Freeze duplicate in-flight ID as exactly:
+Freeze an ID matching an active tool task as exactly:
 
 ```json
 {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Duplicate request id"}}
 ```
 
 Numeric `1` and string `"1"` remain distinct. Validation priority is: strict
-JSON and envelope/legal ID; duplicate outstanding ID globally; lifecycle and
-method-params shape; known tool-name lookup; then saturation. Any repeated
-legal in-flight ID therefore gets the duplicate error with `id=null`, even if
-the second envelope has illegal params, is not currently lifecycle-valid, has
-an unknown name, or arrives while saturated. Null/fractional/object/oversized
-IDs are not legal duplicates: they receive fixed `-32600 Invalid Request` with
-`id=null`. The duplicate consumes no new slot, never calls or polls the service,
-never overwrites the original registry entry, and later cancellation still
-reaches the original call. Reuse is allowed only after the original has been
-fully removed on completion.
+JSON and envelope/legal ID; match against the active tool-task registry;
+lifecycle and method-params shape; known tool-name lookup; then saturation.
+Any legal ID matching an active tool task therefore gets the duplicate error
+with `id=null`, even if the second envelope has illegal params, is not currently
+lifecycle-valid, has an unknown name, or arrives while saturated. Null/
+fractional/object/oversized IDs are not legal duplicates: they receive fixed
+`-32600 Invalid Request` with `id=null`. The duplicate consumes no new slot,
+never calls or polls the service, never overwrites the active entry, and later
+cancellation still reaches the original task.
+
+The protection ends at task join/removal, before its response is queued. Gate a
+completion while the writer is backlogged, let the owner join/remove the task
+and enqueue its first response, then submit a second request with the same ID.
+Assert the second request is admitted and both responses may be queued in
+completion order. The lifecycle owner does not retain an ID merely because a
+response is waiting in the writer channel.
 
 Add services that panic synchronously inside `ToolService::call`, on first
 future poll, and after first poll. Assert one fixed `-32603 Internal error` for
 the correct request, no panic payload or caller data in the wire response or
-returned `BridgeError`, one-time
+returned `BridgeError` or bridge-authored diagnostics, one-time
 registry/slot release, continued service for other requests, and an empty
 registry after every success, error, panic, cancellation, and close. Verify
 this group RED with:
@@ -1330,15 +1360,24 @@ cargo test --test mcp_protocol task7_panic_ -- --nocapture
 Expected: failures identify missing dispatch/admission/panic behavior, not a
 fixture timeout.
 
+Task 5 does not install or replace a process-global panic hook. Rust's existing
+host-selected panic hook may write to stderr before unwind is caught; that
+runtime-owned behavior is outside the bridge diagnostic contract. Tests inspect
+only MCP output, returned errors, and diagnostics explicitly emitted by the
+bridge.
+
 - [ ] **Step 7: GREEN bounded panic-safe dispatch and admission**
 
 Call `service.call(...)` inside the spawned task so future-construction and
 poll panics both become `JoinError` instead of unwinding the owner. Maintain a
 task-ID-to-request-ID map driven by `JoinSet::join_next_with_id`, or an exactly
 equivalent panic-safe association, in addition to the request registry. Insert
-the registry entry and `try_acquire_owned` its permit before spawn; associate the
-returned task ID immediately. Every join path removes both maps and drops the
-permit exactly once. A missing association is an internal invariant failure
+the registry entry only after `try_acquire_owned` succeeds, and store that
+`OwnedSemaphorePermit` in the owner-held `InFlight`, never inside the task;
+then spawn and associate the returned task ID immediately. Every join path
+removes both maps and drops the owner-held permit exactly once. Closing clears
+remaining `InFlight` entries after abort/drain, so even a drain timeout cannot
+leak slots. A missing association is an internal invariant failure
 that enters Closing rather than guessing an ID.
 
 Use the one stored fallback count for exact per-ID `WireBudget`; pass both
@@ -1374,7 +1413,9 @@ already buffered/ready before the owner polls either. Assert cancellation wins,
 the call response is suppressed, and registry/slot are released. Then stream a
 bounded sequence of continuously ready notifications while one completion is
 ready and prove the completion is reaped within a fixed number of owner
-iterations. Run
+iterations. Add an idle-Ready server with an empty `JoinSet`: under a current-
+thread runtime, a timeout-wrapped sibling yield/heartbeat must progress and a
+later ping must succeed, proving the owner does not busy-loop on `None`. Run
 `cargo test --test mcp_protocol task7_cancellation_ -- --nocapture` and verify
 RED from missing shape/race behavior, not a timeout.
 
@@ -1386,6 +1427,7 @@ Maintain:
 struct InFlight {
     cancel: CancellationToken,
     cancelled_by_client: bool,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct CompletedCall {
@@ -1395,11 +1437,13 @@ struct CompletedCall {
 ```
 
 Use a biased select ordered writer-result first, input second, and tool
-completion third. The writer can therefore never be starved by input, while
-input still wins over a simultaneously ready tool completion. Immediately
-after every processed input
-frame, call `try_join_next_with_id` at most once and process that completion if
-present before selecting the next frame. This exact one-frame/one-try-reap rule
+completion third. Guard the join branch exactly with
+`if !join_set.is_empty()` because `join_next_with_id()` on an empty set returns
+`None` immediately and otherwise creates a busy loop. The writer can therefore
+never be starved by input, while input still wins over a simultaneously ready
+tool completion. Immediately after every processed input frame, check the same
+nonempty condition, call `try_join_next_with_id` at most once, and process that
+completion if present before selecting the next frame. This exact one-frame/one-try-reap rule
 preserves cancel-wins and prevents a continuously ready notification stream
 from starving completion cleanup.
 
@@ -1431,14 +1475,15 @@ Validate `tools/call.params` as containing required string `name`, object
 remain closed in both versions. Other top-level params follow June-open versus
 November-closed rules. Reject unnegotiated `task` fields.
 Reject an unknown name before spawn by checking `service.definitions()` after
-the duplicate-ID check and before saturation.
+the active-task ID check and before saturation.
 Compute `WireBudget::for_response(self.max_frame_bytes, &id,
 self.compact_fallback_result_bytes)` for that exact request ID and construct
 `ToolCallContext { cancel: token.clone(), wire_budget }`. Insert the ID/token
-before spawning and invoke `service.call` only inside the task. On completion,
-remove the task association and entry, release the slot, suppress output if
+before spawning and invoke `service.call` only inside the task. On join,
+remove the task association and active request entry and release the slot
+before attempting to queue any response. Then suppress output if
 `cancelled_by_client`, otherwise return the `CallToolResult` as the JSON-RPC
-result. Known-tool argument validation stays inside the normal result channel;
+result. A queued response retains no registry ID. Known-tool argument validation stays inside the normal result channel;
 only envelope/name validation can produce `-32602`.
 
 Validate version-specific `clientInfo` before changing state. Supported
@@ -1454,12 +1499,22 @@ GREEN before adding shutdown behavior.
 
 - [ ] **Step 10: Add RED EOF, writer-failure, backpressure, and shutdown tests**
 
-Use writer fixtures that fail the first write, write only one byte per poll,
-and remain pending forever. Monitor the writer task in the owner's main select,
+Use writer fixtures that fail the first write, fail after a controlled prefix,
+write one byte per successful poll, and remain pending forever after a prefix.
+Monitor the writer task in the owner's main select,
 not only during final shutdown. Test clean EOF, partial EOF, queue saturation,
 writer early return, writer panic, and a writer that never completes. For each,
 cover cooperative cancellation, a future that ignores its token, and a tool
 completion already ready in the `JoinSet` when Closing begins.
+
+For clean EOF, test zero calls plus cooperative and token-ignoring active calls:
+the server returns success whenever cancellation, bounded task reap/abort-drain,
+and writer drain/shutdown all finish healthily. Inject a task-drain or writer-
+shutdown failure and require fixed MCP transport failure. For partial EOF,
+assert fixed ProtocolError only after the parse-error control response has been
+healthily written and writer shutdown completes; a full/closed writer channel,
+later write error, shutdown error, or writer timeout takes precedence as fixed
+MCP transport failure.
 
 Freeze these assertions:
 
@@ -1472,7 +1527,12 @@ Freeze these assertions:
 - writer failure/backpressure sends no replacement to the broken writer,
   exposes no hostile `io::Error` text, and returns only fixed local
   `BridgeError::io("MCP transport failed")`;
-- complete JSON lines never interleave, including with the one-byte writer; and
+- serializer/capacity overflow is detected before the first transport write and
+  therefore emits zero bytes; a transport `write_all` error or writer abort may
+  leave a prefix of the current frame, so the connection closes immediately and
+  no later frame is attempted;
+- on a healthy successful transport, complete JSON lines never interleave,
+  including with the one-byte writer; and
 - all registries are empty and all slots are released after shutdown.
 
 Use MCP-specific constants, not SSH process constants:
@@ -1532,19 +1592,25 @@ non-retractable write start as the instant this check atomically commits to
 false for the dequeued message. A line past that commit cannot be retracted;
 the EOF race test therefore
 targets a completion simultaneously ready in the owner, which is never queued.
-Overflow closes the connection without a partial serialized line; the writer
-invents no semantic fallback. Every tool join/abort path removes both
+Serialization/capacity overflow occurs while building the capped buffer before
+the first transport write and therefore emits zero bytes. Once `write_all`
+starts, an I/O error or abort may leave the current frame prefix; immediately
+close the transport and never attempt the next queued frame. The writer invents
+no semantic fallback. Every tool join/abort path removes both
 associations and releases slots exactly once.
 
 For a valid cancellation, find the exact ID, set `cancelled_by_client=true`,
 and call `cancel.cancel()`. Ignore unknown/completed/malformed IDs and reasons.
 Do not cancel initialize.
 
-Clean EOF with no in-flight calls and a healthy writer returns success. If the
-partial-EOF parse-error `try_send` succeeds, finish cleanup and return fixed
+Clean EOF with or without active calls returns success exactly when token
+cancellation, bounded task reap/abort-drain, writer drain, and writer shutdown
+all complete healthily. Otherwise return fixed MCP transport failure. If the
+partial-EOF parse-error `try_send` succeeds and that control response is
+healthily drained through writer shutdown, return fixed
 `BridgeError::new(ErrorCode::ProtocolError, "partial MCP frame at EOF", false)`.
-If that send fails, record transport failure and return the fixed MCP transport
-error after cleanup.
+Any full/closed channel, later writer/write/shutdown error, writer timeout, or
+cleanup failure takes precedence and returns fixed MCP transport failure.
 Completion already ready at either EOF is globally suppressed once the
 transition reaches its cancel/suppress phase.
 

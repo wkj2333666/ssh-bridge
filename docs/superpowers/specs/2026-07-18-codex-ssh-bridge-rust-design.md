@@ -264,38 +264,51 @@ The MCP server implements a strict JSON-RPC 2.0 state machine for versions `2025
 Request/notification classification precedes side effects: request-only methods
 without IDs are ignored with zero effect, while nonduplicate ID-bearing
 initialized or cancelled methods receive fixed `-32600` and have zero effect;
-duplicate legal IDs follow the global duplicate rule. Cancellation
+legal IDs matching active tool tasks follow the active-task duplicate rule. Cancellation
 requires a bounded string/integer `requestId`; its optional reason is a bounded
 string and is never reflected. June discards other bounded cancellation fields,
 November rejects them, and unnegotiated `task` is always rejected. URI checks
-use a conservative ASCII RFC 3986 subset: valid scheme/nonempty suffix,
-complete percent escapes, no whitespace/control/backslash or ASCII
-`0x22,0x3c,0x3e,0x5e,0x60,0x7b,0x7c,0x7d`, and nonempty authority for HTTP(S).
-HTTP(S) authority is the slice after `//` through the first `/`, `?`, `#`, or
-end. Any `//` authority rejects userinfo; accepts bracketed `Ipv6Addr`, parsed
-IPv4, or bounded DNS-like labels; and admits only an optional decimal `u16`
-port. Empty/invalid hosts, labels, ports, unbracketed IPv6, and trailing junk
-fail without allocation or resolution. The bridge accepts bounded `https:`,
-`urn:`, and `data:` URIs but performs no normalization, fetch, reflection, or
-logging.
+use an allocation-free RFC 3986 state machine: bounded ASCII scheme (HTTP(S)
+case-insensitive), immediate `//` authority only, path, one query transition,
+and one fragment transition with component-specific character sets. `%` always
+consumes two hex digits; brackets are authority-IPv6-only; a second `#` fails;
+an internal path `//` is not authority. Authority rejects userinfo and accepts
+parsed IPv4/bracketed IPv6 or bounded DNS labels plus optional decimal `u16`
+port. The bridge tests mixed-case HTTPS and performs no normalization,
+resolution, fetch, reflection, or logging.
 
 Any present invalid/null/fractional/overlong ID is an invalid request with
 `id=null`, never a notification. Cancellation fully validates ID, reason,
 `_meta`, project-policy version closure, and rejected `task` before registry
 lookup or token trigger.
 
-Duplicate outstanding IDs return fixed `-32600 Duplicate request id` with
+IDs matching active tool tasks return fixed `-32600 Duplicate request id` with
 `id=null` after envelope/legal-ID validation but before lifecycle, params, name,
-and saturation; string and numeric IDs remain distinct and the original entry
-is never overwritten. Reuse is allowed after removal.
+and saturation; string and numeric IDs remain distinct and the active entry is
+never overwritten. The ID is removed at task join before response queuing, so
+reuse is allowed even while the earlier response remains writer-queued.
 `ToolService::call` runs inside the spawned task. A panic-safe task-ID/request-
 ID registry converts future-construction or polling panics to fixed `-32603`
 while active (or suppresses them after client cancellation/Closing) and releases
-the registry entry and slot exactly once.
+the registry entry and owner-held `OwnedSemaphorePermit` exactly once. The
+permit never moves into the task. Panic payloads remain absent from MCP wire,
+returned errors, and bridge-authored diagnostics; Task 5 installs no global
+panic hook.
 
 Malformed `tools/call` envelopes and unknown tool names return JSON-RPC `-32602`. Once a known tool is selected, argument-schema failures return a normal `CallToolResult` with `isError=true` and actionable compact-JSON text, without invoking the bridge. Bridge errors also use compact-JSON text containing every available remote/host/root/shell and safe warning/error field; structured content repeats only small metadata. Strict parsing rejects duplicate keys and enforces depth, node/member, and aggregate-key-byte budgets before allocation; a shared marker distinguishes `DuplicateKey`, `StructuralBudget`, and genuine `Syntax`, while duplicate checks reuse the destination JSON map rather than cloning keys into a second set. Bounded newline framing rejects an oversized message before JSON parsing.
 
+Protocol tests count synchronous service calls, future first-polls, and actual
+bridge operations separately: pre-service failures are `0/0/0`, while known-
+tool invalid arguments are `1/1/0`. Out-of-order completion is deterministic
+(gated block, then immediate echo), and an empty-JoinSet idle regression proves
+the guarded join branch does not spin.
+
 Every accepted tool future receives `ToolCallContext { cancel, wire_budget }`; the exact token goes to the bridge and the exact budget goes to validation/success/error rendering. `max_frame_bytes` excludes the newline delimiter. A compiled 1 MiB `MIN_MCP_FRAME_BYTES` is statically checked against the shared 65,536-byte root ceiling times a conservative thirteen-byte combined expansion: root occurs in inner Text JSON which is escaped again by outer MCP JSON, and once directly in structured context. The reserve also covers a maximum 256-byte wire ID and 64 KiB fixed response overhead. Error rendering derives a context-free `RenderedErrorCore` from `BridgeError`; Text carries context once and the structured top level carries it once, while nested `structuredContent.error.details` excludes host/root/shell. The authoritative counting test starts from a real maximum `ErrorDetails` with maximum root/shell and bounded safe strings, projects it, and proves only those two root contexts exist and fit. Server construction also counts the trusted full nine-tool list and uses the largest requirement. Exact minimum succeeds and minimum-minus-one is rejected without root truncation. Response renderers reserve envelope/ID/fallback but not newline. The writer is only a capped final serializer. It never replaces a completed mutation result with `-32603`.
+
+Serializer/capacity overflow is detected before the first transport write and
+emits zero bytes. A later `write_all` error or abort may leave the current frame
+prefix; the connection closes immediately and no next frame is attempted.
+Successful frames on a healthy transport never interleave.
 
 The owner continuously selects on the writer task as well as input and tool
 completion. Writer error/panic/early return, backpressure, and EOF all enter one
@@ -305,12 +318,15 @@ try-send only its parse error, then it suppresses/cancels. Tagged queued call
 messages are skipped unless the writer already committed past its final
 suppression check; that boundary is non-retractable. MCP-specific 250 ms task and writer graces are followed by abort-and-
 drain through a separate bounded 250 ms grace, including futures or writers
-that ignore cooperative shutdown. Clean EOF returns success after healthy
-cleanup; partial EOF returns fixed `PROTOCOL_ERROR` after its parse-error
-response, or fixed `MCP transport failed` if that response cannot be queued. Buffered
+that ignore cooperative shutdown. Clean EOF, with or without active calls,
+returns success iff task and writer cleanup are healthy. Partial EOF returns
+fixed `PROTOCOL_ERROR` only after its parse-error response and writer shutdown
+drain healthily; any enqueue or later transport failure wins as fixed
+`MCP transport failed`. Buffered
 cancellation wins because the biased select orders writer result, input, then
-tool completion; one `try_join_next_with_id` after every handled frame prevents
-notification starvation without starving writer failures.
+tool completion; its join branch is disabled while empty, and one guarded
+`try_join_next_with_id` after every handled frame prevents notification
+starvation without an idle-server busy loop or starving writer failures.
 
 `required_mcp_frame_bytes` and `WireBudget::for_response` take fallback bytes
 for the serialized `result` value only, excluding JSON-RPC envelope, request ID,
@@ -318,8 +334,8 @@ and newline. The 1 MiB constant is a complete-frame floor and is never supplied
 as that argument. Task 5 passes zero until real tool-result rendering exists;
 Task 7 replaces it with the counting-serialized real largest fallback result.
 `McpServer` stores this one result-only count; construction and every per-ID
-`WireBudget::for_response` consume the same field, with an equality/propagation
-test preventing budget drift.
+`WireBudget::for_response` consume the same field. Task 5 proves the stored zero
+path; Task 7 owns the real nonzero end-to-end propagation test.
 Task 4 owns only the generic counting and test-only worst-size projection;
 Task 5 owns server/lifecycle exact-min tests, and Task 7 owns real renderer and
 all bulk/mutation fallback assertions. The worst projection uses an absolute

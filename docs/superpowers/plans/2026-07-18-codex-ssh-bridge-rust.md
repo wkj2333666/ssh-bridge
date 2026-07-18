@@ -466,12 +466,20 @@ Test valid initialize flow for both supported versions plus JSON-RPC 1.0 rejecti
 
 Split RED/GREEN groups in this order: constructor budgets; envelope and state;
 dispatch/admission; cancellation and buffered races; shutdown and writer. Use
-separate synchronous-invocation and future-first-poll counters, durable
+separate synchronous-invocation, future-first-poll, and bridge-operation
+counters, durable
 predicate/semaphore gates, and timeout-wrap every async wait. Cover request-
 only methods without IDs, notification-only methods with IDs, exact duplicate-
-ID priority, future-construction/poll panics, continuously ready notifications,
-clean/partial EOF, writer first-write failure, one-byte writes, forever-pending
-writer, and token-ignoring futures. No sleep is test synchronization.
+ID priority only while a tool task is active, reuse after join with its response
+still queued, future-construction/poll panics, continuously ready notifications,
+an empty-JoinSet idle server, deterministic block-then-echo out-of-order
+completion, clean/partial EOF, serializer-zero-write overflow, partial-write-
+then-error, healthy one-byte writes, forever-pending writer, and token-ignoring
+futures. No sleep is test synchronization.
+
+Assert malformed envelope/lifecycle/unknown-name cases are `calls=0, polls=0,
+bridge_ops=0`; known-tool invalid arguments are `calls=1, polls=1,
+bridge_ops=0`.
 
 - [ ] **Step 2: Run protocol tests and verify red**
 
@@ -481,7 +489,7 @@ Expected: missing MCP server fails compilation.
 
 - [ ] **Step 3: Implement bounded framing and concurrent registry**
 
-Read with `AsyncBufReadExt::fill_buf`, scanning for newline while counting bytes; discard and return `REQUEST_TOO_LARGE` once 8 MiB is exceeded without constructing a larger `String` or `Value`. Parse only complete UTF-8 JSON lines.
+Read with `AsyncBufReadExt::fill_buf`, scanning for newline while counting bytes; discard and return `REQUEST_TOO_LARGE` once the configured effective `max_frame_bytes` is exceeded without constructing a larger `String` or `Value`. Eight MiB is the default and compiled maximum, not a hardcoded per-server acceptance bound. Parse only complete UTF-8 JSON lines.
 
 Keep lifecycle state in one owner task. Dispatch valid tool calls into a bounded `JoinSet` and map bounded `RequestId` to cancellation tokens. Serialize all responses through one writer task/channel so JSON lines cannot interleave. On `notifications/cancelled`, cancel immediately without waiting for the tool task and suppress its response.
 
@@ -492,37 +500,49 @@ global call-response suppression and cancels. Tagged queued call messages not
 yet committed past the writer's final suppression check are skipped; that
 commit is the non-retractable boundary. Task and
 writer cleanup use separate MCP-specific 250 ms graces, then abort and drain
-through another bounded 250 ms grace. Clean EOF succeeds after healthy cleanup;
-partial EOF returns fixed `PROTOCOL_ERROR` after its parse-error response, or
-fixed `MCP transport failed` when that response cannot be queued.
+through another bounded 250 ms grace. Clean EOF, with or without active calls,
+succeeds iff cleanup is healthy; partial EOF returns fixed `PROTOCOL_ERROR` only
+after its parse-error response and writer shutdown drain healthily. Any enqueue
+or later transport failure wins as fixed `MCP transport failed`.
+Serialization/capacity overflow occurs before the first transport write and
+emits zero bytes. A `write_all` error or abort may leave the current frame
+prefix; close immediately and attempt no next frame. Successful frames on a
+healthy transport, including one-byte writes, never interleave.
 Invoke `ToolService::call` inside the task and use a
 panic-safe task-ID/request-ID association so construction/poll panics produce
 fixed `-32603` for the correct active ID (or are suppressed after client
-cancellation/Closing) and release the registry entry/slot once.
+cancellation/Closing). Panic payloads are absent from MCP wire, returned errors,
+and bridge-authored diagnostics; Task 5 installs no global panic hook. Acquire
+an owned permit before insertion, keep it in owner-held `InFlight`, never the
+task, and drop it on join/removal or final clear.
 
 Classify requests and notifications before side effects. Request-only methods
 without IDs and malformed notifications do nothing; ID-bearing initialized or
 cancelled methods return fixed `-32600` without effect unless their legal ID is
-already in flight, in which case the global duplicate rule wins. Any present
-illegal ID is invalid with `id=null`, never a notification. A duplicate legal outstanding
-ID returns `-32600 Duplicate request id` with `id=null` after envelope/legal-ID
-validation but before lifecycle, params, name, and saturation, never
-overwriting the original. The biased select orders writer result, input, then
-tool completion, so buffered cancellation wins without starving writer faults;
-one `try_join_next_with_id` after every processed frame prevents a notification
-flood from starving completions.
+an active tool task, in which case the active-task duplicate rule wins. Any
+present illegal ID is invalid with `id=null`, never a notification. A legal ID
+matching an active task returns `-32600 Duplicate request id` with `id=null`
+after envelope/legal-ID validation but before lifecycle, params, name, and
+saturation, never overwriting the active entry. Remove the ID at task join
+before response queuing; reuse is allowed while that response remains queued.
+The biased select orders writer result, input, then tool completion and guards
+the join branch with `if !join_set.is_empty()`, so buffered cancellation wins
+without idle spinning or starving writer faults; after every processed frame,
+one guarded `try_join_next_with_id` prevents a notification flood from starving
+completions.
 
 Negotiate exactly `2025-11-25` and `2025-06-18` from one constant and return server name/version/capabilities. Supported versions validate their requested shape: name/title/version for 2025-06-18 and those plus icons/description/websiteUrl for 2025-11-25. An unsupported version validates the bounded current 2025-11 union before selecting latest; latest-only fields pass there while fields outside the union fail. Use bounded absolute URIs and fixed non-echoing errors. For the six supported methods, negotiated June shapes collect and discard bounded additional top-level params, while November applies the project's closed validator to official fields; both keep object `_meta` and client capabilities open. Reject unnegotiated `task` and unknown fields in tool arguments at the tools layer.
 
-Absolute URIs use the conservative dependency-free ASCII RFC 3986 subset:
-valid scheme and nonempty suffix, complete percent escapes, no whitespace,
-controls, backslash, non-ASCII, or forbidden `"<>^` plus grave-accent/`{|}`
-bytes, plus `//` and nonempty authority for
-HTTP(S). For any `//` authority reject userinfo; accept bracketed parsed IPv6,
-parsed IPv4, or bounded DNS-like labels; and allow only an optional decimal
-`u16` port. Reject empty labels/host/port, unbracketed IPv6, and trailing junk.
-Test accepted `https`, `urn`, `data`, IPv4/IPv6/DNS/port forms and rejected
-relative, empty, ambiguous, malformed-authority, and exact/+1 byte cases.
+Absolute URIs use an allocation-free RFC 3986 state machine: ASCII scheme with
+nonempty suffix; authority only for immediate post-colon `//`; path; at most
+one query transition; and at most one fragment transition, all with component-
+specific character sets and exact percent escapes. HTTP(S) comparison is ASCII-
+case-insensitive and requires authority. Brackets are IPv6-authority-only;
+internal path `//` is not authority; a second `#` fails. Authority rejects
+userinfo and accepts parsed bracketed IPv6/IPv4 or bounded DNS labels plus an
+optional decimal `u16` port. Test mixed-case HTTPS, `urn`, `data`, path `//`,
+query `?` data, IPv4/IPv6/DNS/port, second `#`, brackets in path, relative,
+malformed-authority, and exact/+1 byte cases.
 Cancellation requires bounded
 string/integer `requestId`, admits only optional bounded string reason and
 object `_meta` in November, allows/discards other bounded top-level fields in
@@ -540,7 +560,8 @@ be passed as that result-only value. Task 5 passes zero until real tool-result
 rendering exists; Task 7 replaces zero with the counting-serialized real
 largest fallback result. `McpServer` stores that one result-only value and uses
 the identical field for both constructor minimum calculation and every per-ID
-`WireBudget::for_response`; propagation tests forbid drift. Task 4 owns only the calculator, framing, capped writer,
+`WireBudget::for_response`; Task 5 proves only the stored zero path. Task 7 owns
+the real nonzero end-to-end propagation test. Task 4 owns only the calculator, framing, capped writer,
 and test-only worst-size projection (including a control-heavy maximum shell
 version). Task 5 owns `McpServer::new`, lifecycle/fixed-response fit, and exact
 constructor min/minus-one. Task 7 owns the real `RenderedErrorCore`, every

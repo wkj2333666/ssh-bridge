@@ -414,22 +414,27 @@ most 256 bytes, sizes has at most 16 strings of at most 32 bytes, and theme is
 `data:`; `websiteUrl` is likewise an absolute URI. The bridge never fetches,
 logs, or reflects either URI.
 
-The implementation uses a conservative dependency-free RFC 3986 subset, not
-browser-style URL normalization. Bounds are checked before syntax. The URI is
-ASCII, contains no whitespace, controls, backslash, or ASCII byte values
-`0x22, 0x3c, 0x3e, 0x5e, 0x60, 0x7b, 0x7c, 0x7d`, starts with
-`[A-Za-z][A-Za-z0-9+.-]*:`, has a nonempty suffix made only from RFC 3986
-unreserved/gen-delim/sub-delim bytes, and uses only complete two-hex-digit
-percent escapes. For HTTP(S), the suffix starts `//`; authority is the bytes
-after it through the first `/`, `?`, `#`, or end and must be nonempty.
-For every `//` authority, userinfo is rejected; bracketed hosts must parse as
-`std::net::Ipv6Addr`; other hosts must parse as IPv4 or be DNS-like labels of
-at most 63 bytes and 253 bytes total with ASCII alphanumeric edges and only
-interior hyphens. A digits-and-dots host must parse as IPv4. Optional ports are
-nonempty decimal `u16`; empty host/label/port, unbracketed IPv6, and trailing
-junk fail. The scanner allocates no normalized URL and performs no resolution.
-This accepts ordinary `https:`, `urn:`, and `data:` absolute URIs while failing
-closed on relative, IRI, ambiguous-backslash, or normalization-dependent input.
+The implementation is an allocation-free RFC 3986 state machine, not browser-
+style normalization. It rejects non-ASCII, whitespace/control, backslash, and
+ASCII `0x22,0x3c,0x3e,0x5e,0x60,0x7b,0x7c,0x7d` before scanning:
+
+1. an ASCII-alpha scheme followed by alphanumeric/`+-.`, one `:`, and a
+   nonempty suffix; HTTP/HTTPS comparison is ASCII-case-insensitive;
+2. authority only when the suffix immediately begins `//`; any later `//` is
+   path data;
+3. path as `pchar` or `/` until the first `?` or `#`;
+4. at most one query transition, then `pchar`, `/`, or `?` until `#`; and
+5. at most one fragment transition, then `pchar`, `/`, or `?` to end.
+
+`pchar` is unreserved/sub-delims/`:`/`@`. Every `%` consumes two hex digits.
+Brackets are valid only around an authority IPv6 host, so brackets in path and
+a second `#` fail. For every authority, userinfo is rejected; bracketed hosts
+parse as `std::net::Ipv6Addr`; other hosts parse as IPv4 or bounded DNS-like
+labels. A digits-and-dots host must parse as IPv4. An optional port is nonempty
+decimal `u16`; empty host/label/port, unbracketed IPv6, and trailing junk fail.
+Tests include upper-case HTTPS, internal path `//`, query `?` data, second `#`,
+and brackets in path. The scanner allocates no URL, resolves nothing, and never
+fetches, logs, or reflects the URI.
 November's closed method-field validator is a project security policy for the
 supported version, not a claim that upstream mechanically enforces closure.
 
@@ -532,7 +537,8 @@ is exact: the maximum of the compiled full-frame floor, full tools/list frame,
 and envelope plus the phase's result-only fallback.
 The server stores that result-only count once. Construction passes the stored
 value to `required_mcp_frame_bytes`, and every accepted request passes the same
-unmodified value to `WireBudget::for_response`; tests assert this propagation.
+unmodified value to `WireBudget::for_response`. Task 5 asserts only its stored
+zero path; Task 7 owns real nonzero end-to-end propagation.
 These invariants guarantee that all minimum
 responses and the exact nine-tool list can always be serialized.
 
@@ -695,7 +701,11 @@ indicator. Progress counts are included only where meaningful.
 The capped writer is a final invariant check, not a semantic fallback engine.
 An unexpected overflow before any mutation result exists may become a fixed
 `-32603`; overflow of a truth-bearing tool result closes the connection rather
-than replacing its mutation truth. No partial line is ever written.
+than replacing its mutation truth. Serialization/capacity overflow is detected
+before the first transport write and emits zero bytes. After `write_all` begins,
+an I/O error or abort may leave a prefix of the current frame; the transport is
+closed immediately and no later frame is attempted. Successful frames on a
+healthy transport are serialized by the single writer and never interleave.
 
 Nothing else writes stdout. Server diagnostics go to stderr with caller and
 remote values omitted. Captured remote stderr is data owned by the output
@@ -775,6 +785,11 @@ limit or guesses its own response allowance.
 limit equal to the validated configured global concurrency. Protocol parsing,
 ping, and cancellation do not consume a tool permit.
 
+Admission uses `try_acquire_owned` before registry insertion. The resulting
+`OwnedSemaphorePermit` lives in the owner-held `InFlight`, never in the tool
+task. Joining/removing or final Closing cleanup drops it exactly once; even an
+abort-drain timeout cannot strand capacity in an unreachable task.
+
 Request-versus-notification shape is decided before any method side effect.
 `initialize`, `ping`, `tools/list`, and `tools/call` without an ID are ignored
 as invalid notifications with zero state/service effect and no response.
@@ -782,24 +797,28 @@ Any present null, fractional, object/array/bool, or overlong ID is an invalid
 request with fixed `-32600` and `id=null`, never a notification.
 `notifications/initialized` and `notifications/cancelled` carrying a valid
 nonduplicate ID are invalid requests: they receive fixed `-32600 Invalid
-Request` for that ID and have zero state/cancellation effect. A duplicate legal
-ID follows the earlier global duplicate rule. Every malformed notification is
+Request` for that ID and have zero state/cancellation effect. A legal ID
+matching an active tool task follows the active-task duplicate rule. Every malformed notification is
 response-free and side-effect-free.
 
 The lifecycle owner selects between the next input frame and the next joined
 tool completion. It therefore continues reading cancellation notifications
 while calls are blocked. Each accepted `tools/call` inserts exactly one
 request ID and token before spawning. Duplicate in-flight IDs and calls above
-the bound receive fixed errors without spawning a tool future.
+the bound receive fixed errors without spawning a tool future. Here in-flight
+means an active tool task present in the owner registry, not a queued response.
 
-Duplicate outstanding IDs receive fixed `-32600`, message
+IDs matching active tool tasks receive fixed `-32600`, message
 `Duplicate request id`, and `id=null` to avoid an ambiguous second response for
 the original ID. Validation order is strict JSON and envelope/legal ID,
-duplicate ID globally, lifecycle/method params, known name, then saturation.
-Thus every repeated legal in-flight ID gets the duplicate error regardless of
-the second method/params/name/load. String `"1"` and number `1` are distinct.
+active-task ID match, lifecycle/method params, known name, then saturation.
+Thus every legal ID matching an active task gets the duplicate error regardless
+of the second method/params/name/load. String `"1"` and number `1` are distinct.
 The second request never overwrites the first, consumes no slot, and a later
-cancellation still targets the original. Reuse is allowed after removal.
+cancellation still targets the original. The owner removes the ID when it joins
+the task, before queuing the response. An ID is immediately reusable after that
+removal even while the earlier response remains queued; writer backlog does not
+extend duplicate protection.
 
 `ToolService::call` executes inside the spawned task so a panic during future
 construction or polling cannot unwind the owner. A panic-safe task-ID-to-
@@ -810,6 +829,11 @@ the connection remains active and the call was not client-cancelled, a
 recoverable panic produces fixed `-32603` without panic payload; otherwise its
 response is suppressed. An association
 invariant failure closes the connection rather than guessing.
+
+Panic payloads and caller data never enter MCP wire output, returned
+`BridgeError`, or bridge-authored diagnostics. Task 5 does not replace the
+process-global panic hook; a host-selected Rust hook may independently write to
+stderr before unwind is caught.
 
 ### 8.3 Cancellation races
 
@@ -838,9 +862,12 @@ specific closure are validated before any registry lookup or token trigger.
 Reason is borrow-validated in place and never cloned.
 
 The biased select orders writer result first, input second, and tool completion
-third. Writer failure cannot be input-starved, and an already-buffered
+third. Its join branch is guarded by `if !join_set.is_empty()`; otherwise
+`join_next_with_id()` returns immediate `None` and busy-loops on an idle server.
+Writer failure cannot be input-starved, and an already-buffered
 cancellation wins over its simultaneously ready completion. Immediately after
-each handled frame the owner invokes `try_join_next_with_id` at most once and
+each handled frame, only when nonempty, the owner invokes
+`try_join_next_with_id` at most once and
 processes the result if present, preventing notification floods from starving
 tool cleanup.
 
@@ -851,10 +878,12 @@ parse error; then the global suppression/cancellation phase ensures
 cooperative, uncooperative, panicked, or simultaneously ready completions emit
 nothing. A call line past the writer's suppression-check commit is not
 retractable.
-Clean EOF enqueues nothing and returns success after healthy cleanup. Partial
-EOF returns fixed `PROTOCOL_ERROR`/`partial MCP frame at EOF` after delivering
-its parse error; failure to enqueue that error becomes fixed MCP transport
-failure. `SshRunner`
+Clean EOF enqueues nothing and, with or without active calls, returns success
+iff cancellation, bounded task reap/abort-drain, and writer drain/shutdown are
+healthy. Partial EOF returns fixed `PROTOCOL_ERROR`/`partial MCP frame at EOF`
+only after its parse-error control response and writer shutdown drain
+healthily. Failure to enqueue or later write/drain/shutdown failure takes
+precedence as fixed MCP transport failure. `SshRunner`
 remains responsible for terminating process groups and reporting whether a
 remote process may continue.
 
@@ -1216,24 +1245,38 @@ whole-product acceptance.
 
 - a blocked tool while ping and cancellation remain responsive;
 - separate synchronous invocation and first-poll counters proving rejected
-  calls consume no service invocation or admission slot;
+  calls consume no service invocation or admission slot, plus a bridge-op
+  counter proving known-tool invalid args are invoked/polled once but launch
+  zero bridge operations;
 - request-only methods without IDs and notification-only methods with IDs
   producing zero side effect;
 - string/numeric cancellation identity, unknown/duplicate/late cancellation,
   malformed/versioned cancellation shapes, and buffered completion races;
 - exact duplicate-ID response and priority versus malformed params, unknown
-  name, and saturation, with string/number identity kept distinct;
+  name, and saturation while the first tool task is active, with string/number
+  identity kept distinct; reuse after join is allowed even when the first
+  response is writer-queued;
 - suppression of a notification-cancelled call's response;
 - propagation of the exact cancellation token and `WireBudget` through
   `ToolCallContext` into validation, dispatch, and render tests;
 - future-construction/first-poll/later panic recovery by task ID with one-time
   registry and slot cleanup;
 - EOF global suppression, writer failure/backpressure monitoring, and bounded
-  MCP-specific task/writer cleanup, including token-ignoring futures;
+  MCP-specific task/writer cleanup, including token-ignoring futures; clean EOF
+  with active calls succeeds after healthy cleanup, while partial EOF returns
+  ProtocolError only after its control response drains and later transport
+  failure wins;
 - in-flight saturation without unbounded task creation; and
 - concurrent responses completing out of request order without interleaving;
+- deterministic out-of-order completion using first gated block then immediate
+  echo, not semaphore waiter wake order;
 - buffered-cancel priority plus one `try_join_next_with_id` after every handled
   frame, preventing notification starvation; and
+- an empty-JoinSet idle-server regression proving the guarded join branch does
+  not spin;
+- serializer overflow producing zero transport bytes, partial-write-then-error
+  closing without a next frame, and healthy one-byte writes preserving
+  noninterleaving;
 - every async wait protected by a timeout and durable predicate/semaphore gates
   rather than sleeps or lossy `Notify` events.
 
