@@ -1,5 +1,6 @@
 mod protocol;
 pub mod stdio;
+pub mod tools;
 
 pub use protocol::*;
 use std::collections::HashMap;
