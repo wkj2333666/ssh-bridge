@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::capability::{ShellKind, ShellSelection};
+use crate::capability::{MAX_SHELL_VERSION_BYTES, ShellKind, ShellSelection};
 use crate::config::{Config, EffectiveLimits};
 use crate::error::{
     BridgeError, BridgeResult, ErrorCode, ErrorShellMetadata, attach_available_remote_context,
@@ -105,20 +105,8 @@ fn attach_retention_context(error: BridgeError, provenance: &RetentionProvenance
     }
 }
 
-fn shell_selection_from_metadata(metadata: ShellMetadata) -> BridgeResult<ShellSelection> {
-    let shell = match metadata.kind {
-        ShellName::Bash => ShellKind::Bash {
-            version: metadata.version.ok_or_else(|| {
-                BridgeError::invalid_argument("Bash retention provenance requires a version")
-            })?,
-        },
-        ShellName::Sh => ShellKind::PosixSh,
-        ShellName::Login => ShellKind::Login,
-    };
-    Ok(ShellSelection {
-        shell,
-        fallback: metadata.fallback,
-    })
+fn invalid_retention_provenance() -> BridgeError {
+    BridgeError::invalid_argument("retention provenance does not match a cached remote capability")
 }
 
 fn attach_optional_remote_context(
@@ -267,11 +255,77 @@ impl RemoteBridge {
         cancel: CancellationToken,
     ) -> BridgeResult<OutputReference> {
         let stored = match provenance {
-            RetentionProvenance::Remote(context) => StoredProvenance::Remote(OutputProvenance {
-                host: context.host,
-                physical_root: context.physical_root,
-                shell: shell_selection_from_metadata(context.shell)?,
-            }),
+            RetentionProvenance::Remote(context) => {
+                if !context.remote {
+                    return Err(invalid_retention_provenance());
+                }
+                let Some((canonical_host, _)) = self
+                    .runner
+                    .config()
+                    .hosts
+                    .get_key_value(context.host.as_str())
+                else {
+                    return Err(invalid_retention_provenance());
+                };
+                let canonical_host = canonical_host.clone();
+                let capability = self
+                    .runner
+                    .cached_capability(&canonical_host)
+                    .await
+                    .ok_or_else(invalid_retention_provenance)?;
+                if context.physical_root != capability.physical_root {
+                    return Err(invalid_retention_provenance());
+                }
+                let shell = match context.shell.kind {
+                    ShellName::Bash => {
+                        let Some(version) = context.shell.version.as_deref() else {
+                            return Err(invalid_retention_provenance());
+                        };
+                        if version.len() > MAX_SHELL_VERSION_BYTES || context.shell.fallback {
+                            return Err(invalid_retention_provenance());
+                        }
+                        let ShellKind::Bash {
+                            version: cached_version,
+                        } = &capability.shell
+                        else {
+                            return Err(invalid_retention_provenance());
+                        };
+                        if version != cached_version {
+                            return Err(invalid_retention_provenance());
+                        }
+                        ShellSelection {
+                            shell: capability.shell.clone(),
+                            fallback: false,
+                        }
+                    }
+                    ShellName::Sh => {
+                        if context.shell.version.is_some()
+                            || (context.shell.fallback
+                                && matches!(&capability.shell, ShellKind::Bash { .. }))
+                        {
+                            return Err(invalid_retention_provenance());
+                        }
+                        ShellSelection {
+                            shell: ShellKind::PosixSh,
+                            fallback: context.shell.fallback,
+                        }
+                    }
+                    ShellName::Login => {
+                        if context.shell.version.is_some() || context.shell.fallback {
+                            return Err(invalid_retention_provenance());
+                        }
+                        ShellSelection {
+                            shell: ShellKind::Login,
+                            fallback: false,
+                        }
+                    }
+                };
+                StoredProvenance::Remote(OutputProvenance {
+                    host: canonical_host,
+                    physical_root: capability.physical_root.clone(),
+                    shell,
+                })
+            }
             RetentionProvenance::Aggregate { kind, source_count } => StoredProvenance::Aggregate {
                 kind: match kind {
                     AggregateKind::Hosts => StoredAggregateKind::Hosts,

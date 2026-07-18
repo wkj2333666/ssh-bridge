@@ -138,11 +138,174 @@ fn context() -> RemoteContext {
     }
 }
 
+async fn cached_context(bridge: &RemoteBridge) -> RemoteContext {
+    bridge
+        .stat(
+            StatRequest {
+                host: "dev".to_owned(),
+                paths: vec![".".to_owned()],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .context
+}
+
+struct CountingDetail {
+    serializations: Arc<AtomicUsize>,
+}
+
+impl Serialize for CountingDetail {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.serializations.fetch_add(1, Ordering::Release);
+        serializer.serialize_str("must not be serialized")
+    }
+}
+
+#[tokio::test]
+async fn retention_rejects_uncached_or_forged_remote_provenance_before_serializing() {
+    let root = tempfile::TempDir::new().unwrap();
+    let (runtime, _runner, bridge) = fixture(root.path(), true);
+    let serializations = Arc::new(AtomicUsize::new(0));
+
+    let error = bridge
+        .retain_serialized_detail(
+            RetentionProvenance::Remote(context()),
+            CountingDetail {
+                serializations: Arc::clone(&serializations),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(serializations.load(Ordering::Acquire), 0);
+    assert_eq!(spool_file_count(runtime.path()), 0);
+
+    let valid = cached_context(&bridge).await;
+    let cached_shell = bridge
+        .hosts()
+        .await
+        .unwrap()
+        .hosts
+        .into_iter()
+        .find(|host| host.host == "dev")
+        .unwrap()
+        .shell
+        .unwrap();
+    let mut invalid = Vec::new();
+    let mut remote_false = valid.clone();
+    remote_false.remote = false;
+    invalid.push(remote_false);
+    let mut wrong_host = valid.clone();
+    wrong_host.host = "unconfigured".to_owned();
+    invalid.push(wrong_host);
+    let mut wrong_root = valid.clone();
+    wrong_root.physical_root.push_str("/forged");
+    invalid.push(wrong_root);
+    let mut huge_bash = valid.clone();
+    huge_bash.shell = ShellMetadata {
+        kind: ShellName::Bash,
+        version: Some("x".repeat(257)),
+        fallback: false,
+    };
+    invalid.push(huge_bash);
+    let mut sh_version = valid.clone();
+    sh_version.shell = ShellMetadata {
+        kind: ShellName::Sh,
+        version: Some("invented".to_owned()),
+        fallback: false,
+    };
+    invalid.push(sh_version);
+    let mut login_version = valid.clone();
+    login_version.shell = ShellMetadata {
+        kind: ShellName::Login,
+        version: Some("invented".to_owned()),
+        fallback: false,
+    };
+    invalid.push(login_version);
+    let mut login_fallback = valid.clone();
+    login_fallback.shell = ShellMetadata {
+        kind: ShellName::Login,
+        version: None,
+        fallback: true,
+    };
+    invalid.push(login_fallback);
+    if cached_shell.kind == ShellName::Bash {
+        let mut wrong_bash = valid.clone();
+        wrong_bash.shell = ShellMetadata {
+            kind: ShellName::Bash,
+            version: Some(format!(
+                "{}-forged",
+                cached_shell.version.as_deref().unwrap()
+            )),
+            fallback: false,
+        };
+        invalid.push(wrong_bash);
+        let mut bash_fallback = valid.clone();
+        bash_fallback.shell = ShellMetadata {
+            kind: ShellName::Bash,
+            version: cached_shell.version.clone(),
+            fallback: true,
+        };
+        invalid.push(bash_fallback);
+        let mut false_sh_fallback = valid.clone();
+        false_sh_fallback.shell = ShellMetadata {
+            kind: ShellName::Sh,
+            version: None,
+            fallback: true,
+        };
+        invalid.push(false_sh_fallback);
+    }
+
+    for provenance in invalid {
+        let error = bridge
+            .retain_serialized_detail(
+                RetentionProvenance::Remote(provenance),
+                CountingDetail {
+                    serializations: Arc::clone(&serializations),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(serializations.load(Ordering::Acquire), 0);
+        assert_eq!(spool_file_count(runtime.path()), 0);
+    }
+
+    let reference = bridge
+        .retain_serialized_detail(
+            RetentionProvenance::Remote(valid.clone()),
+            vec!["valid cached provenance"],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let page = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref: reference.as_str().to_owned(),
+                stream: StreamKind::Stdout,
+                offset: 0,
+                max_bytes: 1024,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.provenance, RetentionProvenance::Remote(valid));
+}
+
 #[tokio::test]
 async fn task8_retention_spool_round_trips_remote_and_aggregate_provenance() {
     let root = tempfile::TempDir::new().unwrap();
     let (_runtime, _runner, bridge) = fixture(root.path(), true);
-    let remote_context = context();
+    let remote_context = cached_context(&bridge).await;
     let owned = vec!["TASK8_RETAINED_DETAIL", "second"];
     let expected = serde_json::to_vec(&owned).unwrap();
     let reference = bridge
@@ -202,10 +365,11 @@ async fn task8_retention_spool_round_trips_remote_and_aggregate_provenance() {
 async fn task8_retention_spool_accepts_exact_serialized_limit_and_rejects_first_byte_over() {
     let root = tempfile::TempDir::new().unwrap();
     let (_runtime, _runner, bridge) = fixture(root.path(), true);
+    let remote_context = cached_context(&bridge).await;
     let exact = "x".repeat(codex_ssh_bridge::MAX_OUTPUT_BYTES as usize - 2);
     let reference = bridge
         .retain_serialized_detail(
-            RetentionProvenance::Remote(context()),
+            RetentionProvenance::Remote(remote_context.clone()),
             exact,
             CancellationToken::new(),
         )
@@ -229,7 +393,7 @@ async fn task8_retention_spool_accepts_exact_serialized_limit_and_rejects_first_
     let over = "x".repeat(codex_ssh_bridge::MAX_OUTPUT_BYTES as usize - 1);
     let error = bridge
         .retain_serialized_detail(
-            RetentionProvenance::Remote(context()),
+            RetentionProvenance::Remote(remote_context),
             over,
             CancellationToken::new(),
         )
@@ -262,10 +426,11 @@ impl Serialize for CancellableDetail {
 async fn task8_retention_spool_cancellation_is_polled_and_blocking_join_is_awaited() {
     let root = tempfile::TempDir::new().unwrap();
     let (_runtime, _runner, bridge) = fixture(root.path(), true);
+    let remote_context = cached_context(&bridge).await;
     let progress = Arc::new(AtomicUsize::new(0));
     let cancel = CancellationToken::new();
     let future = bridge.retain_serialized_detail(
-        RetentionProvenance::Remote(context()),
+        RetentionProvenance::Remote(remote_context),
         CancellableDetail {
             progress: Arc::clone(&progress),
             chunk: "x".repeat(64 * 1024),
