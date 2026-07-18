@@ -1446,8 +1446,9 @@ first, input second, and tool completion third. It contains no loop. Guard the j
 `if !join_set.is_empty()` because `join_next_with_id()` on an empty set returns
 `None` immediately and otherwise creates a busy loop. The writer can therefore
 never be starved by input, while input still wins over a simultaneously ready
-tool completion. Immediately after every processed input frame, check the same
-nonempty condition, call `try_join_next_with_id` at most once, and process that
+tool completion. Immediately after every recoverable input event, including a
+drained oversized frame, check the same nonempty condition, call
+`try_join_next_with_id` at most once, and process that
 completion if present before selecting the next frame. This exact one-frame/one-try-reap rule
 preserves cancel-wins and prevents a continuously ready notification stream
 from starving completion cleanup.
@@ -1593,15 +1594,22 @@ shutdown path must not poll a completed handle twice. If it is still present
 after the sender is dropped, the writer drains the channel, calls
 `AsyncWriteExt::shutdown`, and is awaited through the writer grace.
 
-The writer serializes already budgeted responses through `serialize_json_line`
-and `write_all`. Channel messages are tagged `CallResponse` or `Control`; before
-starting each queued `CallResponse`, the writer checks the shared suppression
-flag and discards it when Closing has reached suppression. Define the
+Control responses remain owned `Value`s that the writer serializes through
+`serialize_json_line` and `write_all`. A completed call response is serialized
+and capped exactly once before channel admission, directly from its owned
+result through a borrowed response wrapper into a private `PreparedJsonLine`.
+That type contains at most `max_frame_bytes + 1` bytes including the newline;
+the queue never receives a second large `Value` clone. Channel messages are
+tagged `CallResponse(PreparedJsonLine)` or `Control(Value)`; before writing each
+prepared call line, the writer checks the shared suppression flag and discards
+it when Closing has reached suppression. It then writes the prepared bytes
+without another serialization or clone. Define the
 non-retractable write start as the instant this check atomically commits to
 false for the dequeued message. A line past that commit cannot be retracted;
 the EOF race test therefore
 targets a completion simultaneously ready in the owner, which is never queued.
-Serialization/capacity overflow occurs while building the capped buffer before
+Call serialization/capacity overflow occurs while building `PreparedJsonLine`
+before channel admission and before
 the first transport write and therefore emits zero bytes. Once `write_all`
 starts, an I/O error or abort may leave the current frame prefix; immediately
 close the transport and never attempt the next queued frame. The writer invents

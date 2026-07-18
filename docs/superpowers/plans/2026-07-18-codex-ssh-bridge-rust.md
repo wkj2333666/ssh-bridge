@@ -496,7 +496,7 @@ Expected: missing MCP server fails compilation.
 
 Read with `AsyncBufReadExt::fill_buf`, scanning for newline while counting bytes; discard and return `REQUEST_TOO_LARGE` once the configured effective `max_frame_bytes` is exceeded without constructing a larger `String` or `Value`. Eight MiB is the default and compiled maximum, not a hardcoded per-server acceptance bound. Parse only complete UTF-8 JSON lines.
 
-Keep lifecycle state in one owner task. Dispatch valid tool calls into a bounded `JoinSet` and map bounded `RequestId` to cancellation tokens. Serialize all responses through one writer task/channel so JSON lines cannot interleave. On `notifications/cancelled`, cancel immediately without waiting for the tool task and suppress its response.
+Keep lifecycle state in one owner task. Dispatch valid tool calls into a bounded `JoinSet` and map bounded `RequestId` to cancellation tokens. Control responses remain values serialized by the single writer. Serialize and cap each completed call response exactly once before channel admission, directly from its owned result through a borrowed response wrapper into a private `PreparedJsonLine` bounded to `max_frame_bytes + 1` including newline. The writer performs the final suppression check and writes those prepared bytes without another clone/serialization, so JSON lines cannot interleave and the queue cannot hold a second large result copy. On `notifications/cancelled`, cancel immediately without waiting for the tool task and suppress its response.
 
 The main select monitors input, tool joins, and the writer join. Writer failure,
 panic/early return, backpressure, and EOF share one Closing transition; it sets
@@ -509,8 +509,9 @@ through another bounded 250 ms grace. Clean EOF, with or without active calls,
 succeeds iff cleanup is healthy; partial EOF returns fixed `PROTOCOL_ERROR` only
 after its parse-error response and writer shutdown drain healthily. Any enqueue
 or later transport failure wins as fixed `MCP transport failed`.
-Serialization/capacity overflow occurs before the first transport write and
-emits zero bytes. A `write_all` error or abort may leave the current frame
+Call serialization/capacity overflow occurs while preparing the bounded line,
+before channel admission and the first transport write, and emits zero bytes. A
+`write_all` error or abort may leave the current frame
 prefix; close immediately and attempt no next frame. Successful frames on a
 healthy transport, including one-byte writes, never interleave.
 Invoke `ToolService::call` inside the task and use a
@@ -533,9 +534,9 @@ before response queuing; reuse is allowed while that response remains queued.
 Factor one loop iteration into async `next_owner_event` with no internal loop.
 Its biased select orders writer result, input, then tool completion and guards
 the join branch with `if !join_set.is_empty()`, so buffered cancellation wins
-without idle spinning or starving writer faults; after every processed frame,
-one guarded `try_join_next_with_id` prevents a notification flood from starving
-completions.
+without idle spinning or starving writer faults; after every recoverable input
+event, including a drained oversized frame, one guarded
+`try_join_next_with_id` prevents a notification flood from starving completions.
 
 Cleanup unit tests use cooperative and token-ignoring-but-yielding tool futures
 and injected writer-shutdown failure. Do not inject a non-returning poll into a

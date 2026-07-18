@@ -470,9 +470,17 @@ One writer task owns stdout. Every response is compact JSON followed by one
 newline delimiter. `max_frame_bytes` and every response budget exclude that
 delimiter. `CappedJsonBuffer` implements `std::io::Write` and refuses the first
 serialized byte beyond `max_frame_bytes`, so checking cannot occur after an
-unbounded allocation.
+unbounded allocation. Control responses remain owned `Value`s and are capped
+and serialized by the writer. A completed call response is instead serialized
+exactly once, directly from its owned result through a borrowed response
+wrapper, into a private `PreparedJsonLine` before channel admission. That type
+can contain at most `max_frame_bytes + 1` bytes including its final newline;
+the call queue never contains both a result model and another JSON value/copy.
 
-The writer channel capacity and each queued message are bounded.
+The writer channel capacity and each queued message are bounded. Before a
+prepared call line is written, the writer performs the final shared suppression
+check and discards it when Closing has suppressed call responses; otherwise it
+writes the already prepared bytes without serializing or cloning them again.
 The lifecycle owner's main select continuously monitors the writer
 `JoinHandle`. Writer error, panic, or unexpected success while its channel is
 open, reader EOF/partial EOF, and bounded-channel backpressure all enter one
@@ -868,7 +876,8 @@ Its join branch is guarded by `if !join_set.is_empty()`; otherwise
 `join_next_with_id()` returns immediate `None` and busy-loops on an idle server.
 Writer failure cannot be input-starved, and an already-buffered
 cancellation wins over its simultaneously ready completion. Immediately after
-each handled frame, only when nonempty, the owner invokes
+each recoverable input event, including an oversized frame that was drained to
+its delimiter, only when nonempty, the owner invokes
 `try_join_next_with_id` at most once and
 processes the result if present, preventing notification floods from starving
 tool cleanup.

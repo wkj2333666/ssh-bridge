@@ -306,10 +306,11 @@ into async `next_owner_event`; the test exercises that helper directly with
 empty JoinSet and pending input/writer, then supplies input. It never runs an
 intentionally buggy outer loop that could starve the test timeout.
 
-Every accepted tool future receives `ToolCallContext { cancel, wire_budget }`; the exact token goes to the bridge and the exact budget goes to validation/success/error rendering. `max_frame_bytes` excludes the newline delimiter. A compiled 1 MiB `MIN_MCP_FRAME_BYTES` is statically checked against the shared 65,536-byte root ceiling times a conservative thirteen-byte combined expansion: root occurs in inner Text JSON which is escaped again by outer MCP JSON, and once directly in structured context. The reserve also covers a maximum 256-byte wire ID and 64 KiB fixed response overhead. Error rendering derives a context-free `RenderedErrorCore` from `BridgeError`; Text carries context once and the structured top level carries it once, while nested `structuredContent.error.details` excludes host/root/shell. The authoritative counting test starts from a real maximum `ErrorDetails` with maximum root/shell and bounded safe strings, projects it, and proves only those two root contexts exist and fit. Server construction also counts the trusted full nine-tool list and uses the largest requirement. Exact minimum succeeds and minimum-minus-one is rejected without root truncation. Response renderers reserve envelope/ID/fallback but not newline. The writer is only a capped final serializer. It never replaces a completed mutation result with `-32603`.
+Every accepted tool future receives `ToolCallContext { cancel, wire_budget }`; the exact token goes to the bridge and the exact budget goes to validation/success/error rendering. `max_frame_bytes` excludes the newline delimiter. A compiled 1 MiB `MIN_MCP_FRAME_BYTES` is statically checked against the shared 65,536-byte root ceiling times a conservative thirteen-byte combined expansion: root occurs in inner Text JSON which is escaped again by outer MCP JSON, and once directly in structured context. The reserve also covers a maximum 256-byte wire ID and 64 KiB fixed response overhead. Error rendering derives a context-free `RenderedErrorCore` from `BridgeError`; Text carries context once and the structured top level carries it once, while nested `structuredContent.error.details` excludes host/root/shell. The authoritative counting test starts from a real maximum `ErrorDetails` with maximum root/shell and bounded safe strings, projects it, and proves only those two root contexts exist and fit. Server construction also counts the trusted full nine-tool list and uses the largest requirement. Exact minimum succeeds and minimum-minus-one is rejected without root truncation. Response renderers reserve envelope/ID/fallback but not newline. Control responses remain values capped and serialized by the writer. Each completed call response is serialized exactly once before channel admission, directly from its owned result through a borrowed response wrapper into a private `PreparedJsonLine` bounded to `max_frame_bytes + 1` including newline. The writer performs the final suppression check and writes the prepared bytes without another clone or serialization. It never replaces a completed mutation result with `-32603`.
 
-Serializer/capacity overflow is detected before the first transport write and
-emits zero bytes. A later `write_all` error or abort may leave the current frame
+Call serializer/capacity overflow is detected while preparing the bounded line,
+before channel admission and the first transport write, and emits zero bytes. A
+later `write_all` error or abort may leave the current frame
 prefix; the connection closes immediately and no next frame is attempted.
 Successful frames on a healthy transport never interleave.
 
@@ -328,8 +329,9 @@ drain healthily; any enqueue or later transport failure wins as fixed
 `MCP transport failed`. Buffered
 cancellation wins because the biased select orders writer result, input, then
 tool completion; its join branch is disabled while empty, and one guarded
-`try_join_next_with_id` after every handled frame prevents notification
-starvation without an idle-server busy loop or starving writer failures.
+`try_join_next_with_id` after every recoverable input event, including a drained
+oversized frame, prevents notification starvation without an idle-server busy
+loop or starving writer failures.
 
 Cleanup unit tests use cooperative and token-ignoring-but-yielding futures plus
 writer shutdown failure. A non-returning poll is not injected into the current-
