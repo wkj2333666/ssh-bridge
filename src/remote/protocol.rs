@@ -26,6 +26,25 @@ pub(super) fn encode_bytes(bytes: &[u8]) -> EncodedValue {
     }
 }
 
+pub(super) fn encode_owned_bytes(bytes: Vec<u8>) -> EncodedValue {
+    if bytes.contains(&0) {
+        return EncodedValue {
+            encoding: ValueEncoding::Base64,
+            value: STANDARD.encode(bytes),
+        };
+    }
+    match String::from_utf8(bytes) {
+        Ok(value) => EncodedValue {
+            encoding: ValueEncoding::Utf8,
+            value,
+        },
+        Err(error) => EncodedValue {
+            encoding: ValueEncoding::Base64,
+            value: STANDARD.encode(error.into_bytes()),
+        },
+    }
+}
+
 pub(super) fn shell_metadata(shell: &ShellKind, fallback: bool) -> ShellMetadata {
     match shell {
         ShellKind::Bash { version } => ShellMetadata {
@@ -377,6 +396,16 @@ pub(super) fn protocol_error(message: &'static str) -> BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task78_owned_utf8_encoding_reuses_the_input_allocation() {
+        let bytes = b"owned preview".to_vec();
+        let pointer = bytes.as_ptr();
+        let encoded = encode_owned_bytes(bytes);
+        assert_eq!(encoded.encoding, ValueEncoding::Utf8);
+        assert_eq!(encoded.value, "owned preview");
+        assert_eq!(encoded.value.as_ptr(), pointer);
+    }
 
     #[tokio::test]
     async fn spool_cursor_nul_field_crosses_the_sixty_four_kib_page_boundary() {

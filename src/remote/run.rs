@@ -9,12 +9,9 @@ use crate::output::{CapturedOutput, OutputPreview};
 use crate::path::RemotePath;
 
 use super::{
-    EncodedOutputPreview, RemoteBridge, RemoteRunRequest, RemoteRunResult, RunShell, RunStdin,
-    WriteEncoding, protocol,
+    EncodedOutputPreview, POSIX_SH_WARNING, RemoteBridge, RemoteRunRequest, RemoteRunResult,
+    RunShell, RunStdin, WriteEncoding, protocol,
 };
-
-const SH_WARNING: &str =
-    "selected shell is POSIX sh; Bash-only syntax such as [[ ]] is unavailable";
 
 pub(super) async fn run(
     bridge: &RemoteBridge,
@@ -71,15 +68,10 @@ fn decode_stdin(stdin: Option<RunStdin>, maximum: usize) -> BridgeResult<Option<
     let bytes = match stdin.encoding {
         WriteEncoding::Utf8 => stdin.value.into_bytes(),
         WriteEncoding::Base64 => {
-            let decoded = STANDARD.decode(stdin.value.as_bytes()).map_err(|_| {
+            preflight_base64_length(&stdin.value, maximum)?;
+            STANDARD.decode(stdin.value.as_bytes()).map_err(|_| {
                 BridgeError::invalid_argument("stdin is not canonical standard Base64")
-            })?;
-            if STANDARD.encode(&decoded) != stdin.value {
-                return Err(BridgeError::invalid_argument(
-                    "stdin is not canonical standard Base64",
-                ));
-            }
-            decoded
+            })?
         }
     };
     if bytes.len() > maximum {
@@ -90,6 +82,39 @@ fn decode_stdin(stdin: Option<RunStdin>, maximum: usize) -> BridgeResult<Option<
         ));
     }
     Ok(Some(bytes))
+}
+
+fn preflight_base64_length(value: &str, maximum: usize) -> BridgeResult<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if !value.len().is_multiple_of(4) {
+        return Err(BridgeError::invalid_argument(
+            "stdin is not canonical standard Base64",
+        ));
+    }
+    let padding = value.bytes().rev().take_while(|byte| *byte == b'=').count();
+    if padding > 2 || value.as_bytes()[..value.len() - padding].contains(&b'=') {
+        return Err(BridgeError::invalid_argument(
+            "stdin is not canonical standard Base64",
+        ));
+    }
+    let decoded_length = (value.len() / 4)
+        .checked_mul(3)
+        .and_then(|length| length.checked_sub(padding))
+        .ok_or_else(command_input_too_large)?;
+    if decoded_length > maximum {
+        return Err(command_input_too_large());
+    }
+    Ok(())
+}
+
+fn command_input_too_large() -> BridgeError {
+    BridgeError::new(
+        ErrorCode::RequestTooLarge,
+        "command input exceeds the configured limit",
+        false,
+    )
 }
 
 fn map_shell(shell: RunShell) -> ShellRequest {
@@ -118,7 +143,7 @@ fn convert_result(host: String, result: crate::ssh::RunResult) -> RemoteRunResul
         ..
     } = output;
     let warnings = if matches!(shell.shell, ShellKind::PosixSh) {
-        vec![SH_WARNING.to_owned()]
+        vec![POSIX_SH_WARNING.to_owned()]
     } else {
         Vec::new()
     };
@@ -137,8 +162,8 @@ fn convert_result(host: String, result: crate::ssh::RunResult) -> RemoteRunResul
 
 fn encode_preview(preview: OutputPreview) -> EncodedOutputPreview {
     EncodedOutputPreview {
-        head: protocol::encode_bytes(&preview.head),
-        tail: protocol::encode_bytes(&preview.tail),
+        head: protocol::encode_owned_bytes(preview.head),
+        tail: protocol::encode_owned_bytes(preview.tail),
         raw_bytes: preview.bytes_seen,
         truncated: preview.truncated,
     }
