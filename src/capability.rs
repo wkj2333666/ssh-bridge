@@ -125,22 +125,32 @@ if [ -n "$probe_tmp" ]; then
     find_actual=$probe_tmp/codex-probe-find
     find_link=$probe_tmp/codex-probe-find-link
     find_out=$probe_tmp/find-output
+    find_expected=$probe_tmp/find-expected
     mkdir -p "$find_actual/visible/nested" "$find_actual/.hidden" "$probe_tmp/find-outside"
     newline_name='line
 name'
-    : >"$find_actual/$newline_name"
-    : >"$find_actual/visible/leaf"
+    printf xy >"$find_actual/visible/$newline_name"
     : >"$find_actual/visible/nested/too-deep"
     : >"$find_actual/.hidden/secret"
     : >"$probe_tmp/find-outside/not-followed"
-    ln -s "$probe_tmp/find-outside" "$find_actual/descendant-link"
+    find_link_target=$probe_tmp/find-outside
+    ln -s "$find_link_target" "$find_actual/descendant-link"
     ln -s "$find_actual" "$find_link"
+    chmod 640 "$find_actual/visible/$newline_name"
+    touch -d '@7.25' -- "$find_actual/visible/$newline_name"
+    touch -h -d '@8.5' -- "$find_actual/descendant-link"
+    find_link_size=${#find_link_target}
     if (cd -- "$probe_tmp" &&
         find -H codex-probe-find-link -mindepth 1 -maxdepth 2 \
-        \( -path '*/.*' -prune -o -printf '%P\000%y\000%s\000%m\000%T@\000' \)) \
+        \( -path '*/.*' -prune -o -type f -printf '%P\000%y\000%s\000%m\000%T@\000' \) &&
+        find -H codex-probe-find-link -mindepth 1 -maxdepth 2 \
+        \( -path '*/.*' -prune -o -type l -printf '%P\000%y\000%s\000%m\000%T@\000' \)) \
         >"$find_out" 2>/dev/null; then
-        find_fields=$(tr -cd '\000' <"$find_out" | wc -c)
-        if [ "$find_fields" -eq 25 ]; then tool_find_nul=1; fi
+        {
+            printf 'visible/%s\000f\0002\000640\0007.2500000000\000' "$newline_name"
+            printf 'descendant-link\000l\000%s\000777\0008.5000000000\000' "$find_link_size"
+        } >"$find_expected"
+        if cmp -s "$find_expected" "$find_out"; then tool_find_nul=1; fi
     fi
 
     stat_file=$probe_tmp/codex-probe-stat
@@ -156,18 +166,43 @@ name'
         esac
     fi
 
-    rg_file=$probe_tmp/codex-probe-rg
-    printf 'before\000needle\n' >"$rg_file"
+    rg_file=$probe_tmp/codex-probe-rg-text
+    rg_bytes_file=$probe_tmp/codex-probe-rg-bytes
+    rg_binary_file=$probe_tmp/codex-probe-rg-binary
+    rg_error_file=$probe_tmp/codex-probe-rg-error
+    printf 'before needle after\n' >"$rg_file"
+    printf '\377needle\n' >"$rg_bytes_file"
+    printf 'before\000needle\n' >"$rg_binary_file"
     if command -v rg >/dev/null 2>&1; then
-        rg_json=$(rg --json --fixed-strings --hidden --no-ignore --text -- needle "$rg_file" 2>/dev/null)
+        rg_json=$(rg --json --fixed-strings --hidden --no-ignore -- needle "$rg_file" 2>/dev/null)
         rg_status=$?
+        rg_bytes_json=$(rg --json --fixed-strings --hidden --no-ignore --text -- needle "$rg_bytes_file" 2>/dev/null)
+        rg_bytes_status=$?
+        rg_binary_json=$(rg --json --fixed-strings --hidden --no-ignore -- needle "$rg_binary_file" 2>/dev/null)
+        rg_binary_status=$?
+        rg_binary_text_json=$(rg --json --fixed-strings --hidden --no-ignore --text -- needle "$rg_binary_file" 2>/dev/null)
+        rg_binary_text_status=$?
         rg --json --fixed-strings --hidden --no-ignore -- absent "$rg_file" >/dev/null 2>&1
         rg_empty_status=$?
+        rg --json --fixed-strings --hidden --no-ignore -- needle "$rg_error_file" >/dev/null 2>&1
+        rg_error_status=$?
+        rg_text_ok=0
+        rg_bytes_ok=0
+        rg_binary_ok=0
         case "$rg_json" in
-            *'"type":"begin"'*'"type":"match"'*'"type":"end"'*'"type":"summary"'*)
-                if [ "$rg_status" -eq 0 ] && [ "$rg_empty_status" -eq 1 ]; then tool_rg_json=1; fi
-                ;;
+            *'"type":"begin"'*'"type":"match"'*'"path":{"text":"'"$rg_file"'"}'*'"lines":{"text":"before needle after\n"}'*'"line_number":1'*'"start":7,"end":13'*'"type":"end"'*'"type":"summary"'*) rg_text_ok=1 ;;
         esac
+        case "$rg_bytes_json" in
+            *'"type":"match"'*'"path":{"text":"'"$rg_bytes_file"'"}'*'"lines":{"bytes":"/25lZWRsZQo="}'*'"line_number":1'*'"start":1,"end":7'*) rg_bytes_ok=1 ;;
+        esac
+        case "$rg_binary_json:$rg_binary_text_json" in
+            *'"binary_offset":6'*:*'"binary_offset":null'*) rg_binary_ok=1 ;;
+        esac
+        if [ "$rg_status" -eq 0 ] && [ "$rg_bytes_status" -eq 0 ] &&
+           [ "$rg_binary_status" -eq 0 ] && [ "$rg_binary_text_status" -eq 0 ] &&
+           [ "$rg_empty_status" -eq 1 ] && [ "$rg_error_status" -gt 1 ] &&
+           [ "$rg_text_ok" -eq 1 ] && [ "$rg_bytes_ok" -eq 1 ] &&
+           [ "$rg_binary_ok" -eq 1 ]; then tool_rg_json=1; fi
     fi
 
     grep_file=$probe_tmp/codex-probe-grep
@@ -194,30 +229,60 @@ name'
     fi
 
     if command -v mkfifo >/dev/null 2>&1; then
-        bound_fifo=$probe_tmp/bound-fifo
-        bound_status=$probe_tmp/bound-status
-        bound_out=$probe_tmp/codex-probe-bound
-        mkfifo "$bound_fifo"
-        (
-            printf abcdef >"$bound_fifo"
-            printf '%s' "$?" >"$bound_status"
-        ) &
-        bound_pid=$!
-        exec 3<"$bound_fifo"
-        head -c 3 <&3 >"$bound_out" 2>/dev/null
-        bound_head_status=$?
-        cat <&3 >/dev/null
-        bound_drain_status=$?
-        exec 3<&-
-        wait "$bound_pid" 2>/dev/null
-        bound_wait_status=$?
-        bound_producer_status=$(cat "$bound_status" 2>/dev/null || printf 2)
-        bound_mode=$(stat -c '%a' -- "$probe_tmp" 2>/dev/null || printf 0)
-        if [ "$bound_head_status" -eq 0 ] && [ "$bound_drain_status" -eq 0 ] &&
-           [ "$bound_wait_status" -eq 0 ] &&
-           [ "$bound_producer_status" -eq 0 ] && [ "$bound_mode" = 700 ] &&
-           [ "$(cat "$bound_out")" = abc ]; then
-            tool_search_bound=1
+        bound_dir=$(mktemp -d "$probe_tmp/codex-probe-bound.XXXXXX" 2>/dev/null) || bound_dir=
+        if [ -n "$bound_dir" ] && (
+            cleanup_bound() { rm -rf -- "$bound_dir"; }
+            trap cleanup_bound EXIT HUP INT TERM
+            bound_fifo=$bound_dir/success-fifo
+            bound_status=$bound_dir/success-status
+            bound_out=$bound_dir/success-output
+            bound_error_fifo=$bound_dir/error-fifo
+            bound_error_status=$bound_dir/error-status
+            bound_error_out=$bound_dir/error-output
+            bound_mode=$(stat -c '%a' -- "$bound_dir" 2>/dev/null || printf 0)
+            [ "$bound_mode" = 700 ] || exit 1
+            mkfifo "$bound_fifo" "$bound_error_fifo" || exit 1
+            (
+                printf 'ab\000cd\000' |
+                    xargs -0 -r -n 1 sh -c 'printf %s "$1"' codex-ssh-probe-bound-xargs >"$bound_fifo" 2>/dev/null
+                printf '%s' "$?" >"$bound_status"
+            ) &
+            bound_pid=$!
+            exec 3<"$bound_fifo"
+            head -c 3 <&3 >"$bound_out" 2>/dev/null
+            bound_head_status=$?
+            cat <&3 >/dev/null
+            bound_drain_status=$?
+            exec 3<&-
+            wait "$bound_pid" 2>/dev/null
+            bound_wait_status=$?
+            bound_producer_status=$(cat "$bound_status" 2>/dev/null || printf 2)
+            [ "$bound_head_status" -eq 0 ] && [ "$bound_drain_status" -eq 0 ] &&
+            [ "$bound_wait_status" -eq 0 ] && [ "$bound_producer_status" -eq 0 ] &&
+            [ "$(cat "$bound_out")" = abc ] || exit 1
+
+            (
+                printf 'abcdef\000' |
+                    xargs -0 -r sh -c 'printf %s "$1"; exit 7' codex-ssh-probe-bound-xargs >"$bound_error_fifo" 2>/dev/null
+                printf '%s' "$?" >"$bound_error_status"
+            ) &
+            bound_error_pid=$!
+            exec 3<"$bound_error_fifo"
+            head -c 3 <&3 >"$bound_error_out" 2>/dev/null
+            bound_error_head_status=$?
+            cat <&3 >/dev/null
+            bound_error_drain_status=$?
+            exec 3<&-
+            wait "$bound_error_pid" 2>/dev/null
+            bound_error_wait_status=$?
+            bound_error_final=$(cat "$bound_error_status" 2>/dev/null || printf 0)
+            [ "$bound_error_head_status" -eq 0 ] && [ "$bound_error_drain_status" -eq 0 ] &&
+            [ "$bound_error_wait_status" -eq 0 ] && [ "$bound_error_final" -ne 0 ] &&
+            [ "$(cat "$bound_error_out")" = abc ] || exit 1
+        ); then
+            if [ ! -e "$bound_dir" ]; then tool_search_bound=1; fi
+        else
+            rm -rf -- "$bound_dir"
         fi
     fi
 fi

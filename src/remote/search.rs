@@ -9,24 +9,45 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::FixedRunRequest;
+use crate::ssh::{FixedRunRequest, render_fixed_command};
 
 use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
 use super::{RemoteBridge, ResolvedSearch, SearchEngine, SearchMatch, SearchResult, compile_glob};
 
-const CANDIDATE_SCRIPT: &str = r#"
+macro_rules! bounded_sentinel {
+    () => {
+        r#"
+cb() (
+ d=$(mktemp -d /tmp/codex-sentinel-bound.XXXXXX 2>/dev/null)||exit 90
+ trap 'rm -rf -- "$d"' 0 1 2 15
+ f=$d/codex-sentinel-bound;o=$d/o
+ m=$(stat -c %a "$d" 2>/dev/null)||exit 90
+ [ "$m" = 700 ]||exit 1;mkfifo "$f"||exit 90;[ -p "$f" ]||exit 1
+ (printf abcdef>"$f")&p=$!;exec 3<"$f"
+ CODEX_SSH_SENTINEL=bound head -c 3 <&3 >"$o" 2>/dev/null;h=$?
+ cat <&3 >/dev/null;r=$?;exec 3<&-;wait "$p" 2>/dev/null;w=$?
+ [ "$r:$w" = 0:0 ]||exit 90;v=$(cat "$o")||exit 90;[ "$h:$v" = 0:abc ]
+)
+cb;s=$?;case $s in 0);;1)printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2;exit 0;;*)exit 2;;esac
+"#
+    };
+}
+
+const CANDIDATE_SCRIPT: &str = concat!(
+    r#"
 root=$1
 limit=$2
-if ! find -H . -mindepth 1 -maxdepth 0 -printf '' >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=find_nul\000' >&2
-    exit 0
-fi
-if ! command -v mktemp >/dev/null 2>&1 ||
-   ! command -v mkfifo >/dev/null 2>&1 ||
-   ! command -v head >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
-    exit 0
-fi
+"#,
+    bounded_sentinel!(),
+    r#"
+cf() (
+ d=$(mktemp -d /tmp/codex-sentinel-search-find.XXXXXX 2>/dev/null)||exit 90
+ trap 'rm -rf -- "$d"' 0 1 2 15
+ mkdir "$d/a" "$d/z"&&printf x>"$d/a/.hidden"&&printf x>"$d/z/x"&&ln -s "$d/z" "$d/a/l"&&ln -s "$d/a" "$d/codex-sentinel-search-find"||exit 90
+ find -H "$d/codex-sentinel-search-find" -type f -print0 >"$d/o" 2>/dev/null||exit 90
+ printf '%s/.hidden\000' "$d/codex-sentinel-search-find">"$d/e"||exit 90;cmp -s "$d/e" "$d/o"
+)
+cf;s=$?;case $s in 0);;1)printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=find_nul\000' >&2;exit 0;;*)exit 2;;esac
 if [ ! -e "$root" ] && [ ! -L "$root" ]; then printf 'NOT_FOUND\000' >&2; exit 0; fi
 if [ ! -d "$root" ]; then printf 'NOT_DIRECTORY\000' >&2; exit 0; fi
 if [ ! -r "$root" ]; then printf 'PERMISSION_DENIED\000' >&2; exit 0; fi
@@ -57,32 +78,54 @@ if [ "$head_status" -ne 0 ] || [ "$drain_status" -ne 0 ] ||
    [ "$wait_status" -ne 0 ] || [ "$producer_status" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
-"#;
+"#,
+);
 
-const RG_SCRIPT: &str = r#"
+const RG_SCRIPT: &str = concat!(
+    r#"
 query=$1
 binary=$2
 limit=$3
-rg --json --fixed-strings --hidden --no-ignore -- codex-ssh-probe-no-match /dev/null >/dev/null 2>&1
-rg_probe=$?
-if [ "$rg_probe" -ne 1 ]; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=rg_json\000' >&2
-    exit 0
-fi
-if ! printf 'x\000' | xargs -0 -r sh -c 'exit 0' codex-ssh-rg-probe >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2
-    exit 0
-fi
-if ! command -v mktemp >/dev/null 2>&1 ||
-   ! command -v mkfifo >/dev/null 2>&1 ||
-   ! command -v head >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
-    exit 0
-fi
+"#,
+    bounded_sentinel!(),
+    r#"
+x=$(printf 'a\nb\000'|xargs -0 -r sh -c 'printf %s "$1"' codex-sentinel-rg-xargs 2>/dev/null);s=$?
+printf x\000|xargs -0 -r sh -c 'exit 7' codex-sentinel-rg-xargs >/dev/null 2>&1;q=$?
+if [ "$s" -ne 0 ]||[ "$q" -eq 0 ]||[ "$x" != 'a
+b' ];then printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2;exit 0;fi
 umask 077
 scratch=$(mktemp -d /tmp/codex-ssh-search.XXXXXX) || exit 2
 cleanup() { rm -rf -- "$scratch"; }
 trap cleanup EXIT HUP INT TERM
+codex_rg_file=$scratch/codex-sentinel-rg
+if [ "$binary" = 1 ]; then
+    printf '\377needle\n' >"$codex_rg_file" || exit 2
+    codex_rg_json=$(rg --json --fixed-strings --hidden --no-ignore --text -- needle "$codex_rg_file" 2>/dev/null)
+else
+    printf 'before needle after\n' >"$codex_rg_file" || exit 2
+    codex_rg_json=$(rg --json --fixed-strings --hidden --no-ignore -- needle "$codex_rg_file" 2>/dev/null)
+fi
+codex_rg_status=$?
+if [ "$codex_rg_status" -gt 1 ]; then exit 2; fi
+if [ "$binary" = 1 ]; then
+    case "$codex_rg_json" in
+        *'"type":"match"'*'"path":{"text":"'"$codex_rg_file"'"}'*'"lines":{"bytes":"/25lZWRsZQo="}'*'"line_number":1'*'"start":1,"end":7'*) codex_rg_ok=1 ;;
+        *) codex_rg_ok=0 ;;
+    esac
+    rg --json --fixed-strings --hidden --no-ignore --text -- absent "$codex_rg_file" >/dev/null 2>&1
+else
+    case "$codex_rg_json" in
+        *'"type":"match"'*'"path":{"text":"'"$codex_rg_file"'"}'*'"lines":{"text":"before needle after\n"}'*'"line_number":1'*'"start":7,"end":13'*) codex_rg_ok=1 ;;
+        *) codex_rg_ok=0 ;;
+    esac
+    rg --json --fixed-strings --hidden --no-ignore -- absent "$codex_rg_file" >/dev/null 2>&1
+fi
+codex_rg_empty=$?
+if [ "$codex_rg_empty" -gt 1 ]; then exit 2; fi
+if [ "$codex_rg_status" -ne 0 ] || [ "$codex_rg_empty" -ne 1 ] || [ "$codex_rg_ok" -ne 1 ]; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=rg_json\000' >&2
+    exit 0
+fi
 fifo=$scratch/fifo
 data=$scratch/data
 status=$scratch/status
@@ -120,31 +163,42 @@ if [ -s "$engine_error" ] || [ "$head_status" -ne 0 ] ||
    [ "$producer_status" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
-"#;
+"#,
+);
 
-const GREP_SCRIPT: &str = r#"
+const GREP_SCRIPT: &str = concat!(
+    r#"
 query=$1
 limit=$2
-grep -IHnZ -F -- codex-ssh-probe-no-match /dev/null >/dev/null 2>&1
-grep_probe=$?
-if [ "$grep_probe" -ne 1 ]; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=grep_nul\000' >&2
-    exit 0
-fi
-if ! printf 'x\000' | xargs -0 -r sh -c 'exit 0' codex-ssh-grep-probe >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2
-    exit 0
-fi
-if ! command -v mktemp >/dev/null 2>&1 ||
-   ! command -v mkfifo >/dev/null 2>&1 ||
-   ! command -v head >/dev/null 2>&1; then
-    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\000' >&2
-    exit 0
-fi
+"#,
+    bounded_sentinel!(),
+    r#"
+x=$(printf 'a\nb\000'|xargs -0 -r sh -c 'printf %s "$1"' codex-sentinel-grep-xargs 2>/dev/null);s=$?
+printf x\000|xargs -0 -r sh -c 'exit 7' codex-sentinel-grep-xargs >/dev/null 2>&1;q=$?
+if [ "$s" -ne 0 ]||[ "$q" -eq 0 ]||[ "$x" != 'a
+b' ];then printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=xargs_nul\000' >&2;exit 0;fi
 umask 077
 scratch=$(mktemp -d /tmp/codex-ssh-search.XXXXXX) || exit 2
 cleanup() { rm -rf -- "$scratch"; }
 trap cleanup EXIT HUP INT TERM
+codex_grep_file=$scratch/codex-sentinel-grep
+codex_grep_binary=$scratch/codex-sentinel-grep-binary
+codex_grep_out=$scratch/codex-sentinel-grep-out
+codex_grep_expected=$scratch/codex-sentinel-grep-expected
+printf 'needle\n' >"$codex_grep_file" || exit 2
+printf 'before\000needle\n' >"$codex_grep_binary" || exit 2
+grep -IHnZ -F -- needle "$codex_grep_file" "$codex_grep_binary" >"$codex_grep_out" 2>/dev/null
+codex_grep_status=$?
+if [ "$codex_grep_status" -gt 1 ]; then exit 2; fi
+{ printf '%s\000' "$codex_grep_file"; printf '1:needle\n'; } >"$codex_grep_expected" || exit 2
+grep -IHnZ -F -- absent "$codex_grep_file" >/dev/null 2>&1
+codex_grep_empty=$?
+if [ "$codex_grep_empty" -gt 1 ]; then exit 2; fi
+if [ "$codex_grep_status" -ne 0 ] || [ "$codex_grep_empty" -ne 1 ] ||
+   ! cmp -s "$codex_grep_expected" "$codex_grep_out"; then
+    printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=grep_nul\000' >&2
+    exit 0
+fi
 fifo=$scratch/fifo
 data=$scratch/data
 status=$scratch/status
@@ -181,7 +235,8 @@ if [ -s "$engine_error" ] || [ "$head_status" -ne 0 ] ||
    [ "$producer_status" -ne 0 ]; then exit 2; fi
 cat "$data"
 if [ "$bytes" -eq "$limit" ]; then printf 'CAPPED\000' >&2; fi
-"#;
+"#,
+);
 
 pub(super) async fn search(
     bridge: &RemoteBridge,
@@ -279,14 +334,35 @@ pub(super) async fn search(
     } else {
         SearchEngine::Grep
     };
+    let (script, args, required): (&'static str, Vec<String>, &'static [&'static str]) = if rg {
+        (
+            RG_SCRIPT,
+            vec![
+                request.query.clone(),
+                if request.binary { "1" } else { "0" }.to_owned(),
+                (limits.max_frame_bytes + 1).to_string(),
+            ],
+            &["rg_json", "xargs_nul", "search_bound"],
+        )
+    } else {
+        (
+            GREP_SCRIPT,
+            vec![
+                request.query.clone(),
+                (limits.max_frame_bytes + 1).to_string(),
+            ],
+            &["grep_nul", "xargs_nul", "search_bound"],
+        )
+    };
+    let command_reserve = render_fixed_command(script, &args)?.len();
+    if command_reserve >= limits.max_frame_bytes {
+        return Err(BridgeError::new(
+            ErrorCode::RequestTooLarge,
+            "fixed request exceeds the configured frame limit",
+            false,
+        ));
+    }
     let mut stdin = Vec::new();
-    let source = if rg { RG_SCRIPT } else { GREP_SCRIPT };
-    let command_reserve = source
-        .len()
-        .checked_add(source.bytes().filter(|byte| *byte == b'\'').count() * 4)
-        .and_then(|value| value.checked_add(request.query.len() * 4))
-        .and_then(|value| value.checked_add(512))
-        .ok_or_else(|| protocol_error("search command bound overflowed"))?;
     for candidate in &candidates {
         if stdin
             .len()
@@ -313,26 +389,6 @@ pub(super) async fn search(
     }
     drop(owner);
     let owner = InternalSpoolOwner::new();
-    let (script, args, required): (&'static str, Vec<String>, &'static [&'static str]) = if rg {
-        (
-            RG_SCRIPT,
-            vec![
-                request.query.clone(),
-                if request.binary { "1" } else { "0" }.to_owned(),
-                (limits.max_frame_bytes + 1).to_string(),
-            ],
-            &["rg_json", "xargs_nul", "search_bound"],
-        )
-    } else {
-        (
-            GREP_SCRIPT,
-            vec![
-                request.query.clone(),
-                (limits.max_frame_bytes + 1).to_string(),
-            ],
-            &["grep_nul", "xargs_nul", "search_bound"],
-        )
-    };
     let result = bridge
         .execute_readonly_fixed(
             FixedRunRequest {
@@ -563,8 +619,12 @@ fn decoded_path(value: &super::EncodedValue) -> Vec<u8> {
 }
 
 fn relative<'a>(root: &[u8], actual: &'a [u8]) -> BridgeResult<&'a [u8]> {
-    actual
-        .strip_prefix(root)
-        .and_then(|rest| rest.strip_prefix(b"/"))
-        .ok_or_else(|| protocol_error("search path escaped the configured root"))
+    let relative = actual.strip_prefix(root).and_then(|rest| {
+        if root.ends_with(b"/") {
+            Some(rest)
+        } else {
+            rest.strip_prefix(b"/")
+        }
+    });
+    relative.ok_or_else(|| protocol_error("search path escaped the configured root"))
 }

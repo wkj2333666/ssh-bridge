@@ -1301,11 +1301,148 @@ Update `.superpowers/sdd/task-4-report.md` with every observed RED/GREEN and
 fresh count, force-stage the clarification/report because `.superpowers` is
 ignored, preserve both `__pycache__` trees, and create one new commit.
 
+### Task 16: R2 Exact Probe Oracles
+
+**Files:**
+- Modify: `src/capability.rs`
+- Modify: `tests/ssh_transport.rs`
+
+**Interfaces:**
+- `find_nul` compares the complete raw five-field output for the expected
+  `%P/%y/%s/%m/%T@` records, including a newline name, root symlink follow,
+  descendant symlink no-follow, depth 2, and hidden pruning.
+- `rg_json` proves text and bytes forms, binary false/true, required match
+  fields, and statuses 0, 1, and greater than 1.
+- `search_bound` runs the production-shaped parent-held same-fd head/drain
+  helper, sequential NUL xargs, child/xargs failure propagation, later-error
+  precedence after a full prefix, mode-0700 scratch, and cleanup.
+
+- [x] **Step 1: Add fine-grained incompatible-PATH tests**
+
+Extend the table in `capability_probe_rejects_each_incompatible_exact_behavior`
+with shims that keep `command -v` and ordinary invocations working but corrupt
+one semantic detail at a time. Include find field/path/type corruption, rg
+text/bytes/status corruption, head, xargs child-status masking, `mktemp`, and
+`mkfifo`. Assert only the target functional flag becomes false and each probe
+scratch root is empty.
+
+- [x] **Step 2: Verify RED**
+
+Run `cargo test --test ssh_transport capability_probe_rejects_each_incompatible_exact_behavior -- --exact --nocapture`.
+Expected: one or more fine-grained semantic shims still leave the target flag
+true.
+
+- [x] **Step 3: Implement exact raw-output/status oracles**
+
+Build fixed expected files inside the existing private probe directory and use
+`cmp -s` plus exact exit-status assertions. The search-bound probe must emit no
+protocol bytes, drain before wait, and leave all failure/scratch state private.
+
+- [x] **Step 4: Verify GREEN**
+
+Re-run the exact RED command and the existing real-probe cleanup tests.
+
+### Task 17: R2 Cheap Exact Operation Sentinels
+
+**Files:**
+- Modify: `src/remote/metadata.rs`
+- Modify: `src/remote/read.rs`
+- Modify: `src/remote/search.rs`
+- Modify: `tests/remote_ops.rs`
+
+**Interfaces:**
+- Each fixed read-only script runs a cheap, discriminating self-test for each
+  production form it will use before touching caller paths or starting the
+  real engine.
+- Only sentinel failure emits the strict exit-zero mismatch for a key in the
+  request's static required set; real filesystem/engine failures retain their
+  ordinary fixed errors.
+
+- [x] **Step 1: Add stateful stale-sentinel RED tests**
+
+Use PATH shims that pass the full capability probe, then corrupt one production
+form only. Cover list find format/no-follow, stat printf, read slicing,
+sequential xargs, rg/grep modes, and the mktemp/mkfifo/head same-fd helper.
+Assert success-after-one-stale gives exactly `P=2/C=2`; a sentinel that remains
+bad after reprobe returns `RemoteCapabilityMissing`; filesystem and genuine
+engine errors do not become mismatch records.
+
+- [x] **Step 2: Verify RED**
+
+Run the new `readonly_stale_sentinel_` tests. Expected: shallow sentinels miss
+at least one corrupted production behavior or misclassify the failure.
+
+- [x] **Step 3: Implement minimal per-script self-tests**
+
+Keep sentinel data under a mode-0700 `mktemp -d`, suppress utility diagnostics,
+compare exact small outputs/statuses, and trap cleanup. Do not run the full
+capability probe and do not add an SSH round trip. Record focused-test elapsed
+time in the report as the integration-level performance guard.
+
+- [x] **Step 4: Verify GREEN**
+
+Run the RED tests plus all existing retry, filesystem-error, engine-error, and
+cleanup regressions.
+
+### Task 18: R2 Root Slash Join and Completion
+
+**Files:**
+- Modify: `src/remote/metadata.rs`
+- Modify: `tests/remote_ops.rs`
+- Modify: Task 4 design, plan, clarifications, and report
+
+- [x] **Step 1: Add a real root-slash list RED test**
+
+Configure the host root as `/`, list a known direct child selected from the
+actual filesystem, and assert every returned `actual_path` begins with exactly
+one `/`; specifically reject `//etc` when `/etc` is present.
+
+- [x] **Step 2: Verify RED, implement, and verify GREEN**
+
+Run the focused test. Change `join_raw` to append a separator only when the
+base is nonempty and does not already end in `/`, then re-run the test and all
+metadata regressions.
+
+- [x] **Step 3: Fresh completion gate and commit**
+
+Update the binding clarification list and report with all R2 RED/GREEN evidence
+and sentinel timing. Run, in order, `cargo fmt --check`, strict clippy,
+`cargo test --test remote_ops -- --nocapture`, `cargo test --all-targets`,
+`git diff --check`, and `git status --short`. Preserve both user-owned
+`__pycache__` trees and create one new commit.
+
+### Task 19: Close Final Focused Review Findings
+
+**Files:**
+- Modify: `src/remote/read.rs`
+- Modify: `src/remote/search.rs`
+- Modify: operation/capability tests and Task 4 binding documents
+
+- [x] **Step 1: Add four focused RED regressions**
+
+Cover quote-amplified rendered commands at 4 KiB, configured root `/` search,
+an unreadable parent that makes file existence indeterminate, and sentinel
+scratch setup failure. Observe respectively empty-truncated success,
+`ProtocolError`, `NotFound`, and retry to `RemoteCapabilityMissing`.
+
+- [x] **Step 2: Separate setup errors and exact semantic mismatches**
+
+Return `RequestTooLarge` when the engine command alone cannot fit a candidate;
+derive root-relative search paths from one existing root slash; classify the
+nearest inaccessible parent as `PermissionDenied`; and make nonzero sentinel
+setup ordinary `RemoteExit` while successful wrong mktemp mode/mkfifo type
+remains a genuine `search_bound` mismatch.
+
+- [x] **Step 3: Verify GREEN and rerun completion gates**
+
+Run the four focused tests, stale table, exact capability cleanup table, both
+4-KiB regressions, then every completion gate before committing.
+
 ---
 
 ## Plan Self-Review Checklist
 
-- Every clarification item 1-47 maps to at least one task above.
+- Every clarification item 1-50 maps to at least one task above.
 - All production changes follow a named failing test and observed RED.
 - Public type names are defined before later tasks consume them.
 - List/stat/read/search protocols each have explicit field and byte ceilings.

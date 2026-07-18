@@ -2,7 +2,7 @@
 
 Date: 2026-07-18
 
-Status: Controller-approved formal-review revision; rework in progress
+Status: Second formal-review revision implemented; verification in progress
 
 ## Formal Review Revision
 
@@ -12,6 +12,28 @@ aggregation, retry inside the general `SshRunner` fixed executor, local list
 hidden filtering, or a planned-SIGPIPE success path. The seven Important
 findings are binding and must all pass RED/GREEN regression tests before the
 Task 4 rework can be approved.
+
+### Second formal-review revision
+
+The second review tightened three boundaries. Capability probes now compare
+complete production-shaped raw records, JSON forms, statuses, same-fd bounded
+stream behavior, failure priority, and cleanup under fine-grained PATH shims.
+Every real read-only fixed script runs a cheap exact sentinel for each required
+production form before touching caller data; only an exact sentinel failure can
+emit its static mismatch key. This adds no SSH round trip: a warm operation
+runs the sentinel and operation in one fixed command, while a genuine stale
+sentinel still permits only the existing one reprobe/retry. Finally, raw path
+joining preserves an existing trailing slash, so configured root `/` produces
+`/etc` rather than `//etc`; root-relative search strips that one existing slash
+without requiring a second separator.
+
+The fixed frame boundary is unchanged. Search computes candidate stdin capacity
+from the exact `render_fixed_command(script, args).len()` used by the runner,
+not from a heuristic reserve. Both list and search retain verified operation at
+`max_frame_bytes=4096`, including a full bounded prefix followed by a late
+engine error. If the rendered engine command alone leaves no room for one NUL
+candidate, search returns `RequestTooLarge` instead of claiming an empty
+truncated search.
 
 ## 1. Scope
 
@@ -534,6 +556,17 @@ asserted after both success and every failed behavior. In the fake SSH fixture,
 `FAKE_SSH_MODE=local-fixed` executes the real capability command by default;
 synthetic all-true records are never allowed to mask the production probe.
 
+The exact `find_nul` oracle compares complete raw `%P/%y/%s/%m/%T@` records for
+a root symlink, a newline-bearing hidden file at the required depth, and a
+descendant symlink that must not be followed. The exact `rg_json` oracle checks
+text and Base64 byte fields, binary false/true modes, path/line/submatch fields,
+and exit statuses 0, 1, and greater than 1. The exact `search_bound` oracle uses
+the production parent-held FIFO fd for head then drain, sequential xargs with a
+failing child, a full prefix followed by a final error, private scratch mode,
+traps, and post-probe cleanup. Fine-grained shims continue to expose every
+other command normally, so one corrupted semantic detail disables only its
+target flag.
+
 Probe parsing still rejects unknown keys, duplicates, malformed booleans, or a
 wrong protocol version. Existing flags needed by later write tasks remain.
 
@@ -559,6 +592,11 @@ checks the exact field count and numeric ranges across page boundaries, sorts
 by raw relative path bytes, retains at most `max_entries + 1`, returns the first
 requested count, and sets `truncated` only after observing the qualifying
 lookahead record.
+
+Raw path reconstruction appends a separator only when the base is nonempty and
+does not already end in `/`. This applies equally to absolute and relative raw
+byte joins; in particular a configured filesystem root `/` yields `/etc`, never
+`//etc`.
 
 A missing root returns `NotFound`; an unreadable root returns
 `PermissionDenied`; a non-directory root returns `NotDirectory`. No raw remote
@@ -618,6 +656,12 @@ non-regular value uses a fixed `InvalidArgument` message, because the four new
 filesystem codes intentionally include `NotDirectory` for directory-required
 operations but do not add an `IsDirectory` code. Transport, cancellation,
 protocol, and aggregate output failures abort the batch.
+
+If `test -e` cannot distinguish a missing target from an inaccessible parent,
+the script walks upward to the nearest existing directory. A directory lacking
+search permission makes the result `PermissionDenied`; a reachable ancestor
+with a genuinely absent suffix remains `NotFound`. Neither branch copies the
+path or a utility diagnostic.
 
 ## 10. Search Protocol
 
@@ -725,6 +769,18 @@ field count and terminal NUL. In particular, only an exit-zero
 private retry marker. Unknown capability names, extra/duplicate fields,
 malformed UTF-8, trailing bytes, and the same record accompanying a nonzero
 remote exit are `ProtocolError`.
+
+Before caller paths or content engines are touched, each read-only fixed script
+runs small exact sentinels for the production forms named in its static required
+set. The sentinel uses private mode-0700 scratch where files or FIFOs are
+needed, suppresses utility diagnostics, compares exact output and status, and
+traps cleanup. Only that sentinel's genuine failure emits the corresponding
+strict mismatch record. Ordinary filesystem and engine failures keep their
+normal error channel. A mismatch invalidates and reprobes once; a repeated
+mismatch is `RemoteCapabilityMissing`. In particular, nonzero mktemp/mkfifo or
+sentinel-file setup is an ordinary fixed-operation failure; a successful
+mktemp/mkfifo invocation producing the wrong mode/type is a genuine
+`search_bound` mismatch. No sentinel adds a separate SSH command.
 
 ## 12. Cancellation, Cleanup, and Performance
 

@@ -983,7 +983,7 @@ fn render_remote_command(
     }
 }
 
-fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<String> {
+pub(crate) fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<String> {
     let mut command = format!("exec sh -c {} codex-ssh-bridge-op", shell_word(script)?);
     for argument in args {
         command.push(' ');

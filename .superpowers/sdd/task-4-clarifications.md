@@ -253,3 +253,33 @@ These decisions are binding Task 4 requirements and supplement the Task 4 brief.
     itself indeterminate, return a fixed safe filesystem error and never copy
     stderr or the path. Keep the existing 64-KiB quote and checked rendered
     command plus stdin bounds unchanged.
+
+## K. Second formal-review corrections
+
+48. Capability flags compare complete production-shaped behavior, not selected
+    substrings. `find_nul` proves root-follow, descendant no-follow, depth,
+    hidden pruning, newline names, and exact `%P/%y/%s/%m/%T@` raw records.
+    `rg_json` proves text and byte JSON, binary false/true, match fields, and
+    statuses 0/1/>1. `search_bound` proves private mode-0700 scratch, `mkfifo`,
+    a parent-held same fd for head plus drain, sequential xargs and child
+    failure propagation, full-prefix later-error priority, traps, and cleanup.
+    Fine-grained PATH shims retain ordinary command availability and make only
+    the targeted functional flag false.
+49. Every real read-only script runs a cheap exact sentinel for each required
+    production form it is about to use. A genuine sentinel mismatch may emit
+    only that request's static required key and trigger exactly one
+    invalidation/reprobe/retry; a second mismatch is
+    `RemoteCapabilityMissing`. Ambiguous filesystem, transport, parser, and
+    engine failures never become mismatch markers. Sentinels add no SSH round
+    trip, keep scratch private/trapped, and their warm local-fixed integration
+    latency is recorded as non-threshold evidence. A utility that returns
+    nonzero while creating sentinel scratch is an ordinary setup failure; a
+    successful invocation whose resulting mode/type/output violates the exact
+    production contract is a capability mismatch.
+50. Raw configured-root joining inserts `/` only when the base is nonempty and
+    does not already end in `/`. A host configured with root `/` therefore
+    reports `/etc`, never `//etc`, and search derives `tmp/x` from `/tmp/x`.
+    Search reserves the exact runner-rendered fixed command bytes before adding
+    NUL stdin candidates; if the command alone leaves no room for one candidate
+    it returns `RequestTooLarge`. The total command-plus-stdin frame limit
+    remains unchanged.

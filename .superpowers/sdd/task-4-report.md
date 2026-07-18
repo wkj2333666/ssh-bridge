@@ -85,6 +85,80 @@ launches remain owned by `SshRunner`; `src/remote` launches no process.
   dangling target to `NotFound`, and maps a deterministically unreadable target
   to `PermissionDenied` without exposing stderr or path bytes.
 
+## Second Formal Review Rework
+
+The second Task 4 review of commit `710734c` was **Not Approved** with three
+Important findings. The R2 rework tightened the exact probe oracles, added
+production-form stale sentinels to every read-only operation, and corrected
+configured root `/` path joining.
+
+### R2 RED/GREEN evidence
+
+- Exact probe RED: a fine-grained `find` shim corrupted one raw metadata detail
+  while preserving command availability and the probe still reported
+  `find_nul=true`. GREEN compares the full expected raw path plus
+  `%P/%y/%s/%m/%T@` records, including root-follow, descendant no-follow,
+  depth, hidden pruning, and a newline name. The rg oracle now checks text and
+  byte JSON, binary false/true, match fields, and statuses 0/1/>1. The bounded
+  oracle now checks private mode-0700 scratch, FIFO creation, the production
+  parent-held same-fd head/drain, sequential xargs and child failure, a full
+  prefix followed by a final error, traps, and cleanup. Fine-grained PATH shims
+  for find, rg, head, xargs, mktemp, and mkfifo make only the target flag false.
+- Stale sentinel RED: a stateful production-form shim produced only one probe
+  (`P=1`) because the operation did not detect the stale behavior; a permanently
+  bad operation form returned success instead of
+  `RemoteCapabilityMissing`. GREEN covers ten list/stat/read/candidate/rg/grep
+  sentinel cases. Each passes the full probe, fails the first production-form
+  sentinel, then succeeds after exactly one invalidation/reprobe/retry; a second
+  mismatch returns `RemoteCapabilityMissing`. Filesystem, transport, parser,
+  and genuine engine failures remain ordinary non-mismatch errors.
+- 4-KiB refactor RED: adding exact sentinels initially made the conservative
+  search reserve exceed 4096, so a valid candidate was omitted before the
+  engine and the late-error regression returned an empty result. GREEN uses the
+  exact runner rendering length. After final setup-error separation the script
+  source sizes are list 3,738 bytes, candidate 2,177, rg 3,680, and grep 3,007;
+  a representative complete list rendering is 3,994 bytes. Both the hidden-flood list and
+  full-prefix-then-exit-2 search regressions pass with
+  `max_frame_bytes=4096`; the command-plus-stdin hard bound is unchanged.
+- Root slash RED: a real list with configured root `/` returned `//etc`.
+  GREEN inserts a separator only when the base does not already end in `/` and
+  asserts exact `/etc` plus the absence of any `//` actual path.
+
+The ten stateful stale-sentinel cases completed in 1.348 seconds locally.
+After warming the capability cache, five local-fixed samples per operation
+reported these integration-level totals (sentinel included, no network RTT):
+
+- list: p50 21.96 ms, range 21.30–22.70 ms;
+- stat: p50 16.54 ms, range 16.34–17.19 ms;
+- read: p50 17.85 ms, range 17.45–21.52 ms;
+- rg search: p50 42.36 ms, range 39.28–43.54 ms;
+- grep search: p50 32.69 ms, range 30.74–38.60 ms.
+
+The latency test records evidence without a timing threshold, so host load does
+not turn it into a flaky correctness gate. Sentinels execute inside the one
+existing fixed command and add no SSH round trip.
+
+### Final focused-review closure
+
+The pre-commit read-only review found no Critical issues and four Important
+edge cases. Each received an observed RED and focused GREEN:
+
+- a quote-heavy query under 4 KiB returned an unexecuted empty/truncated search;
+  it now returns `RequestTooLarge` when the rendered command alone cannot fit a
+  candidate;
+- configured root `/` search rejected `/tmp/x` as outside the root; it now
+  derives `tmp/x` and preserves the exact actual path;
+- an inaccessible parent returned `NotFound`; walking to the nearest existing
+  unsearchable directory now returns the safe `PermissionDenied` entry;
+- mktemp setup failure retried and ended as `RemoteCapabilityMissing`; setup
+  and I/O failures now remain ordinary `RemoteExit` with `P=1/C=1`, while a
+  successful wrong 0755 directory or non-FIFO result remains a genuine stale
+  `search_bound` mismatch and retries exactly once.
+
+The review's cleanup recommendation also added an incompatible `rm` shim: the
+exact `search_bound` flag becomes false and the outer probe still removes its
+private directory.
+
 ## Bounds and Security Review
 
 - Input paths 64 KiB; stat 256 paths; read 32 paths; list depth 32 and 10,000
@@ -131,8 +205,9 @@ launches remain owned by `SshRunner`; `src/remote` launches no process.
 
 - `cargo fmt --check`: passed
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed
-- `cargo test --test remote_ops -- --nocapture`: 23 passed, 0 failed
-- `cargo test --all-targets`: 117 passed, 0 failed
+- `cargo test --test remote_ops -- --nocapture`: 30 passed, 0 failed
+- `cargo test --all-targets`: 124 passed, 0 failed (12 lib, 25 core,
+  30 remote operations, 57 SSH transport)
 - `git diff --check`: passed
 - `__pycache__`: both pre-existing untracked trees preserved and unstaged
 
