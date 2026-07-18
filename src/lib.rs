@@ -1,7 +1,9 @@
+pub mod capability;
 pub mod config;
 pub mod error;
 pub mod path;
 pub mod quote;
+pub mod ssh;
 
 pub use error::{BridgeError, BridgeResult, ErrorCode, ErrorDetails};
 
