@@ -50,6 +50,14 @@ pub struct ErrorDetails {
     pub bytes_seen: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutation_may_have_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_changed_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_unknown_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

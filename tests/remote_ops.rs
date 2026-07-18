@@ -11,11 +11,11 @@ use codex_ssh_bridge::capability::ShellRequest;
 use codex_ssh_bridge::output::OutputStore;
 use codex_ssh_bridge::output::StreamKind;
 use codex_ssh_bridge::remote::{
-    EncodedValue, EntryError, EntryErrorCode, HostInfo, HostsResult, ListEntry, ListRequest,
-    ListResult, OutputReadResult, ReadEntry, ReadRequest, ReadResult, RemoteBridge, RemoteContext,
-    RemoteFileKind, RemoteMetadata, SearchEngine, SearchMatch, SearchRequest, SearchResult,
-    ShellMetadata, ShellName, StatEntry, StatRequest, StatResult, ValueEncoding, WriteEncoding,
-    WriteMode, WriteOperation, WriteRequest, WriteResult,
+    ApplyPatchRequest, ApplyPatchResult, EncodedValue, EntryError, EntryErrorCode, HostInfo,
+    HostsResult, ListEntry, ListRequest, ListResult, OutputReadResult, ReadEntry, ReadRequest,
+    ReadResult, RemoteBridge, RemoteContext, RemoteFileKind, RemoteMetadata, SearchEngine,
+    SearchMatch, SearchRequest, SearchResult, ShellMetadata, ShellName, StatEntry, StatRequest,
+    StatResult, ValueEncoding, WriteEncoding, WriteMode, WriteOperation, WriteRequest, WriteResult,
 };
 use codex_ssh_bridge::ssh::{RunRequest, RuntimePaths, SshRunner};
 use codex_ssh_bridge::{BridgeError, ErrorCode};
@@ -324,6 +324,103 @@ fn task5_write_result_shape_and_unknown_error_are_closed() {
             "details": {"mutation_may_have_applied": true}
         })
     );
+}
+
+#[test]
+fn task6_request_result_and_error_progress_shapes_are_closed() {
+    let request = ApplyPatchRequest {
+        host: "dev".to_owned(),
+        patch: "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n".to_owned(),
+    };
+    assert_eq!(request.host, "dev");
+
+    let result = ApplyPatchResult {
+        context: context(),
+        changed_paths: vec!["a".to_owned()],
+    };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({
+            "remote": true,
+            "host": "dev",
+            "physical_root": "/physical/root",
+            "shell": {"kind": "sh", "version": null, "fallback": false},
+            "changed_paths": ["a"]
+        })
+    );
+
+    let error = BridgeError {
+        code: ErrorCode::WriteConflict,
+        message: "patch failed".to_owned(),
+        retryable: false,
+        details: codex_ssh_bridge::ErrorDetails {
+            failed_path: Some("b".to_owned()),
+            changed_paths: Some(vec!["a".to_owned()]),
+            not_changed_paths: Some(vec!["b".to_owned(), "c".to_owned()]),
+            outcome_unknown_paths: Some(Vec::new()),
+            ..Default::default()
+        },
+    };
+    let json = serde_json::to_value(error).unwrap();
+    assert_eq!(json["details"]["failed_path"], "b");
+    assert_eq!(json["details"]["changed_paths"], serde_json::json!(["a"]));
+    assert_eq!(
+        json["details"]["not_changed_paths"],
+        serde_json::json!(["b", "c"])
+    );
+    assert_eq!(
+        json["details"]["outcome_unknown_paths"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn task6_preparse_rejection_has_no_progress_details() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+    let error = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: "GIT binary patch\n".to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(error.details.failed_path, None);
+    assert_eq!(error.details.changed_paths, None);
+    assert_eq!(error.details.not_changed_paths, None);
+    assert_eq!(error.details.outcome_unknown_paths, None);
+}
+
+#[tokio::test]
+async fn task6_postparse_local_failure_partitions_every_path() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+    let error = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: concat!(
+                    "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+                    "--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+new\n",
+                )
+                .to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(error.details.failed_path, None);
+    assert_eq!(error.details.changed_paths, Some(Vec::new()));
+    assert_eq!(
+        error.details.not_changed_paths,
+        Some(vec!["a".to_owned(), "b".to_owned()])
+    );
+    assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
 }
 
 #[tokio::test]
