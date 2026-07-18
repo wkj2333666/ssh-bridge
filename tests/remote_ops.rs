@@ -432,6 +432,7 @@ async fn task78_patch_mutation_result_corruption_keeps_context_and_progress_trut
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown);
+    assert_eq!(error.details.mutation_may_have_applied, Some(true));
     assert_eq!(error.details.failed_path.as_deref(), Some("malformed"));
     assert_eq!(error.details.changed_paths, Some(Vec::new()));
     assert_eq!(
@@ -448,6 +449,182 @@ async fn task78_patch_mutation_result_corruption_keeps_context_and_progress_trut
         b"first\n"
     );
     assert!(!remote.path().join("later").exists());
+}
+
+#[tokio::test]
+async fn task78_patch_second_snapshot_cancellation_keeps_first_snapshot_context() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("a"), b"old\n").unwrap();
+    std::fs::write(remote.path().join("b"), b"old\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let second_started = controls.path().join("second-started");
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("stat"),
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" -- ./b \"*) : >{}; /usr/bin/sleep 10;; esac\nexec /usr/bin/stat \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(second_started.to_str().unwrap()).unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) =
+        fixture_with_options(remote.path(), false, None, &[("PATH", path)]);
+    let bridge = Arc::new(bridge);
+    let cancel = CancellationToken::new();
+    let task_bridge = Arc::clone(&bridge);
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        task_bridge
+            .apply_patch(
+                ApplyPatchRequest {
+                    host: "dev".to_owned(),
+                    patch: concat!(
+                        "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+                        "--- a/b\n+++ b/b\n@@ -1 +1 @@\n-old\n+new\n",
+                    )
+                    .to_owned(),
+                },
+                task_cancel,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !second_started.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second snapshot did not start");
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancelled patch did not stop")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    assert_task78_fixed_context(&error, remote.path());
+    assert_eq!(error.details.failed_path.as_deref(), Some("b"));
+    assert_eq!(error.details.changed_paths, Some(Vec::new()));
+    assert_eq!(
+        error.details.not_changed_paths,
+        Some(vec!["a".to_owned(), "b".to_owned()])
+    );
+    assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
+    assert_eq!(error.details.mutation_may_have_applied, None);
+    assert_eq!(std::fs::read(remote.path().join("a")).unwrap(), b"old\n");
+    assert_eq!(std::fs::read(remote.path().join("b")).unwrap(), b"old\n");
+}
+
+#[tokio::test]
+async fn task78_read_second_reprobe_cancellation_uses_first_result_context() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("entry"), b"payload\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let mismatch = controls.path().join("mismatch-used");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            ("FAKE_SSH_MISMATCH_FILE", mismatch.as_os_str().to_owned()),
+            ("FAKE_SSH_MISMATCH_KEY", OsString::from("read_slice")),
+            ("FAKE_SSH_FIXED_SLEEP_SECONDS", OsString::from("10")),
+        ],
+    );
+    let bridge = Arc::new(bridge);
+    let cancel = CancellationToken::new();
+    let task_bridge = Arc::clone(&bridge);
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        task_bridge
+            .read(
+                ReadRequest {
+                    host: "dev".to_owned(),
+                    paths: vec!["entry".to_owned()],
+                    start_line: None,
+                    max_lines: None,
+                    max_bytes: None,
+                },
+                task_cancel,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !mismatch.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first capability mismatch was not observed");
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancelled reprobe did not stop")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    assert_task78_fixed_context(&error, remote.path());
+}
+
+#[tokio::test]
+async fn task78_search_engine_cancellation_keeps_candidate_context() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("entry"), b"needle\n").unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let engine_started = controls.path().join("engine-started");
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("grep"),
+        format!(
+            "#!/bin/sh\nlast=\nfor last do :; done\nif [ \"$last\" = {} ]; then : >{}; /usr/bin/sleep 10; fi\nexec /usr/bin/grep \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(remote.path().join("entry").to_str().unwrap())
+                .unwrap(),
+            codex_ssh_bridge::quote::shell_word(engine_started.to_str().unwrap()).unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) =
+        fixture_with_options(remote.path(), false, None, &[("PATH", path)]);
+    let bridge = Arc::new(bridge);
+    let cancel = CancellationToken::new();
+    let task_bridge = Arc::clone(&bridge);
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        task_bridge
+            .search(
+                SearchRequest {
+                    host: "dev".to_owned(),
+                    query: "needle".to_owned(),
+                    path: None,
+                    globs: Vec::new(),
+                    max_results: None,
+                    binary: None,
+                },
+                task_cancel,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !engine_started.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("search engine did not start");
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancelled search did not stop")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    assert_task78_fixed_context(&error, remote.path());
 }
 
 fn metadata() -> RemoteMetadata {
@@ -6391,6 +6568,7 @@ async fn search_quote_amplification_over_frame_is_request_too_large() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::RequestTooLarge);
+    assert_task78_fixed_context(&error, remote.path());
 }
 
 #[tokio::test]
