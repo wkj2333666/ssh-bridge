@@ -1,6 +1,12 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use codex_ssh_bridge::error::ErrorShellMetadata;
+use codex_ssh_bridge::mcp::stdio::{
+    CappedJsonBuffer, FrameEvent, FrameReader, MIN_MCP_FRAME_BYTES, SerializeLineError,
+    exact_tools_list_response_bytes, required_mcp_frame_bytes, serialize_json_line,
+    write_json_line,
+};
 use codex_ssh_bridge::mcp::{
     CallToolResult, MAX_INVALID_ARGUMENT_ACTION_BYTES, ProtocolState, RequestId,
     SUPPORTED_PROTOCOL_VERSIONS, StrictJsonError, ToolAnnotations, ToolCallContext, ToolDefinition,
@@ -9,7 +15,11 @@ use codex_ssh_bridge::mcp::{
     request_too_large_response, result_response, server_busy_response,
     server_not_initialized_response,
 };
+use codex_ssh_bridge::{BridgeError, ErrorCode, ErrorDetails};
+use serde::Serialize;
 use serde_json::{Value, json};
+use std::io::Write;
+use tokio::io::{AsyncReadExt, BufReader};
 
 fn nested_arrays(depth: usize) -> Vec<u8> {
     let mut input = Vec::with_capacity(depth * 2 + 4);
@@ -464,4 +474,327 @@ fn task7_tool_service_future_and_context_contract_are_sendable() {
         },
     );
     require_send(future);
+}
+
+#[tokio::test]
+async fn task7_frame_reader_accepts_exact_limit_and_recovers_after_plus_one() {
+    let wire = b"12345678\n123456789\n{}\n";
+    let mut reader = FrameReader::new(BufReader::with_capacity(3, wire.as_slice()), 8);
+    assert_eq!(
+        reader.next_frame().await.unwrap(),
+        FrameEvent::Frame(b"12345678".to_vec())
+    );
+    assert_eq!(reader.next_frame().await.unwrap(), FrameEvent::Oversized);
+    assert_eq!(
+        reader.next_frame().await.unwrap(),
+        FrameEvent::Frame(b"{}".to_vec())
+    );
+    assert_eq!(reader.next_frame().await.unwrap(), FrameEvent::Eof);
+}
+
+#[tokio::test]
+async fn task7_frame_reader_handles_buffering_crlf_empty_and_partial_eof() {
+    let wire = b"{}\n[]\r\n\n{\"raw\":\xff}\npartial";
+    let mut reader = FrameReader::new(BufReader::with_capacity(64, wire.as_slice()), 64);
+    for expected in [
+        b"{}".as_slice(),
+        b"[]\r".as_slice(),
+        b"".as_slice(),
+        b"{\"raw\":\xff}".as_slice(),
+    ] {
+        let event = reader.next_frame().await.unwrap();
+        assert_eq!(event, FrameEvent::Frame(expected.to_vec()));
+        if expected.contains(&0xff) {
+            let FrameEvent::Frame(raw) = event else {
+                unreachable!();
+            };
+            assert_eq!(parse_strict_json(&raw), Err(StrictJsonError::Syntax));
+        }
+    }
+    assert_eq!(reader.next_frame().await.unwrap(), FrameEvent::PartialEof);
+    assert_eq!(reader.next_frame().await.unwrap(), FrameEvent::Eof);
+}
+
+#[tokio::test]
+async fn task7_frame_reader_reports_empty_eof_and_oversized_partial_eof() {
+    let mut empty = FrameReader::new(BufReader::new(&b""[..]), 4);
+    assert_eq!(empty.next_frame().await.unwrap(), FrameEvent::Eof);
+
+    let mut partial = FrameReader::new(BufReader::new(&b"12345"[..]), 4);
+    assert_eq!(partial.next_frame().await.unwrap(), FrameEvent::PartialEof);
+    assert_eq!(partial.next_frame().await.unwrap(), FrameEvent::Eof);
+}
+
+#[test]
+fn task7_capped_writer_accepts_exact_limit_and_rejects_first_extra_byte() {
+    let mut output = CappedJsonBuffer::new(8);
+    assert_eq!(output.write(b"12345678").unwrap(), 8);
+    assert!(output.write(b"9").is_err());
+    assert_eq!(output.into_inner(), b"12345678");
+}
+
+#[tokio::test]
+async fn task7_capped_writer_emits_one_injection_safe_json_line() {
+    let value = json!({"text":"line\n\0界 {\"jsonrpc\":\"2.0\"}"});
+    let expected_without_delimiter = serde_json::to_vec(&value).unwrap();
+    let line = serialize_json_line(&value, expected_without_delimiter.len()).unwrap();
+    assert_eq!(line.last(), Some(&b'\n'));
+    assert!(!line[..line.len() - 1].contains(&b'\n'));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&line[..line.len() - 1]).unwrap(),
+        value
+    );
+    assert!(matches!(
+        serialize_json_line(&value, expected_without_delimiter.len() - 1),
+        Err(SerializeLineError::CapacityExceeded)
+    ));
+
+    let (mut tx, mut rx) = tokio::io::duplex(line.len() + 8);
+    write_json_line(&mut tx, &value, expected_without_delimiter.len())
+        .await
+        .unwrap();
+    drop(tx);
+    let mut actual = Vec::new();
+    rx.read_to_end(&mut actual).await.unwrap();
+    assert_eq!(actual, line);
+}
+
+struct HostileSerializer;
+
+impl Serialize for HostileSerializer {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(serde::ser::Error::custom(
+            "HOSTILE caller-controlled serializer diagnostic",
+        ))
+    }
+}
+
+#[test]
+fn task7_capped_writer_errors_are_classified_and_do_not_echo_diagnostics() {
+    let error = serialize_json_line(&HostileSerializer, 64).unwrap_err();
+    assert!(matches!(error, SerializeLineError::Serialization));
+    assert_eq!(error.to_string(), "failed to serialize compact JSON frame");
+    assert!(!error.to_string().contains("HOSTILE"));
+
+    let capacity = serialize_json_line(&json!({"value":"too long"}), 1).unwrap_err();
+    assert!(matches!(capacity, SerializeLineError::CapacityExceeded));
+    assert_eq!(
+        capacity.to_string(),
+        "compact JSON frame exceeds configured bound"
+    );
+}
+
+fn stub_definition(description: &str) -> ToolDefinition {
+    ToolDefinition {
+        name: "remote_read".into(),
+        title: "Read remote file".into(),
+        description: description.into(),
+        input_schema: json!({"type":"object","additionalProperties":false}),
+        annotations: ToolAnnotations {
+            read_only_hint: true,
+            destructive_hint: false,
+            idempotent_hint: true,
+            open_world_hint: false,
+        },
+    }
+}
+
+#[test]
+fn task7_min_frame_counts_complete_tools_list_and_definition_growth() {
+    let id = RequestId::synthetic_max_wire();
+    let short = vec![stub_definition("bounded")];
+    let long = vec![stub_definition(&"x".repeat(4096))];
+    let short_count = exact_tools_list_response_bytes(&short, &id).unwrap();
+    let long_count = exact_tools_list_response_bytes(&long, &id).unwrap();
+    assert!(long_count > short_count);
+
+    let fallback = MIN_MCP_FRAME_BYTES + 17;
+    let envelope = serde_json::to_vec(&result_response(id.clone(), Value::Null))
+        .unwrap()
+        .len()
+        - b"null".len();
+    assert_eq!(
+        required_mcp_frame_bytes(&short, fallback, &id).unwrap(),
+        (envelope + fallback).max(short_count)
+    );
+    let required = required_mcp_frame_bytes(&short, fallback, &id).unwrap();
+    assert!(WireBudget::for_response(required, &id, fallback).is_some());
+    assert_eq!(
+        required_mcp_frame_bytes(&long, 0, &id).unwrap(),
+        MIN_MCP_FRAME_BYTES.max(long_count)
+    );
+}
+
+#[derive(Serialize)]
+struct ProjectedContext<'a> {
+    remote: bool,
+    host: &'a str,
+    physical_root: &'a str,
+    shell: ProjectedShell<'a>,
+}
+
+#[derive(Serialize)]
+struct ProjectedShell<'a> {
+    kind: &'a str,
+    version: &'a str,
+    fallback: bool,
+}
+
+#[derive(Serialize)]
+struct ProjectedCore<'a> {
+    code: ErrorCode,
+    message: &'a str,
+    retryable: bool,
+    mutation_may_have_applied: bool,
+    action: &'a str,
+    warnings: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectedStructured<'a> {
+    #[serde(flatten)]
+    context: &'a ProjectedContext<'a>,
+    error: &'a ProjectedCore<'a>,
+}
+
+#[test]
+fn task7_min_frame_authoritative_future_renderer_projection_fits_compiled_floor() {
+    // Task 7 replaces this shape-only projection with its real RenderedErrorCore
+    // assertion. Keeping it test-only avoids inventing renderer semantics early.
+    let root = format!(
+        "/{}",
+        "\u{1}".repeat(codex_ssh_bridge::config::MAX_REMOTE_CONTEXT_ROOT_BYTES - 1)
+    );
+    assert_eq!(
+        root.len(),
+        codex_ssh_bridge::config::MAX_REMOTE_CONTEXT_ROOT_BYTES
+    );
+    let version = "v".repeat(codex_ssh_bridge::capability::MAX_SHELL_VERSION_BYTES);
+    // Task 7's real safe-string projection must replace every Unicode control
+    // character with one ASCII '?' before/during UTF-8-bound truncation. Quotes
+    // and backslashes are therefore the largest legal JSON-escaping pattern.
+    let message = "\"\\".repeat(512);
+    let action = "\\\"".repeat(512);
+    let warning = "\"\\".repeat(512);
+    let bridge_error = BridgeError {
+        code: ErrorCode::MutationOutcomeUnknown,
+        message: message.clone(),
+        retryable: false,
+        details: ErrorDetails {
+            host: Some("largest-host".into()),
+            physical_root: Some(root.clone()),
+            shell: Some(ErrorShellMetadata {
+                kind: "bash".into(),
+                version: Some(version.clone()),
+                fallback: false,
+            }),
+            mutation_may_have_applied: Some(true),
+            suggested_action: Some(action.clone()),
+            ..ErrorDetails::default()
+        },
+    };
+    let error_shell = bridge_error.details.shell.as_ref().unwrap();
+    let context = ProjectedContext {
+        remote: true,
+        host: bridge_error.details.host.as_deref().unwrap(),
+        physical_root: bridge_error.details.physical_root.as_deref().unwrap(),
+        shell: ProjectedShell {
+            kind: &error_shell.kind,
+            version: error_shell.version.as_deref().unwrap(),
+            fallback: error_shell.fallback,
+        },
+    };
+    let core = ProjectedCore {
+        code: bridge_error.code,
+        message: &bridge_error.message,
+        retryable: bridge_error.retryable,
+        mutation_may_have_applied: true,
+        action: bridge_error.details.suggested_action.as_deref().unwrap(),
+        warnings: vec![warning.as_str(); 16],
+    };
+    let projected = ProjectedStructured {
+        context: &context,
+        error: &core,
+    };
+    let core_value = serde_json::to_value(&core).unwrap();
+    assert!(core_value.get("host").is_none());
+    assert!(core_value.get("physical_root").is_none());
+    assert!(core_value.get("shell").is_none());
+    let projected_value = serde_json::to_value(&projected).unwrap();
+    assert_eq!(projected_value["physical_root"], root);
+    assert!(projected_value["error"].get("host").is_none());
+    assert!(projected_value["error"].get("physical_root").is_none());
+    assert!(projected_value["error"].get("shell").is_none());
+    let inner = serde_json::to_string(&projected).unwrap();
+    let parsed_inner: Value = serde_json::from_str(&inner).unwrap();
+    assert_eq!(count_exact_string(&parsed_inner, &root), 1);
+    let result = json!({
+        "content":[{"type":"text","text":inner}],
+        "structuredContent": projected,
+        "isError":true
+    });
+    assert_eq!(count_exact_string(&result["structuredContent"], &root), 1);
+    let response = result_response(RequestId::synthetic_max_wire(), result);
+    let exact = serde_json::to_vec(&response).unwrap().len();
+    eprintln!("authoritative worst safe fallback bytes={exact}");
+    assert!(serialize_json_line(&response, exact).is_ok());
+    assert!(matches!(
+        serialize_json_line(&response, exact - 1),
+        Err(SerializeLineError::CapacityExceeded)
+    ));
+    let bytes = serialize_json_line(&response, MIN_MCP_FRAME_BYTES).unwrap();
+    assert!(bytes.len() - 1 <= MIN_MCP_FRAME_BYTES);
+}
+
+fn count_exact_string(value: &Value, needle: &str) -> usize {
+    match value {
+        Value::String(value) => usize::from(value == needle),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| count_exact_string(value, needle))
+            .sum(),
+        Value::Object(values) => values
+            .values()
+            .map(|value| count_exact_string(value, needle))
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
+#[test]
+fn task7_min_frame_wire_budget_reserves_envelope_id_and_fallback_only() {
+    let id = RequestId::synthetic_max_wire();
+    let fallback_bytes = 8192;
+    let envelope_bytes = serde_json::to_vec(&result_response(id.clone(), Value::Null))
+        .unwrap()
+        .len()
+        - b"null".len();
+    let frame = envelope_bytes + fallback_bytes + 123;
+    let budget = WireBudget::for_response(frame, &id, fallback_bytes).unwrap();
+    assert_eq!(budget.result_bytes, 123);
+    assert_eq!(budget.compact_fallback_bytes, fallback_bytes);
+    assert!(
+        WireBudget::for_response(envelope_bytes + fallback_bytes - 1, &id, fallback_bytes)
+            .is_none()
+    );
+    assert_eq!(
+        serde_json::to_vec(&id).unwrap().len(),
+        codex_ssh_bridge::mcp::MAX_REQUEST_ID_WIRE_BYTES
+    );
+
+    let manually_constructed_oversized_id = RequestId::String("x".repeat(255));
+    assert!(
+        serde_json::to_vec(&manually_constructed_oversized_id)
+            .unwrap()
+            .len()
+            > codex_ssh_bridge::mcp::MAX_REQUEST_ID_WIRE_BYTES
+    );
+    assert!(
+        WireBudget::for_response(frame, &manually_constructed_oversized_id, fallback_bytes)
+            .is_none()
+    );
 }

@@ -474,7 +474,11 @@ largest compact fallback model. It starts with an actual maximum `BridgeError`
 whose `ErrorDetails` contains a maximum control-heavy physical root and maximum
 shell version, projects it through `RenderedErrorCore`, and proves the root
 occurs in exactly the two intended contexts. It also uses maximum bounded safe
-message/action/warnings and the synthetic maximum ID. `McpServer::new` also
+message/action/warnings using the worst legal alternating quote/backslash
+pattern and the synthetic maximum ID. Control-heavy message/action/warning
+inputs are not legal projections: Task 7 replaces every Unicode
+`char::is_control()` with the single ASCII byte `?` before or while applying
+the UTF-8-byte bound. `McpServer::new` also
 counting-serializes its trusted
 `service.definitions()` with that ID to calculate the exact complete,
 non-degradable `tools/list` response. The effective minimum is the maximum of
@@ -971,14 +975,20 @@ bulk/context fields.
 Wire-safe projections bound all remaining human strings: error message and
 suggested action are each at most 1,024 UTF-8 bytes, at most 16 warnings are
 emitted, and each warning is at most 1,024 bytes. Stable fixed strings normally
-fit unchanged; an unexpectedly longer safe string is truncated at a UTF-8
-boundary and the metadata sets `message_truncated` or `warnings_truncated`.
+fit unchanged. Before or during UTF-8-bound truncation, every Unicode
+`char::is_control()` is normalized to the single ASCII byte `?`; quotes,
+backslashes, ordinary Unicode, and other non-control characters are preserved.
+An unexpectedly longer safe string is truncated at a UTF-8 boundary and the
+metadata sets `message_truncated` or `warnings_truncated`.
 Error code, remote context, mutation truth/status/counts, retention status, and
 progress are never truncated. The real maximum compact-fallback counting model
 starts from a maximum actual `ErrorDetails`, applies `RenderedErrorCore`, and
 uses maximum message/action/warnings as well as maximum root and shell version;
-it asserts the root is absent from nested structured error detail and counts
-only the intended Text and structured-top-level context copies.
+its safe strings use the worst legal alternating quote/backslash pattern. It
+asserts the root is absent from nested structured error detail and counts only
+the intended Text and structured-top-level context copies. Task 4 uses an
+equivalent test-only projection; Task 7 must replace it with the real sanitizer
+and `RenderedErrorCore` projection.
 
 Known-tool argument validation uses the same result channel with stable code
 `INVALID_ARGUMENT`; its text gives a safe correction such as “provide

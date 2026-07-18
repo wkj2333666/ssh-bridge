@@ -294,8 +294,14 @@ without changing the original code, retryability, or mutation progress.
 
 The safe wire projection bounds message and suggested action to 1,024 UTF-8
 bytes each and warnings to at most 16 entries of 1,024 bytes. Truncation occurs
-only at UTF-8 boundaries and sets `message_truncated` or `warnings_truncated`;
-code, context, shell, truth, counts, and progress are never truncated.
+only at UTF-8 boundaries. Before or during truncation, every Unicode
+`char::is_control()` is normalized to one ASCII `?`; quotes, backslashes,
+ordinary Unicode, and other non-control characters are preserved. The
+projection sets `message_truncated` or `warnings_truncated`; code, context,
+shell, truth, counts, and progress are never truncated. Authoritative worst-case
+tests use alternating quote/backslash bytes for every maximum safe field;
+Task 4's test-only projection is replaced by the real sanitizer/projection in
+Task 7.
 Renderers construct `RenderedErrorCore`, Text, and structured metadata directly
 rather than serializing a complete `BridgeError` and deleting or cloning
 fields.

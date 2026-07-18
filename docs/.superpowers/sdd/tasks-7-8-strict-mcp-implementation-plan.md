@@ -872,7 +872,11 @@ Start with an actual maximum `BridgeError`/`ErrorDetails`, project it through
 `RenderedErrorCore`, and assert physical root/host/shell are absent from nested
 `structuredContent.error.details` and occur only in Text context and structured
 top-level context. Populate the same model with maximum bounded safe
-error/action/warnings. Counting-serialize that real model and
+error/action/warnings using alternating quote/backslash bytes, the worst legal
+escaping pattern after Task 7 normalizes every Unicode `char::is_control()` to
+the single ASCII byte `?` before or during UTF-8-bound truncation. Task 4 may
+use an equivalent test-only projection, but Task 7 must replace it with the
+real sanitizer and `RenderedErrorCore`. Counting-serialize that real model and
 maximum ID and assert it fits the compile minimum; do not substitute a hand
 calculation for this authoritative test. With trusted stub definitions, use a counting serializer and
 synthetic maximum-wire ID to derive the non-degradable complete `tools/list`
@@ -1640,10 +1644,12 @@ Assert:
   `Vec<u8>` or `serde_json::Value` clone;
 - error output excludes command, stdin, patch, remote file bytes, fake SSH
   stderr, ControlPath, runtime directory, and agent-socket sentinel strings.
-- maximum 1,024-byte safe message/action, 16 warnings of 1,024 bytes, and
+- maximum 1,024-byte safe message/action, 16 warnings of 1,024 bytes using the
+  worst legal alternating quote/backslash pattern, and
   maximum 256-byte shell version fit the real compact-fallback count; +1 inputs
-  truncate at UTF-8 boundaries with explicit truncation flags while code,
-  context, truth, counts, and progress remain exact.
+  normalize every Unicode `char::is_control()` to one ASCII `?`, truncate at
+  UTF-8 boundaries with explicit truncation flags, and preserve quotes,
+  backslashes, ordinary Unicode, code, context, truth, counts, and progress.
 
 - [ ] **Step 4: Run dispatch/render tests and verify RED**
 
@@ -1731,9 +1737,12 @@ bulk.
 
 Bound the wire projection—not the semantic error code—to 1,024 UTF-8 bytes for
 message and action, 16 warnings, and 1,024 bytes per warning. Truncate only at a
-UTF-8 boundary and set `message_truncated`/`warnings_truncated`. Never truncate
-code, physical root, shell kind/version within its shared bound, mutation
-truth/status/counts, retention status, or Task 6 progress.
+UTF-8 boundary and set `message_truncated`/`warnings_truncated`. Before or
+during truncation, replace every Unicode `char::is_control()` with the single
+ASCII byte `?`; preserve quotes, backslashes, ordinary Unicode, and all other
+non-control characters. Never truncate code, physical root, shell kind/version
+within its shared bound, mutation truth/status/counts, retention status, or
+Task 6 progress.
 
 Render against the `WireBudget` supplied by the lifecycle owner. Preconstruct a
 compact fallback before the full projection. Hosts/list/stat/search/read retain
