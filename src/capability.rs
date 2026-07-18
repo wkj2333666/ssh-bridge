@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, watch};
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::path::RemotePath;
@@ -30,7 +30,11 @@ set -u
 
 requested_root=$1
 cd -- "$requested_root" || exit 1
-physical_root=$(pwd -P) || exit 1
+physical_plus=$(pwd -P && printf x) || exit 1
+physical_with_delimiter=${physical_plus%x}
+newline='
+'
+physical_root=${physical_with_delimiter%"$newline"}
 
 emit_record() {
     printf '%s=%s\000' "$1" "$2"
@@ -258,8 +262,29 @@ fn protocol_error(message: &str) -> BridgeError {
 }
 
 #[derive(Debug, Default)]
+struct CacheState {
+    entries: HashMap<String, Arc<OnceCell<Arc<Capability>>>>,
+    in_flight: HashMap<String, Arc<ProbeFlight>>,
+}
+
+#[derive(Debug)]
+struct ProbeFlight {
+    cell: Arc<OnceCell<Arc<Capability>>>,
+    outcome: watch::Receiver<Option<BridgeResult<Arc<Capability>>>>,
+}
+
+enum CacheLookup {
+    Ready(Arc<Capability>),
+    Leader {
+        flight: Arc<ProbeFlight>,
+        sender: watch::Sender<Option<BridgeResult<Arc<Capability>>>>,
+    },
+    Follower(Arc<ProbeFlight>),
+}
+
+#[derive(Debug, Default)]
 pub struct CapabilityCache {
-    entries: Mutex<HashMap<String, Arc<OnceCell<Arc<Capability>>>>>,
+    state: Mutex<CacheState>,
 }
 
 impl CapabilityCache {
@@ -268,34 +293,95 @@ impl CapabilityCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = BridgeResult<Capability>>,
     {
-        let cell = {
-            let mut entries = self.entries.lock().await;
-            Arc::clone(
-                entries
-                    .entry(host.to_owned())
-                    .or_insert_with(|| Arc::new(OnceCell::new())),
-            )
-        };
-
-        match cell
-            .get_or_try_init(|| async { probe().await.map(Arc::new) })
-            .await
-        {
-            Ok(capability) => Ok(Arc::clone(capability)),
-            Err(error) => {
-                let mut entries = self.entries.lock().await;
-                if entries
-                    .get(host)
-                    .is_some_and(|current| Arc::ptr_eq(current, &cell))
-                {
-                    entries.remove(host);
+        let mut probe = Some(probe);
+        loop {
+            let lookup = {
+                let mut state = self.state.lock().await;
+                let cell = Arc::clone(
+                    state
+                        .entries
+                        .entry(host.to_owned())
+                        .or_insert_with(|| Arc::new(OnceCell::new())),
+                );
+                if let Some(capability) = cell.get() {
+                    CacheLookup::Ready(Arc::clone(capability))
+                } else if let Some(flight) = state.in_flight.get(host) {
+                    CacheLookup::Follower(Arc::clone(flight))
+                } else {
+                    let (sender, outcome) = watch::channel(None);
+                    let flight = Arc::new(ProbeFlight { cell, outcome });
+                    state.in_flight.insert(host.to_owned(), Arc::clone(&flight));
+                    CacheLookup::Leader { flight, sender }
                 }
-                Err(error)
+            };
+
+            match lookup {
+                CacheLookup::Ready(capability) => return Ok(capability),
+                CacheLookup::Follower(flight) => match wait_for_probe(&flight).await {
+                    ProbeWait::Completed(outcome) => return outcome,
+                    ProbeWait::Abandoned => {
+                        self.remove_generation(host, &flight, true).await;
+                    }
+                },
+                CacheLookup::Leader { flight, sender } => {
+                    let run_probe = probe.take().expect("only a leader consumes its probe");
+                    let outcome = run_probe().await.map(Arc::new);
+                    if let Ok(capability) = &outcome {
+                        let _ = flight.cell.set(Arc::clone(capability));
+                    }
+
+                    self.remove_generation(host, &flight, outcome.is_err())
+                        .await;
+                    sender.send_replace(Some(outcome.clone()));
+                    return outcome;
+                }
             }
         }
     }
 
+    async fn remove_generation(&self, host: &str, flight: &Arc<ProbeFlight>, remove_cell: bool) {
+        let mut state = self.state.lock().await;
+        if remove_cell
+            && state
+                .entries
+                .get(host)
+                .is_some_and(|current| Arc::ptr_eq(current, &flight.cell))
+        {
+            state.entries.remove(host);
+        }
+        if state
+            .in_flight
+            .get(host)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            state.in_flight.remove(host);
+        }
+    }
+
     pub async fn invalidate(&self, host: &str) -> bool {
-        self.entries.lock().await.remove(host).is_some()
+        let mut state = self.state.lock().await;
+        let entry_removed = state.entries.remove(host).is_some();
+        let flight_removed = state.in_flight.remove(host).is_some();
+        entry_removed || flight_removed
+    }
+}
+
+enum ProbeWait {
+    Completed(BridgeResult<Arc<Capability>>),
+    Abandoned,
+}
+
+async fn wait_for_probe(flight: &ProbeFlight) -> ProbeWait {
+    let mut receiver = flight.outcome.clone();
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return ProbeWait::Completed(outcome);
+        }
+        if receiver.changed().await.is_err() {
+            if let Some(outcome) = receiver.borrow().clone() {
+                return ProbeWait::Completed(outcome);
+            }
+            return ProbeWait::Abandoned;
+        }
     }
 }

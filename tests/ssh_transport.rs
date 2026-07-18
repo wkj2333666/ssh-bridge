@@ -19,6 +19,7 @@ use codex_ssh_bridge::error::{BridgeError, ErrorCode};
 use codex_ssh_bridge::path::RemotePath;
 use codex_ssh_bridge::ssh::{RuntimePaths, SshPolicy, build_ssh_argv};
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 use support::{config_with_host, fake_ssh_path};
 
@@ -173,6 +174,26 @@ fn runtime_paths_refuse_insecure_modes_and_symlinks() {
     symlink(&target, symlink_base.path().join("codex-ssh-bridge")).unwrap();
     let symlink_error = RuntimePaths::ensure_from_base(symlink_base.path()).unwrap_err();
     assert_eq!(symlink_error.code, ErrorCode::InvalidConfig);
+
+    let special_mode_base = TempDir::new().unwrap();
+    let special_mode = special_mode_base.path().join("codex-ssh-bridge");
+    fs::create_dir(&special_mode).unwrap();
+    fs::set_permissions(&special_mode, fs::Permissions::from_mode(0o1700)).unwrap();
+    let special_mode_error = RuntimePaths::ensure_from_base(special_mode_base.path()).unwrap_err();
+    assert_eq!(special_mode_error.code, ErrorCode::InvalidConfig);
+
+    let real_base_container = TempDir::new().unwrap();
+    let real_base = real_base_container.path().join("real-base");
+    fs::create_dir(&real_base).unwrap();
+    let linked_base = real_base_container.path().join("linked-base");
+    symlink(&real_base, &linked_base).unwrap();
+    let linked_base_error = RuntimePaths::ensure_from_base(&linked_base).unwrap_err();
+    assert_eq!(linked_base_error.code, ErrorCode::InvalidConfig);
+
+    let writable_base = TempDir::new().unwrap();
+    fs::set_permissions(writable_base.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    let writable_base_error = RuntimePaths::ensure_from_base(writable_base.path()).unwrap_err();
+    assert_eq!(writable_base_error.code, ErrorCode::InvalidConfig);
 }
 
 #[test]
@@ -340,12 +361,152 @@ async fn failed_probe_is_not_cached_or_allowed_to_invalidate_another_host() {
     assert!(cache.invalidate("healthy").await);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_failed_callers_share_one_outcome_then_a_new_call_retries() {
+    let cache = Arc::new(CapabilityCache::default());
+    let probes = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+
+    let first = {
+        let cache = Arc::clone(&cache);
+        let probes = Arc::clone(&probes);
+        let first_started = Arc::clone(&first_started);
+        let release_first = Arc::clone(&release_first);
+        tokio::spawn(async move {
+            cache
+                .get_or_probe("dev", || async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    first_started.notify_one();
+                    release_first.notified().await;
+                    Err(BridgeError::new(ErrorCode::Io, "first failure", false))
+                })
+                .await
+        })
+    };
+    first_started.notified().await;
+
+    let second_entered = Arc::new(Notify::new());
+    let second = {
+        let cache = Arc::clone(&cache);
+        let probes = Arc::clone(&probes);
+        let second_entered = Arc::clone(&second_entered);
+        tokio::spawn(async move {
+            second_entered.notify_one();
+            cache
+                .get_or_probe("dev", || async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    Err(BridgeError::new(ErrorCode::Io, "second failure", false))
+                })
+                .await
+        })
+    };
+    second_entered.notified().await;
+    tokio::task::yield_now().await;
+    release_first.notify_waiters();
+
+    let first_error = first.await.unwrap().unwrap_err();
+    let second_error = second.await.unwrap().unwrap_err();
+    assert_eq!(first_error.message, "first failure");
+    assert_eq!(second_error.message, "first failure");
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+    cache
+        .get_or_probe("dev", || async {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(capability(ShellKind::PosixSh))
+        })
+        .await
+        .unwrap();
+    assert_eq!(probes.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_old_generation_cannot_remove_a_new_successful_generation() {
+    let cache = Arc::new(CapabilityCache::default());
+    let old_started = Arc::new(Notify::new());
+    let release_old = Arc::new(Notify::new());
+
+    let old = {
+        let cache = Arc::clone(&cache);
+        let old_started = Arc::clone(&old_started);
+        let release_old = Arc::clone(&release_old);
+        tokio::spawn(async move {
+            cache
+                .get_or_probe("dev", || async move {
+                    old_started.notify_one();
+                    release_old.notified().await;
+                    Err(BridgeError::new(ErrorCode::Io, "old failure", false))
+                })
+                .await
+        })
+    };
+    old_started.notified().await;
+    assert!(cache.invalidate("dev").await);
+
+    cache
+        .get_or_probe("dev", || async {
+            Ok(capability(ShellKind::Bash {
+                version: "5.2.15".to_owned(),
+            }))
+        })
+        .await
+        .unwrap();
+    release_old.notify_waiters();
+    assert_eq!(old.await.unwrap().unwrap_err().message, "old failure");
+
+    let unexpected_probe = AtomicUsize::new(0);
+    let cached = cache
+        .get_or_probe("dev", || async {
+            unexpected_probe.fetch_add(1, Ordering::SeqCst);
+            Ok(capability(ShellKind::PosixSh))
+        })
+        .await
+        .unwrap();
+    assert!(matches!(cached.shell, ShellKind::Bash { .. }));
+    assert_eq!(unexpected_probe.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_probe_leader_does_not_leave_the_host_permanently_in_flight() {
+    let cache = Arc::new(CapabilityCache::default());
+    let old_started = Arc::new(Notify::new());
+    let leader = {
+        let cache = Arc::clone(&cache);
+        let old_started = Arc::clone(&old_started);
+        tokio::spawn(async move {
+            cache
+                .get_or_probe("dev", || async move {
+                    old_started.notify_one();
+                    std::future::pending::<codex_ssh_bridge::BridgeResult<Capability>>().await
+                })
+                .await
+        })
+    };
+    old_started.notified().await;
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+
+    let retry = cache.get_or_probe("dev", || async { Ok(capability(ShellKind::PosixSh)) });
+    tokio::pin!(retry);
+    tokio::select! {
+        result = &mut retry => {
+            assert_eq!(result.unwrap().shell, ShellKind::PosixSh);
+        }
+        () = async {
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        } => panic!("cancelled probe left the cache permanently in flight"),
+    }
+}
+
 #[test]
 fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directory() {
     let filesystem = TempDir::new().unwrap();
-    let physical = filesystem.path().join("physical\nroot");
+    let physical = filesystem.path().join("physical root\n\n");
     fs::create_dir(&physical).unwrap();
-    let requested = filesystem.path().join("requested\nroot");
+    let requested = filesystem.path().join("requested root\n");
     symlink(&physical, &requested).unwrap();
     let scratch = TempDir::new().unwrap();
     let requested_text = requested.to_str().unwrap();

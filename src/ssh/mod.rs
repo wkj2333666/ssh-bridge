@@ -38,6 +38,7 @@ impl RuntimePaths {
     }
 
     pub fn ensure_from_base(base: &Path) -> BridgeResult<Self> {
+        validate_runtime_base(base)?;
         Self::ensure_directory(base.join(RUNTIME_DIRECTORY))
     }
 
@@ -67,7 +68,7 @@ impl RuntimePaths {
                 "runtime directory must be owned by the current user",
             ));
         }
-        if metadata.permissions().mode() & 0o777 != 0o700 {
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
             return Err(unsafe_runtime_directory(
                 "runtime directory permissions must be 0700",
             ));
@@ -75,6 +76,28 @@ impl RuntimePaths {
 
         Ok(Self { directory })
     }
+}
+
+fn validate_runtime_base(base: &Path) -> BridgeResult<()> {
+    let metadata = fs::symlink_metadata(base).map_err(BridgeError::io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(unsafe_runtime_directory(
+            "runtime base must be a real directory",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process credentials.
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        return Err(unsafe_runtime_directory(
+            "runtime base must be owned by the current user",
+        ));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(unsafe_runtime_directory(
+            "runtime base must not be writable by group or other users",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
