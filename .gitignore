@@ -1,4 +1,5 @@
 .worktrees/
 target/
 .superpowers/
-bin/codex-ssh-bridge
+__pycache__/
+*.pyc

@@ -1,7 +1,7 @@
 {
   "name": "codex-ssh-bridge",
   "version": "0.1.0",
-  "description": "Run structured SSH operations from local Codex without installing Codex on remote hosts.",
+  "description": "Operate allowlisted SSH hosts through a local native bridge without installing or authenticating Codex remotely.",
   "author": {
     "name": "Local developer"
   },
@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "Codex SSH Bridge",
     "shortDescription": "Operate allowlisted SSH hosts from local Codex.",
-    "longDescription": "Keeps Codex and SSH credentials on the local machine while exposing bounded remote command and file tools over a dependency-free MCP server.",
+    "longDescription": "Keeps Codex, SSH credentials, and approvals on the local machine while a native Rust MCP server exposes bounded remote file and command tools.",
     "developerName": "Local developer",
     "category": "Developer Tools",
     "capabilities": [
