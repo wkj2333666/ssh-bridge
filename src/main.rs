@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_ssh_bridge::cli;
 use codex_ssh_bridge::config::Config;
 use codex_ssh_bridge::mcp::McpServer;
 use codex_ssh_bridge::mcp::tools::RemoteMcpTools;
@@ -13,13 +14,30 @@ const FATAL_PREFIX: &str = "codex-ssh-bridge fatal: ";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let mut arguments = std::env::args_os().skip(1);
-    let mode = arguments.next();
-    if mode.as_deref() != Some(std::ffi::OsStr::new("mcp")) || arguments.next().is_some() {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.len() == 1 && arguments[0] == std::ffi::OsStr::new("mcp") {
+        if let Err(error) = run_mcp().await {
+            eprintln!("{FATAL_PREFIX}{}", stable_error_code(error.code));
+            std::process::exit(1);
+        }
+        return;
+    }
+    if arguments.is_empty()
+        || arguments[0] == std::ffi::OsStr::new("mcp")
+        || !cli::known_human_mode(&arguments[0])
+    {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    if let Err(error) = run_mcp().await {
+    let parsed = match cli::parse(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let _ = error.print();
+            std::process::exit(exit_code);
+        }
+    };
+    if let Err(error) = cli::run(parsed).await {
         eprintln!("{FATAL_PREFIX}{}", stable_error_code(error.code));
         std::process::exit(1);
     }

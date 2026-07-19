@@ -144,6 +144,10 @@ pub struct ResolvedHost<'a> {
 }
 
 impl Config {
+    pub fn default_path() -> BridgeResult<PathBuf> {
+        default_config_path()
+    }
+
     pub fn load(path: &Path) -> BridgeResult<Self> {
         let mut file = open_config(path)?;
         validate_file_security(&file)?;
