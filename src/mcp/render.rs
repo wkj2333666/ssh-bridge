@@ -410,10 +410,15 @@ pub async fn run(
                     .push(crate::remote::POSIX_SH_WARNING.to_owned());
             }
             let warnings_truncated = normalize_warnings(&mut result.warnings);
+            let status = if result.exit_status == 0 {
+                "completed"
+            } else {
+                "failed"
+            };
             let metadata = with_context(
                 &result.context,
                 json!({
-                    "status":"completed",
+                    "status":status,
                     "exit_status":result.exit_status,
                     "elapsed_ms":result.elapsed_ms,
                     "stdout_raw_bytes":result.stdout.raw_bytes,

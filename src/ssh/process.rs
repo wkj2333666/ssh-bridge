@@ -269,7 +269,7 @@ impl SshRunner {
             )
             .await;
         Ok(RunResult {
-            status: 0,
+            status: outcome.status,
             elapsed_ms: elapsed_ms(operation_started.elapsed()),
             shell,
             physical_root: capability.physical_root.clone(),
@@ -867,10 +867,35 @@ impl SshRunner {
         host: &str,
         elapsed: Duration,
     ) -> BridgeResult<ChildOutcome> {
-        let code = status.code().unwrap_or(-1);
+        let Some(code) = status.code() else {
+            return self.failed_exit(-1, output, phase, host, elapsed).await;
+        };
         if code == 0 {
-            return Ok(ChildOutcome { output });
+            return Ok(ChildOutcome {
+                status: code,
+                output,
+            });
         }
+        if matches!(phase, Phase::Command { .. })
+            && code != 255
+            && !(phase.remote_timeout_wrapped() && code == 124)
+        {
+            return Ok(ChildOutcome {
+                status: code,
+                output,
+            });
+        }
+        self.failed_exit(code, output, phase, host, elapsed).await
+    }
+
+    async fn failed_exit(
+        &self,
+        code: i32,
+        output: ChildCaptured,
+        phase: Phase,
+        host: &str,
+        elapsed: Duration,
+    ) -> BridgeResult<ChildOutcome> {
         let error_code = if phase.remote_timeout_wrapped() && code == 124 {
             ErrorCode::CommandTimeout
         } else if code == 255 && phase.allows_transport_classification() {
@@ -910,6 +935,7 @@ struct OperationReservation {
 }
 
 struct ChildOutcome {
+    status: i32,
     output: ChildCaptured,
 }
 

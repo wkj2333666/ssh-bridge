@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile};
 use codex_ssh_bridge::mcp::stdio::{exact_tools_list_response_bytes, required_mcp_frame_bytes};
 use codex_ssh_bridge::mcp::tools::{RemoteMcpTools, tool_definitions};
@@ -101,6 +102,78 @@ async fn call_json(tools: &RemoteMcpTools, name: &str, arguments: Value) -> Valu
             .await,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn remote_run_nonzero_exit_is_a_failed_result_not_an_mcp_error() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _log, tools) = fake_remote_tools_fixture(remote.path());
+
+    for exit_status in [1, 2, 127] {
+        let rendered = call_json(
+            &tools,
+            "remote_run",
+            json!({
+                "host":"dev",
+                "command":format!("printf stdout-{exit_status}; printf stderr-{exit_status} >&2; exit {exit_status}"),
+                "shell":"sh"
+            }),
+        )
+        .await;
+
+        assert!(
+            rendered.get("isError").is_none() || rendered["isError"] == false,
+            "completed command failure must not be an MCP protocol/tool error: {rendered}"
+        );
+        assert_eq!(rendered["structuredContent"]["status"], "failed");
+        assert_eq!(rendered["structuredContent"]["exit_status"], exit_status);
+        assert_eq!(
+            rendered["structuredContent"]["remote_process_may_continue"],
+            false
+        );
+        let text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("stdout-{exit_status}")), "{text}");
+        assert!(text.contains(&format!("stderr-{exit_status}")), "{text}");
+        assert!(
+            text.contains(&format!("\"exit_status\":{exit_status}")),
+            "{text}"
+        );
+    }
+
+    let rendered = call_json(
+        &tools,
+        "remote_run",
+        json!({
+            "host":"dev",
+            "command":"dd if=/dev/zero bs=1024 count=300 >&2 2>/dev/null; exit 2",
+            "shell":"sh"
+        }),
+    )
+    .await;
+    assert_eq!(rendered["structuredContent"]["status"], "failed");
+    let output_ref = rendered["structuredContent"]["output_ref"]
+        .as_str()
+        .expect("failed command's large stderr must publish an output reference");
+    let page = call_json(
+        &tools,
+        "remote_output_read",
+        json!({
+            "output_ref":output_ref,
+            "stream":"stderr",
+            "offset":256 * 1024,
+            "max_bytes":4096
+        }),
+    )
+    .await;
+    assert!(page.get("isError").is_none() || page["isError"] == false);
+    let page_text = text_json(&page);
+    assert_eq!(page_text["data"]["encoding"], "base64");
+    assert_eq!(
+        page_text["data"]["value"],
+        base64::engine::general_purpose::STANDARD.encode(vec![0; 4096])
+    );
+    assert_eq!(page_text["next_offset"], 260 * 1024);
+    assert_eq!(page_text["eof"], false);
 }
 
 fn text_json(result: &Value) -> Value {

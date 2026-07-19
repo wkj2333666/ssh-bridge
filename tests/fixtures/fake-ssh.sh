@@ -260,6 +260,7 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
     streams)
         printf '%s' "${FAKE_SSH_STDOUT:-stdout}"
         printf '%s' "${FAKE_SSH_STDERR:-stderr}" >&2
+        exit "${FAKE_SSH_EXIT_STATUS:-0}"
         ;;
     stdin)
         cat
@@ -271,6 +272,7 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
         stderr_pid=$!
         wait "$stdout_pid"
 		wait "$stderr_pid"
+		exit "${FAKE_SSH_EXIT_STATUS:-0}"
 		;;
 	large-candidates)
 		fake_root=${FAKE_SSH_ROOT:-/srv/project}
