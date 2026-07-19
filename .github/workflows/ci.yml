@@ -61,4 +61,4 @@ jobs:
           plugin_version="$(jq -r '.version' .codex-plugin/plugin.json)"
           test "$cargo_version" = "$plugin_version"
           jq -e '.mcpServers == null' .codex-plugin/plugin.json >/dev/null
-          jq -e '.mcpServers.ssh-bridge.args == ["mcp"]' .mcp.json.example >/dev/null
+          jq -e '.mcpServers["ssh-bridge"].args == ["mcp"]' .mcp.json.example >/dev/null
