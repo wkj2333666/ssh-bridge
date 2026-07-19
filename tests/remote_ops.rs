@@ -1398,6 +1398,332 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[tokio::test]
+async fn physical_root_retarget_read_uses_and_reports_the_new_tree_without_reprobing_tools() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first = container.path().join("first");
+    let second = container.path().join("second");
+    let active = container.path().join("active");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(first.join("value"), b"first\n").unwrap();
+    std::fs::write(second.join("value"), b"second\n").unwrap();
+    symlink(&first, &active).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        &active,
+        false,
+        None,
+        &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+
+    let first_read = bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_read.context.physical_root, first.to_str().unwrap());
+
+    std::fs::remove_file(&active).unwrap();
+    symlink(&second, &active).unwrap();
+    let second_read = bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_read.context.physical_root, second.to_str().unwrap());
+    assert!(matches!(
+        &second_read.files[0],
+        ReadEntry::Success { content, .. } if content.value == "second\n"
+    ));
+    assert_eq!(
+        bridge.hosts().await.unwrap().hosts[0]
+            .physical_root
+            .as_deref(),
+        second.to_str()
+    );
+    assert_eq!(
+        ssh_call_count(&log, "P"),
+        1,
+        "tool capabilities stay cached"
+    );
+    assert_eq!(ssh_call_count(&log, "R"), 2, "root is observed per read");
+}
+
+#[tokio::test]
+async fn write_root_retarget_after_preflight_is_definite_and_writes_neither_tree() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first = container.path().join("first");
+    let second = container.path().join("second");
+    let active = container.path().join("active");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    symlink(&first, &active).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let trigger = controls.path().join("trigger");
+    let marker = controls.path().join("retargeted");
+    let log = controls.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        &active,
+        false,
+        None,
+        &[
+            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+            (
+                "FAKE_SSH_ROOT_RETARGET_TRIGGER",
+                trigger.as_os_str().to_owned(),
+            ),
+            ("FAKE_SSH_ROOT_RETARGET_LINK", active.as_os_str().to_owned()),
+            (
+                "FAKE_SSH_ROOT_RETARGET_TARGET",
+                second.as_os_str().to_owned(),
+            ),
+            (
+                "FAKE_SSH_ROOT_RETARGET_MARKER",
+                marker.as_os_str().to_owned(),
+            ),
+        ],
+    );
+    std::fs::write(&trigger, b"go").unwrap();
+
+    let error = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "created".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert!(!error.retryable);
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+    assert!(marker.exists());
+    assert!(!first.join("created").exists());
+    assert!(!second.join("created").exists());
+    assert_eq!(
+        ssh_call_count(&log, "P"),
+        1,
+        "tool capabilities stay cached"
+    );
+    assert_eq!(
+        ssh_call_count(&log, "R"),
+        1,
+        "one mutation preflight observation"
+    );
+}
+
+#[tokio::test]
+async fn cached_root_retarget_blocks_a_later_mutation_until_the_bridge_is_restarted() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first = container.path().join("first");
+    let second = container.path().join("second");
+    let active = container.path().join("active");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(first.join("value"), b"first\n").unwrap();
+    std::fs::write(second.join("value"), b"second\n").unwrap();
+    symlink(&first, &active).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        &active,
+        false,
+        None,
+        &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+    bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(&active).unwrap();
+    symlink(&second, &active).unwrap();
+
+    let error = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "blocked".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+    assert_eq!(error.details.physical_root.as_deref(), second.to_str());
+    assert!(!first.join("blocked").exists());
+    assert!(!second.join("blocked").exists());
+    assert_eq!(
+        ssh_call_count(&log, "P"),
+        1,
+        "root checks do not reprobe tools"
+    );
+
+    drop(bridge);
+    let (_runtime, _runner, restarted) = fixture_with_options(&active, false, None, &[]);
+    restarted
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "accepted-after-restart".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(second.join("accepted-after-restart")).unwrap(),
+        b"payload"
+    );
+}
+
+#[tokio::test]
+async fn cached_root_retarget_blocks_remote_run_before_its_command_can_have_side_effects() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first = container.path().join("first");
+    let second = container.path().join("second");
+    let active = container.path().join("active");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(first.join("value"), b"first\n").unwrap();
+    symlink(&first, &active).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        &active,
+        false,
+        None,
+        &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
+    );
+    bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(&active).unwrap();
+    symlink(&second, &active).unwrap();
+
+    let error = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "printf payload > blocked".to_owned(),
+                cwd: None,
+                shell: RunShell::Sh,
+                timeout_ms: None,
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+    assert!(!first.join("blocked").exists());
+    assert!(!second.join("blocked").exists());
+    assert_eq!(
+        ssh_call_count(&log, "P"),
+        1,
+        "run root checks reuse tool cache"
+    );
+}
+
+#[tokio::test]
+async fn same_physical_path_with_a_new_directory_identity_blocks_mutation() {
+    let container = tempfile::TempDir::new().unwrap();
+    let root = container.path().join("root");
+    let old = container.path().join("old-root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("value"), b"old\n").unwrap();
+    let (_runtime, _runner, bridge) = fixture(&root, false);
+    bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    std::fs::rename(&root, &old).unwrap();
+    std::fs::create_dir(&root).unwrap();
+
+    let error = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "blocked".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+    assert!(!old.join("blocked").exists());
+    assert!(!root.join("blocked").exists());
+}
+
 #[test]
 fn task4_request_and_result_shapes_are_closed_and_serializable() {
     let read = ReadRequest {
@@ -2790,7 +3116,7 @@ async fn task6_second_snapshot_reprobe_physical_root_drift_is_zero_mutation_conf
     assert_eq!(error.code, ErrorCode::ReadConflict);
     assert_eq!(error.details.failed_path.as_deref(), Some("b"));
     assert_task78_fixed_context(&error, &second_root);
-    assert_eq!(phase_log(&phases), ["S", "S", "S"]);
+    assert_eq!(phase_log(&phases), ["S", "S"]);
     assert_eq!(std::fs::read(first_root.join("a")).unwrap(), b"old\n");
     assert_eq!(std::fs::read(second_root.join("b")).unwrap(), b"old\n");
 }
@@ -3020,7 +3346,7 @@ async fn task6_second_malformed_postcommit_is_only_current_unknown_and_stops_suf
     assert!(!remote.path().join("c").exists());
 }
 
-async fn task6_assert_post_snapshot_context_drift_is_unknown(delete: bool) {
+async fn task6_assert_cached_root_drift_is_definite_conflict(delete: bool) {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -3129,35 +3455,31 @@ async fn task6_assert_post_snapshot_context_drift_is_unknown(delete: bool) {
         .expect("patch did not finish after releasing the snapshot")
         .unwrap()
         .unwrap_err();
-    assert_eq!(error.code, ErrorCode::MutationOutcomeUnknown, "{error:?}");
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
     assert!(!error.retryable);
-    assert_eq!(error.details.mutation_may_have_applied, Some(true));
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
     assert_eq!(error.details.failed_path.as_deref(), Some("target"));
     assert_eq!(error.details.changed_paths, Some(Vec::new()));
-    assert_eq!(error.details.not_changed_paths, Some(Vec::new()));
     assert_eq!(
-        error.details.outcome_unknown_paths,
+        error.details.not_changed_paths,
         Some(vec!["target".to_owned()])
     );
+    assert_eq!(error.details.outcome_unknown_paths, Some(Vec::new()));
     assert_task78_fixed_context(&error, &second_root);
-    assert_eq!(phase_log(&phases), ["S", "M"]);
+    assert_eq!(phase_log(&phases), ["S"]);
     assert_eq!(ssh_call_count(&ssh_log, "P"), 2);
     assert_eq!(std::fs::read(first_root.join("target")).unwrap(), b"old\n");
-    if delete {
-        assert!(!second_root.join("target").exists());
-    } else {
-        assert_eq!(std::fs::read(second_root.join("target")).unwrap(), b"new\n");
-    }
+    assert_eq!(std::fs::read(second_root.join("target")).unwrap(), b"old\n");
 }
 
 #[tokio::test]
-async fn task6_successful_write_on_reprobed_root_is_current_unknown_not_changed() {
-    task6_assert_post_snapshot_context_drift_is_unknown(false).await;
+async fn task6_cached_root_drift_before_write_is_definite_and_changes_neither_tree() {
+    task6_assert_cached_root_drift_is_definite_conflict(false).await;
 }
 
 #[tokio::test]
-async fn task6_successful_delete_on_reprobed_root_is_current_unknown_not_changed() {
-    task6_assert_post_snapshot_context_drift_is_unknown(true).await;
+async fn task6_cached_root_drift_before_delete_is_definite_and_changes_neither_tree() {
+    task6_assert_cached_root_drift_is_definite_conflict(true).await;
 }
 
 #[tokio::test]
@@ -3523,6 +3845,7 @@ async fn task5_missing_required_write_command_is_a_future_only_capability_mismat
     let scratch = controls.path().join("scratch");
     std::fs::create_dir(&empty_path).unwrap();
     std::os::unix::fs::symlink("/bin/sh", empty_path.join("sh")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/stat", empty_path.join("stat")).unwrap();
     std::fs::create_dir(&scratch).unwrap();
     let (_runtime, _runner, bridge) = fixture_with_options(
         remote.path(),

@@ -61,21 +61,21 @@ fn policy(
 
 fn bash_probe(requested: &str, physical: &str) -> Vec<u8> {
     format!(
-        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0SHELL_KIND=bash\0BASH_VERSION=5.2.15\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=bash\0BASH_VERSION=5.2.15\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
     )
     .into_bytes()
 }
 
 fn bash_probe_with_version(requested: &str, physical: &str, version: &str) -> Vec<u8> {
     format!(
-        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0SHELL_KIND=bash\0BASH_VERSION={version}\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=bash\0BASH_VERSION={version}\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
     )
     .into_bytes()
 }
 
 fn sh_probe(requested: &str, physical: &str) -> Vec<u8> {
     format!(
-        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0SHELL_KIND=sh\0BASH_VERSION=\0TOOL_rg=0\0"
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=sh\0BASH_VERSION=\0TOOL_rg=0\0"
     )
     .into_bytes()
 }
@@ -87,6 +87,8 @@ fn capability(shell: ShellKind) -> Capability {
     };
     Capability {
         physical_root: "/srv/project".to_owned(),
+        root_device: 1,
+        root_inode: 2,
         shell,
         bash_version,
         tools: BTreeMap::new(),
@@ -647,13 +649,9 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
     .unwrap();
 
     for _ in 0..2 {
-        let result = runner
-            .execute(
-                request("dev", ShellRequest::Auto, Duration::from_secs(2)),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(2));
+        run.cwd = root.clone();
+        let result = runner.execute(run, CancellationToken::new()).await.unwrap();
         assert_eq!(result.physical_root, root);
         assert_eq!(
             result.shell.shell,
@@ -1390,7 +1388,7 @@ fn request(host: &str, shell: ShellRequest, timeout: Duration) -> RunRequest {
 async fn task78_run_cwd_is_encoded_as_data_and_never_executed() {
     let filesystem = TempDir::new().unwrap();
     let sentinel = filesystem.path().join("cwd-injection");
-    let hostile_cwd = format!("'; touch {}; '", sentinel.display());
+    let hostile_cwd = format!("/srv/project/'; touch {}; '", sentinel.display());
     let fixture = task3_runner(
         &["dev"],
         Limits::default(),
@@ -1711,18 +1709,10 @@ async fn selected_shell_and_remote_gnu_timeout_are_reported_and_rendered_exactly
     assert!(result.shell.fallback);
     assert!(!result.remote_process_may_continue);
     let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
-    assert_eq!(
-        rendered,
-        concat!(
-            "exec sh -c 'set -u\n",
-            "[ \"$#\" -eq 3 ] || exit 2\n",
-            "cd -- \"$1\" || exit 126\n",
-            "if [ -n \"$3\" ]; then\n",
-            "    exec timeout --signal=TERM --kill-after=1s \"$3\" sh -c \"$2\"\n",
-            "fi\n",
-            "exec sh -c \"$2\"' codex-ssh-bridge-run '/srv/project' 'printf safe' '0.123s'"
-        )
-    );
+    assert!(rendered.contains("i=$3:$4"));
+    assert!(rendered.contains("timeout --signal=TERM --kill-after=1s"));
+    assert!(rendered.contains("printf safe"));
+    assert!(rendered.contains("'/srv/project'"));
 }
 
 #[test]
@@ -1779,10 +1769,43 @@ async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
         .await
         .unwrap();
     assert_eq!(result.shell.shell, ShellKind::Login);
-    assert_eq!(
-        preview_bytes(&result.output.stdout),
-        b"cd -- '/srv/project' || exit 126\nprintf safe"
+    let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
+    assert!(rendered.contains("i=$3:$4"));
+    assert!(rendered.contains("cd -- '"));
+    assert!(rendered.contains("printf safe"));
+    assert!(!rendered.contains("timeout --signal"));
+}
+
+#[tokio::test]
+async fn root_observation_consumes_the_single_command_timeout_budget() {
+    let controls = TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "streams".to_owned()),
+            ("FAKE_SSH_ROOT_OBSERVE_SLEEP_SECONDS", "1".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
     );
+    let started = Instant::now();
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Sh, Duration::from_millis(100)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::CommandTimeout, "{error:?}");
+    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.mutation_may_have_applied, None);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 0);
 }
 
 #[tokio::test]

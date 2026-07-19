@@ -1613,6 +1613,39 @@ fn fixed_script_prefix(command: &str, marker: &str) -> String {
         .to_owned()
 }
 
+fn normalized_remote_run_shape(log: &std::path::Path) -> (String, String) {
+    let (argv, command) = only_command_record(log);
+    let operation_end = command
+        .rfind("\n)\ns=$?")
+        .expect("guarded remote_run command has an operation boundary");
+    let (prefix, timeout_word) = command[..operation_end]
+        .rsplit_once(' ')
+        .expect("remote_run command has a timeout argument");
+    const EMBEDDED_SINGLE_QUOTE: &str = "'\"'\"'";
+    let timeout = timeout_word
+        .strip_prefix(EMBEDDED_SINGLE_QUOTE)
+        .and_then(|value| value.strip_suffix(EMBEDDED_SINGLE_QUOTE))
+        .and_then(|value| value.strip_suffix('s'))
+        .unwrap_or_else(|| {
+            panic!("remote_run timeout is a quoted seconds value: {timeout_word:?}")
+        });
+    let (seconds, milliseconds) = timeout
+        .split_once('.')
+        .expect("remote_run timeout has millisecond precision");
+    assert_eq!(milliseconds.len(), 3);
+    assert!(
+        seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && milliseconds.bytes().all(|byte| byte.is_ascii_digit())
+    );
+    let timeout_ms = seconds.parse::<u64>().unwrap() * 1000 + milliseconds.parse::<u64>().unwrap();
+    assert!((1..=300_000).contains(&timeout_ms));
+    let mut normalized = String::with_capacity(command.len());
+    normalized.push_str(prefix);
+    normalized.push_str(" '<REMOTE_TIMEOUT>'");
+    normalized.push_str(&command[operation_end..]);
+    (argv, normalized)
+}
+
 fn assert_hostile_marker_absent(remote: &std::path::Path) {
     assert!(!remote.join("SHOULD_NOT_EXIST").exists());
     assert!(!std::path::Path::new("SHOULD_NOT_EXIST").exists());
@@ -1870,7 +1903,7 @@ async fn task8_hostile_content_and_command_output_remain_single_response_data() 
                 || json_contains_exact_encoded_bytes(&text, value.as_bytes()),
             "command output was not preserved exactly: {text}"
         );
-        let shape = only_command_record(&log);
+        let shape = normalized_remote_run_shape(&log);
         if let Some(expected) = &output_shape {
             assert_eq!(
                 &shape, expected,

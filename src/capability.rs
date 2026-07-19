@@ -45,6 +45,13 @@ physical_with_delimiter=${physical_plus%x}
 newline='
 '
 physical_root=${physical_with_delimiter%"$newline"}
+root_identity=$(stat -L --printf='%d:%i' -- . 2>/dev/null) ||
+    root_identity=$(stat -f '%d:%i' . 2>/dev/null) || exit 78
+case "$root_identity" in
+    *[!0-9:]*|:*|*:|*:*:*) exit 78 ;;
+esac
+root_device=${root_identity%%:*}
+root_inode=${root_identity#*:}
 
 emit_record() {
     printf '%s=%s\000' "$1" "$2"
@@ -596,6 +603,8 @@ fi
 emit_record CODEX_SSH_PROBE 1
 emit_record REQUESTED_ROOT "$requested_root"
 emit_record ROOT "$physical_root"
+emit_record ROOT_DEVICE "$root_device"
+emit_record ROOT_INODE "$root_inode"
 emit_record SHELL_KIND "$shell_kind"
 emit_record BASH_VERSION "$bash_version"
 emit_record TOOL_mktemp "$tool_mktemp"
@@ -629,6 +638,8 @@ pub enum ShellKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     pub physical_root: String,
+    pub root_device: u64,
+    pub root_inode: u64,
     pub shell: ShellKind,
     pub bash_version: Option<String>,
     pub tools: BTreeMap<String, bool>,
@@ -734,6 +745,8 @@ pub fn parse_probe_output(
     if normalized.absolute() != physical_root {
         return Err(protocol_error("physical root is not normalized"));
     }
+    let root_device = parse_root_identity_number(required(&records, "ROOT_DEVICE")?)?;
+    let root_inode = parse_root_identity_number(required(&records, "ROOT_INODE")?)?;
 
     let bash_version = required(&records, "BASH_VERSION")?;
     if bash_version.len() > MAX_SHELL_VERSION_BYTES {
@@ -764,6 +777,8 @@ pub fn parse_probe_output(
 
     Ok(Capability {
         physical_root: physical_root.to_owned(),
+        root_device,
+        root_inode,
         shell,
         bash_version,
         tools,
@@ -772,7 +787,8 @@ pub fn parse_probe_output(
 
 fn validate_key_value(key: &str, value: &str) -> BridgeResult<()> {
     match key {
-        "CODEX_SSH_PROBE" | "REQUESTED_ROOT" | "ROOT" | "SHELL_KIND" | "BASH_VERSION" => Ok(()),
+        "CODEX_SSH_PROBE" | "REQUESTED_ROOT" | "ROOT" | "ROOT_DEVICE" | "ROOT_INODE"
+        | "SHELL_KIND" | "BASH_VERSION" => Ok(()),
         _ => match key.strip_prefix("TOOL_") {
             Some(name) if TOOL_NAMES.contains(&name) && matches!(value, "0" | "1") => Ok(()),
             Some(name) if !TOOL_NAMES.contains(&name) => {
@@ -782,6 +798,15 @@ fn validate_key_value(key: &str, value: &str) -> BridgeResult<()> {
             None => Err(protocol_error("unknown capability key")),
         },
     }
+}
+
+fn parse_root_identity_number(value: &str) -> BridgeResult<u64> {
+    if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return Err(protocol_error("root identity is invalid"));
+    }
+    value
+        .parse()
+        .map_err(|_| protocol_error("root identity is invalid"))
 }
 
 fn required<'a>(records: &'a BTreeMap<String, String>, key: &str) -> BridgeResult<&'a str> {
