@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "ssh-bridge": {
-      "command": "python3",
+      "command": "./bin/codex-ssh-bridge",
       "args": [
-        "./mcp/server.py"
+        "mcp"
       ]
     }
   }

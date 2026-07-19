@@ -1,0 +1,259 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::{Value, json};
+
+const EXPECTED_TOOLS: [&str; 9] = [
+    "remote_hosts",
+    "remote_list",
+    "remote_stat",
+    "remote_search",
+    "remote_read",
+    "remote_output_read",
+    "remote_apply_patch",
+    "remote_write",
+    "remote_run",
+];
+
+fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn read_text(relative_path: impl AsRef<Path>) -> String {
+    let path = repository_root().join(relative_path);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+fn read_json(relative_path: impl AsRef<Path>) -> Value {
+    let relative_path = relative_path.as_ref();
+    let text = read_text(relative_path);
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", relative_path.display()))
+}
+
+fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
+    if path.is_file() {
+        files.push(path.to_owned());
+        return;
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("failed to list {}: {error}", path.display()))
+        .map(|entry| entry.expect("failed to read directory entry").path())
+        .collect();
+    entries.sort();
+
+    for entry in entries {
+        collect_files(&entry, files);
+    }
+}
+
+fn identifier_tokens(text: &str) -> BTreeSet<&str> {
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn section<'a>(document: &'a str, heading: &str) -> &'a str {
+    let start = document
+        .find(heading)
+        .unwrap_or_else(|| panic!("missing required Skill section {heading:?}"));
+    let body = &document[start + heading.len()..];
+    let end = body.find("\n## ").unwrap_or(body.len());
+    &body[..end]
+}
+
+#[test]
+fn plugin_manifest_points_to_packaged_skill_and_mcp_manifest() {
+    let plugin = read_json(".codex-plugin/plugin.json");
+
+    assert_eq!(plugin.get("skills"), Some(&json!("./skills/")));
+    assert_eq!(plugin.get("mcpServers"), Some(&json!("./.mcp.json")));
+}
+
+#[test]
+fn mcp_manifest_launches_the_packaged_rust_binary() {
+    let manifest = read_json(".mcp.json");
+    let servers = manifest
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .expect(".mcp.json must contain an mcpServers object");
+    assert_eq!(
+        servers.len(),
+        1,
+        "the plugin must install exactly one MCP server"
+    );
+
+    let server = servers
+        .get("ssh-bridge")
+        .expect("the single MCP server must be named ssh-bridge");
+    assert_eq!(
+        server.get("command"),
+        Some(&json!("./bin/codex-ssh-bridge"))
+    );
+    assert_eq!(server.get("args"), Some(&json!(["mcp"])));
+}
+
+#[test]
+fn packaged_bridge_is_an_executable_native_binary() {
+    let binary = repository_root().join("bin/codex-ssh-bridge");
+    let metadata = fs::symlink_metadata(&binary)
+        .unwrap_or_else(|error| panic!("missing packaged binary {}: {error}", binary.display()));
+    assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+    assert!(!metadata.file_type().is_socket());
+    assert_ne!(metadata.permissions().mode() & 0o111, 0);
+    let bytes = fs::read(&binary).expect("read packaged bridge");
+    assert!(bytes.starts_with(b"\x7fELF"), "packaged bridge is not ELF");
+
+    let output = Command::new(&binary)
+        .arg("--help")
+        .output()
+        .expect("execute packaged bridge");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("bridge help is UTF-8");
+    assert!(help.contains("mcp") && help.contains("install"));
+    assert!(!help.to_ascii_lowercase().contains("python"));
+}
+
+#[test]
+fn installed_chain_has_no_python_runtime_or_legacy_module_references() {
+    let root = repository_root();
+    let mut files = Vec::new();
+    collect_files(&root.join(".codex-plugin"), &mut files);
+    files.push(root.join(".mcp.json"));
+    collect_files(&root.join("skills"), &mut files);
+    files.push(root.join("README.md"));
+    files.sort();
+    files.dedup();
+
+    let forbidden = ["python3", "server.py", "ssh_bridge"];
+    let mut violations = Vec::new();
+    for path in files {
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        for needle in forbidden {
+            if text.contains(needle) {
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                violations.push(format!("{} references {needle:?}", relative.display()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "installed plugin chain still references the Python/legacy runtime:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn skill_names_exactly_the_nine_remote_tools() {
+    let skill = read_text("skills/remote-ssh-ops/SKILL.md");
+    let identifiers = identifier_tokens(&skill);
+    let actual_remote_tools: BTreeSet<_> = identifiers
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with("remote_"))
+        .collect();
+    let expected_remote_tools: BTreeSet<_> = EXPECTED_TOOLS.into_iter().collect();
+
+    assert_eq!(
+        actual_remote_tools, expected_remote_tools,
+        "the Skill must name exactly the public MCP tool set"
+    );
+}
+
+#[test]
+fn skill_names_no_legacy_ssh_tools() {
+    let skill = read_text("skills/remote-ssh-ops/SKILL.md");
+    let identifiers = identifier_tokens(&skill);
+    let legacy_tools: Vec<_> = identifiers
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with("ssh_"))
+        .collect();
+    assert!(
+        legacy_tools.is_empty(),
+        "the Skill still names legacy ssh_ tools: {legacy_tools:?}"
+    );
+}
+
+#[test]
+fn skill_exposes_no_sshfs_mcp_tool() {
+    let skill = read_text("skills/remote-ssh-ops/SKILL.md");
+    let identifiers = identifier_tokens(&skill);
+    let sshfs_mcp_tools: Vec<_> = identifiers
+        .iter()
+        .copied()
+        .filter(|token| {
+            token.starts_with("remote_")
+                && (token.contains("sshfs")
+                    || token.ends_with("_mount")
+                    || token.ends_with("_unmount"))
+        })
+        .collect();
+    assert!(
+        sshfs_mcp_tools.is_empty(),
+        "SSHFS must remain a CLI workflow, not an MCP tool: {sshfs_mcp_tools:?}"
+    );
+}
+
+#[test]
+fn skill_teaches_the_low_burden_default_workflow_in_order() {
+    let skill = read_text("skills/remote-ssh-ops/SKILL.md");
+    let workflow = section(&skill, "## Default workflow");
+    let search = workflow
+        .find("remote_search")
+        .expect("default workflow must start from bounded remote search");
+    let read = workflow
+        .find("remote_read")
+        .expect("default workflow must read before changing files");
+    let patch = workflow
+        .find("remote_apply_patch")
+        .expect("default workflow must prefer remote_apply_patch");
+    let run = workflow
+        .find("remote_run")
+        .expect("default workflow must verify with remote_run");
+    assert!(search < read && read < patch && patch < run);
+}
+
+#[test]
+fn skill_states_remote_shell_output_and_sshfs_boundaries() {
+    let skill = read_text("skills/remote-ssh-ops/SKILL.md").to_ascii_lowercase();
+    for required in [
+        "every path",
+        "untrusted",
+        "actual shell",
+        "posix",
+        "bash-only",
+        "fallback",
+        "human-only",
+        "not an agent workspace",
+    ] {
+        assert!(
+            skill.contains(required),
+            "Skill omits required boundary phrase {required:?}"
+        );
+    }
+}
+
+#[test]
+fn skill_closes_search_stdin_and_patch_schema_ambiguities() {
+    let skill = read_text("skills/remote-ssh-ops/SKILL.md").to_ascii_lowercase();
+    for required in [
+        "case-sensitive literal",
+        "stdin is an object",
+        "encoding",
+        "value",
+        "relative to the configured remote root",
+    ] {
+        assert!(
+            skill.contains(required),
+            "Skill omits schema clarification {required:?}"
+        );
+    }
+}
