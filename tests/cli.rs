@@ -1,11 +1,22 @@
 #![deny(unsafe_code)]
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use codex_ssh_bridge::cli::{
+    LocalCommandSpec, RunArgs, ShellArg, doctor_host, mount_sshfs_with_executable,
+    parse_sshfs_mount_status, redact_ssh_diagnostics, run_local_command, run_remote_argv,
+    unmount_sshfs_with_executable,
+};
 use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile};
+use codex_ssh_bridge::output::OutputStore;
+use codex_ssh_bridge::remote::RemoteBridge;
+use codex_ssh_bridge::ssh::SshRunner;
 use codex_ssh_bridge::ssh::{RuntimePaths, SshPolicy, build_sshfs_argv, validate_sshfs_mountpoint};
 use predicates::prelude::*;
 
@@ -300,4 +311,324 @@ fn task9_mountpoint_must_be_absolute_real_owned_directory_and_empty_by_default()
         validate_sshfs_mountpoint(&nonempty, true).unwrap(),
         nonempty
     );
+}
+
+fn executable_script(directory: &std::path::Path, name: &str, source: &str) -> std::path::PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, source).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+fn remote_bridge(root: &std::path::Path, private: &tempfile::TempDir) -> Arc<RemoteBridge> {
+    let mut config = Config::default();
+    config.hosts.insert(
+        "dev".to_owned(),
+        HostProfile {
+            root: root.to_str().unwrap().to_owned(),
+            description: None,
+            read_only: false,
+            limits: HostLimitOverrides::default(),
+        },
+    );
+    let runtime = RuntimePaths::ensure_from_base(private.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config),
+            runtime,
+            store,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ssh.sh"),
+            [
+                (
+                    OsString::from("FAKE_SSH_MODE"),
+                    OsString::from("local-fixed"),
+                ),
+                (OsString::from("FAKE_SSH_SHELL"), OsString::from("bash")),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap(),
+    );
+    Arc::new(RemoteBridge::new(runner))
+}
+
+fn remote_runner(
+    root: &std::path::Path,
+    private: &tempfile::TempDir,
+    read_only: bool,
+) -> Arc<SshRunner> {
+    let mut config = Config::default();
+    config.hosts.insert(
+        "dev".to_owned(),
+        HostProfile {
+            root: root.to_str().unwrap().to_owned(),
+            description: None,
+            read_only,
+            limits: HostLimitOverrides::default(),
+        },
+    );
+    let runtime = RuntimePaths::ensure_from_base(private.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config),
+            runtime,
+            store,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-ssh.sh"),
+            [(
+                OsString::from("FAKE_SSH_MODE"),
+                OsString::from("local-fixed"),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn task9_doctor_uses_shared_probe_and_reports_remote_root_and_actual_shell() {
+    let private = tempfile::TempDir::new().unwrap();
+    let remote = tempfile::TempDir::new().unwrap();
+    let bridge = remote_bridge(remote.path(), &private);
+    let result = doctor_host(&bridge, "dev").await.unwrap();
+    assert_eq!(result["remote"], true);
+    assert_eq!(result["host"], "dev");
+    assert_eq!(result["physical_root"], remote.path().to_str().unwrap());
+    assert_eq!(result["shell"]["kind"], "sh");
+    assert_eq!(result["shell"]["version"], serde_json::Value::Null);
+    assert_eq!(result["shell"]["fallback"], false);
+}
+
+#[tokio::test]
+async fn task9_direct_run_quotes_each_argv_word_and_reports_shell() {
+    let private = tempfile::TempDir::new().unwrap();
+    let remote = tempfile::TempDir::new().unwrap();
+    let bridge = remote_bridge(remote.path(), &private);
+    let hostile = "space '$HOME' $(touch should-not-exist) * newline\nend";
+    let result = run_remote_argv(
+        &bridge,
+        RunArgs {
+            host: "dev".to_owned(),
+            cwd: ".".to_owned(),
+            shell: ShellArg::Auto,
+            timeout_ms: Some(5_000),
+            argv: vec!["printf".to_owned(), "%s".to_owned(), hostile.to_owned()],
+        },
+    )
+    .await
+    .unwrap();
+    let value = serde_json::to_value(result).unwrap();
+    assert_eq!(value["shell"]["kind"], "bash");
+    assert_eq!(value["shell"]["fallback"], false);
+    assert_eq!(value["warnings"], serde_json::json!([]));
+    assert_eq!(value["stdout"]["head"]["encoding"], "utf8");
+    assert_eq!(value["stdout"]["head"]["value"], hostile);
+    assert!(!remote.path().join("should-not-exist").exists());
+}
+
+#[tokio::test]
+async fn task9_local_executor_preserves_argv_and_bounded_output_without_a_shell() {
+    let private = tempfile::TempDir::new().unwrap();
+    let executable = executable_script(
+        private.path(),
+        "fixture",
+        "#!/bin/sh\nprintf '%s' \"$1\"\nprintf '%s' \"$2\" >&2\nexit 7\n",
+    );
+    let output = run_local_command(LocalCommandSpec {
+        executable,
+        arguments: vec![
+            OsString::from("literal;$(false)"),
+            OsString::from("diagnostic"),
+        ],
+        timeout: Duration::from_secs(2),
+        max_output_bytes: 1024,
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status, 7);
+    assert_eq!(output.stdout, b"literal;$(false)");
+    assert_eq!(output.stderr, b"diagnostic");
+}
+
+#[tokio::test]
+async fn task9_local_executor_timeout_kills_the_process_group_promptly() {
+    let private = tempfile::TempDir::new().unwrap();
+    let pid_file = private.path().join("child.pid");
+    let executable = executable_script(
+        private.path(),
+        "hang",
+        "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s\\n' \"$!\" >\"$1\"\nwait\n",
+    );
+    let started = Instant::now();
+    let error = run_local_command(LocalCommandSpec {
+        executable,
+        arguments: vec![pid_file.as_os_str().to_owned()],
+        timeout: Duration::from_millis(100),
+        max_output_bytes: 1024,
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, codex_ssh_bridge::ErrorCode::CommandTimeout);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let child: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let child_proc = std::path::PathBuf::from(format!("/proc/{child}"));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if !child_proc.exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "local grandchild survived timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn task9_local_executor_output_limit_wins_and_kills_a_term_ignoring_group() {
+    let private = tempfile::TempDir::new().unwrap();
+    let executable = executable_script(
+        private.path(),
+        "overflow",
+        "#!/bin/sh\ntrap '' TERM\ndd if=/dev/zero bs=2048 count=1 2>/dev/null\nsleep 30\n",
+    );
+    let started = Instant::now();
+    let error = run_local_command(LocalCommandSpec {
+        executable,
+        arguments: Vec::new(),
+        timeout: Duration::from_secs(2),
+        max_output_bytes: 1024,
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, codex_ssh_bridge::ErrorCode::OutputLimit);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn task9_verbose_doctor_redacts_paths_commands_credentials_and_controls() {
+    let diagnostic = b"debug1: safe negotiated algorithm ssh-ed25519\n\
+debug1: identity file /home/alice/.ssh/id_ed25519 type 3\n\
+debug1: identity agent /run/user/1000/ssh-agent.socket\n\
+debug1: Sending command: deploy --token=DOCTOR_TOKEN_SECRET\n\
+Authorization: Bearer DOCTOR_BEARER_SECRET\n\
+password=DOCTOR_PASSWORD_SECRET\n\
+safe-control:\x1b[31m\n";
+    let rendered = redact_ssh_diagnostics(diagnostic);
+    assert!(rendered.contains("safe negotiated algorithm ssh-ed25519"));
+    assert!(rendered.contains("[REDACTED]"));
+    for secret in [
+        "/home/alice/.ssh/id_ed25519",
+        "/run/user/1000/ssh-agent.socket",
+        "deploy --token",
+        "DOCTOR_TOKEN_SECRET",
+        "DOCTOR_BEARER_SECRET",
+        "DOCTOR_PASSWORD_SECRET",
+        "\u{1b}",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "leaked {secret:?}: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn task9_mount_status_parser_decodes_mountinfo_and_distinguishes_other_fuse() {
+    let sshfs = b"36 25 0:32 / /mnt/remote\\040project rw,nosuid - fuse.sshfs dev:/srv rw\n";
+    let status =
+        parse_sshfs_mount_status(sshfs, std::path::Path::new("/mnt/remote project")).unwrap();
+    assert!(status.mounted);
+    assert!(status.sshfs);
+    assert_eq!(status.filesystem_type.as_deref(), Some("fuse.sshfs"));
+
+    let other = b"36 25 0:32 / /mnt/remote\\040project rw,nosuid - fuse.other x rw\n";
+    let status =
+        parse_sshfs_mount_status(other, std::path::Path::new("/mnt/remote project")).unwrap();
+    assert!(status.mounted);
+    assert!(!status.sshfs);
+}
+
+#[tokio::test]
+async fn task9_mount_executes_hardened_sshfs_and_forces_profile_read_only() {
+    let private = tempfile::TempDir::new().unwrap();
+    let remote = tempfile::TempDir::new().unwrap();
+    let mountpoint = private.path().join("mountpoint");
+    let log = private.path().join("sshfs.log");
+    fs::create_dir(&mountpoint).unwrap();
+    let source = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >'{}'\n", log.display());
+    let sshfs = executable_script(private.path(), "sshfs", &source);
+    let runner = remote_runner(remote.path(), &private, true);
+    let result = mount_sshfs_with_executable(
+        &runner,
+        sshfs,
+        codex_ssh_bridge::cli::MountArgs {
+            host: "dev".to_owned(),
+            mountpoint: mountpoint.clone(),
+            remote_path: ".".to_owned(),
+            allow_nonempty: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["remote"], true);
+    assert_eq!(result["host"], "dev");
+    assert!(
+        result["warning"]
+            .as_str()
+            .unwrap()
+            .contains("not an Agent workspace")
+    );
+    let logged = fs::read_to_string(log).unwrap();
+    for option in [
+        "BatchMode=yes",
+        "StrictHostKeyChecking=yes",
+        "ForwardAgent=no",
+        "ClearAllForwardings=yes",
+        "reconnect",
+        "ro",
+    ] {
+        assert!(logged.lines().any(|line| line == option), "{logged}");
+    }
+    assert!(logged.contains(mountpoint.to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn task9_unmount_executes_only_for_identity_checked_sshfs_mount() {
+    let private = tempfile::TempDir::new().unwrap();
+    let mountpoint = private.path().join("mountpoint");
+    let log = private.path().join("unmount.log");
+    fs::create_dir(&mountpoint).unwrap();
+    let source = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >'{}'\n", log.display());
+    let helper = executable_script(private.path(), "fusermount3", &source);
+    let mountinfo = format!(
+        "36 25 0:32 / {} rw,nosuid - fuse.sshfs dev:/srv rw\n",
+        mountpoint.display()
+    );
+    let result = unmount_sshfs_with_executable(helper.clone(), &mountpoint, mountinfo.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(result["unmounted"], mountpoint.to_str().unwrap());
+    let logged = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        ["-u", mountpoint.to_str().unwrap()]
+    );
+
+    fs::remove_file(&log).unwrap();
+    let other = mountinfo.replace("fuse.sshfs", "fuse.other");
+    assert!(
+        unmount_sshfs_with_executable(helper, &mountpoint, other.as_bytes())
+            .await
+            .is_err()
+    );
+    assert!(!log.exists());
 }
