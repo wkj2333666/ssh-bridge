@@ -82,7 +82,7 @@ Status: Ready; Tasks 7–8 strict MCP review incorporated
 - Produces: `RemotePath::resolve(root: &str, requested: &str) -> BridgeResult<RemotePath>` with `absolute()` and `relative()` accessors.
 - Produces: `Config::load(path: &Path)`, `Config::save_atomic(path: &Path)`, `Config::host(alias: &str)`, and shared `MAX_REMOTE_CONTEXT_ROOT_BYTES=65_536`.
 
-- [ ] **Step 1: Add the failing core tests**
+- [x] **Step 1: Add the failing core tests**
 
 Create tests that prove shell encoding round-trips through `/bin/sh`, NUL is rejected, `..` cannot escape, exact aliases are required, unknown TOML fields fail, limits cannot exceed compiled ceilings, unsafe configuration modes fail, and an environment-overridden config path is explicitly marked as trusted execution-authority input in diagnostics. Configured normalized roots accept exactly 65,536 UTF-8 bytes and reject one more; non-ASCII cases prove byte rather than character counting. Error serialization includes bounded physical root when known and omits it before probe. Include this property test:
 
@@ -100,13 +100,13 @@ proptest! {
 }
 ```
 
-- [ ] **Step 2: Run the new test target and verify red**
+- [x] **Step 2: Run the new test target and verify red**
 
 Run: `cargo test --test core -- --nocapture`
 
 Expected: compilation fails because the crate and required modules do not exist.
 
-- [ ] **Step 3: Add the crate and minimal focused implementations**
+- [x] **Step 3: Add the crate and minimal focused implementations**
 
 Use these exact top-level types and ceilings:
 
@@ -153,13 +153,13 @@ strip = "symbols"
 panic = "unwind"
 ```
 
-- [ ] **Step 4: Run formatting, lint, and core tests**
+- [x] **Step 4: Run formatting, lint, and core tests**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test core`
 
 Expected: all commands exit 0; core tests include at least 100,000 generated quote cases across the proptest configuration.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add Cargo.toml Cargo.lock src tests/core.rs config.example.toml
@@ -188,7 +188,7 @@ git commit -m "feat: add Rust bridge core primitives"
 - Produces: async `CapabilityCache::get_or_probe(host, probe_fn)` backed by a per-host Tokio `OnceCell`, so concurrent callers share one probe future, plus async `invalidate(host)`.
 - Produces: `parse_probe_output(output: &[u8], expected_requested_root: &RemotePath) -> BridgeResult<Capability>` for strict NUL-delimited `key=value` records.
 
-- [ ] **Step 1: Write failing argv and probe tests**
+- [x] **Step 1: Write failing argv and probe tests**
 
 Assert the generated SSH argv contains, as distinct values, `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, `PermitLocalCommand=no`, `RequestTTY=no`, `ControlMaster=auto`, `ControlPersist=300`, and a ControlPath below an owned mode-`0700` runtime directory. Assert no host text beginning with `-` can enter argv.
 
@@ -200,13 +200,13 @@ CODEX_SSH_PROBE=1\0REQUESTED_ROOT=/srv/project\0ROOT=/srv/project\0SHELL_KIND=ba
 
 Assert malformed, duplicated, unknown-version, and root-mismatch output fails closed. Probed physical `ROOT` imports the shared configured-root constant, accepts exactly 65,536 UTF-8 bytes, rejects +1, and has non-ASCII byte-bound cases. Bash-version values accept exactly 256 UTF-8 bytes and reject +1, including non-ASCII boundaries and malicious fake-Bash records, before shell metadata reaches any result or error. Assert a capability failure invalidates exactly one host cache entry.
 
-- [ ] **Step 2: Run the focused tests and verify red**
+- [x] **Step 2: Run the focused tests and verify red**
 
 Run: `cargo test --test ssh_transport -- --nocapture`
 
 Expected: compilation fails for missing `ssh` and `capability` modules.
 
-- [ ] **Step 3: Implement runtime paths, argv policy, fixed probe, and cache**
+- [x] **Step 3: Implement runtime paths, argv policy, fixed probe, and cache**
 
 Create runtime paths below `XDG_RUNTIME_DIR/codex-ssh-bridge` or `/tmp/codex-ssh-bridge-<uid>`. Refuse symlinks, wrong ownership, or permissions other than `0700`. Hash the alias and resolved connection identity into a short ControlPath filename without exposing it to the Agent.
 
@@ -222,13 +222,13 @@ pub fn select_shell(cap: &Capability, requested: ShellRequest) -> BridgeResult<S
 
 `Auto` chooses Bash without profiles, otherwise sh with `fallback=true`; explicit Bash fails with `RemoteCapabilityMissing`; Login records that the remote account shell will interpret the command.
 
-- [ ] **Step 4: Verify the transport policy tests**
+- [x] **Step 4: Verify the transport policy tests**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test ssh_transport`
 
 Expected: all selected tests pass, including runtime-directory permission failures.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add src/ssh src/capability.rs src/lib.rs tests/ssh_transport.rs tests/support tests/fixtures
@@ -252,7 +252,7 @@ git commit -m "feat: add hardened OpenSSH policy and probing"
 - Produces: `OutputStore::capture(stdout, stderr, cancel) -> CapturedOutput` and `OutputStore::read(reference, stream, offset, max_bytes)`.
 - `RunResult` includes status, elapsed, actual shell metadata, stdout/stderr previews, optional opaque reference, bytes seen, and `remote_process_may_continue`.
 
-- [ ] **Step 1: Add failing async behavior tests**
+- [x] **Step 1: Add failing async behavior tests**
 
 Extend the fake SSH fixture with modes selected by environment: echo argv, emit separate streams, emit arbitrary byte counts, sleep, ignore TERM, and exit with chosen status. Add tests that classify strict-host-key, authentication, connect-timeout, remote-exit, and capability failures into stable error codes without returning verbose SSH diagnostics. Test that a local deadline also wraps eligible remote commands with probed GNU `timeout`, and that an unprovably detached process sets `remote_process_may_continue=true`. Add Tokio tests proving:
 
@@ -275,13 +275,13 @@ async fn cancellation_kills_the_child_group_quickly() {
 
 Add a 64 MiB output test that proves retained previews stay bounded, output spills to mode-`0600` files, references cannot contain paths, expired/unknown references fail, and stdout/stderr are drained concurrently.
 
-- [ ] **Step 2: Run the async tests and verify red**
+- [x] **Step 2: Run the async tests and verify red**
 
 Run: `cargo test --test ssh_transport -- --nocapture`
 
 Expected: missing runner/output types cause compilation failure.
 
-- [ ] **Step 3: Implement process groups and output spooling**
+- [x] **Step 3: Implement process groups and output spooling**
 
 On Unix, set a new child process group in `pre_exec`; on cancellation/timeout/output limit send TERM to the group, wait a bounded grace period, then KILL. Read stdout and stderr in separate Tokio tasks into an `OutputSink` that retains bounded head/tail and begins same-directory private spooling after 256 KiB. Count aggregate bytes and cancel at 64 MiB.
 
@@ -289,13 +289,13 @@ Use random 128-bit reference tokens mapped in memory to owned spool entries. Val
 
 Add global and per-host Tokio semaphores. The stdin/protocol task must not hold either semaphore while waiting to acquire another lock.
 
-- [ ] **Step 4: Verify async and output behavior**
+- [x] **Step 4: Verify async and output behavior**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test ssh_transport`
 
 Expected: five-way concurrency, 250 ms cancellation, stream separation, hard limit, and reference expiry tests pass.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add src/ssh src/output.rs src/lib.rs tests/ssh_transport.rs
@@ -317,31 +317,31 @@ git commit -m "feat: add cancellable SSH execution and bounded output"
 - Produces: `RemoteBridge::hosts`, `list`, `stat`, `read`, `search`, and `output_read` async methods.
 - Produces response types containing `remote=true`, alias, physical root, actual paths, hashes, truncation, and shell metadata where relevant.
 
-- [ ] **Step 1: Write failing high-level read tests**
+- [x] **Step 1: Write failing high-level read tests**
 
 Use a temporary local filesystem behind the fake SSH transport. Test batched reads, binary detection/local Base64 encoding, line/byte limits, hashes, hidden/depth entry limits, exact stat types, `rg` selection, grep/find fallback, paths with quotes/newlines/leading hyphens, and root traversal rejection before process launch. Inject exit-zero malformed read/list/stat/search records and assert new domain/protocol errors retain the available host/physical-root/shell through `attach_available_remote_context`.
 
 Assert result serialization includes `remote: true`, `host`, and `physical_root` for every entry.
 
-- [ ] **Step 2: Run the remote read tests and verify red**
+- [x] **Step 2: Run the remote read tests and verify red**
 
 Run: `cargo test --test remote_ops -- --nocapture`
 
 Expected: missing `RemoteBridge` methods cause compilation failure.
 
-- [ ] **Step 3: Implement fixed scripts and parsers**
+- [x] **Step 3: Implement fixed scripts and parsers**
 
 Each operation uses a compile-time script plus encoded positional arguments. Stream file bytes directly and hash locally when the full requested content is present; obtain a remote SHA-256 for version identity when reads are truncated. Use NUL-delimited internal records for list/stat/search where Linux tools support them, then parse with explicit entry ceilings. Every facade/parser return path attaches available safe remote context to newly created errors without overwriting their classification.
 
 `search` chooses `rg --json` when probed, otherwise a bounded `find -print0` plus `grep` path. Query and glob values remain positional/data inputs. Reject unsupported binary search in the fallback with a typed capability error.
 
-- [ ] **Step 4: Verify remote read tools**
+- [x] **Step 4: Verify remote read tools**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test remote_ops`
 
 Expected: all focused cases pass without invoking a local shell.
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add src/remote src/lib.rs tests/remote_ops.rs
@@ -362,17 +362,17 @@ git commit -m "feat: add high-level remote read operations"
 - Produces: `RemoteBridge::write(WriteRequest) -> BridgeResult<WriteResult>` and internal guarded delete used by patching.
 - `WriteMode` is `Create` or `Replace { expected_sha256: Option<String> }`.
 
-- [ ] **Step 1: Add the adversarial failing tests**
+- [x] **Step 1: Add the adversarial failing tests**
 
 Recreate the Python prototype exploit by predicting/replacing candidate temporary names with symlinks to an outside file. Assert the outside content never changes. Also test dangling target symlinks, create-only collision, target created during write, expected-hash mismatch, interrupted transfer cleanup, mode `0600`, same-directory install, read-only profile rejection, and a filename containing all shell metacharacter classes. Write-conflict/snapshot/domain errors created after capability selection must retain host/physical-root/shell without changing conflict or mutation truth.
 
-- [ ] **Step 2: Run safe-write tests and verify red**
+- [x] **Step 2: Run safe-write tests and verify red**
 
 Run: `cargo test --test remote_ops -- --nocapture`
 
 Expected: missing write implementation fails compilation.
 
-- [ ] **Step 3: Implement the fixed safe-write protocol**
+- [x] **Step 3: Implement the fixed safe-write protocol**
 
 Require probed `mktemp`, GNU `dd` with `oflag=nofollow`, `stat`, `sha256sum`, `ln`, and `mv`. The fixed script must:
 
@@ -388,13 +388,13 @@ Pass script/path/mode/hash as encoded arguments rather than interpolating them. 
 
 The Rust parent computes the content SHA-256 while streaming and checks the remote reported value. It must not retry a mutating write automatically after an ambiguous disconnect. Newly parsed conflict/protocol errors pass through the shared non-overwriting remote-context helper.
 
-- [ ] **Step 4: Verify safe writes and the exploit regression**
+- [x] **Step 4: Verify safe writes and the exploit regression**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test remote_ops`
 
 Expected: all attacks fail closed; the outside sentinel file is unchanged.
 
-- [ ] **Step 5: Commit Task 5**
+- [x] **Step 5: Commit Task 5**
 
 ```bash
 git add src/remote tests/remote_ops.rs
@@ -415,29 +415,29 @@ git commit -m "feat: add symlink-safe remote writes"
 - Produces: `parse_patch(&str) -> BridgeResult<Vec<FilePatch>>`, `apply_file_patch(base, patch)`, and `RemoteBridge::apply_patch`.
 - Supports standard `--- a/path`, `+++ b/path`, hunks, and `/dev/null` create/delete; rejects rename-only and binary patches.
 
-- [ ] **Step 1: Write failing parser and orchestration tests**
+- [x] **Step 1: Write failing parser and orchestration tests**
 
 Cover multi-hunk updates, multiple files, create/delete, no-newline marker, malformed ranges, overlapping hunks, absolute/traversal paths, binary markers, base mismatch, all-bases-validated-before-write, and accurate partial-change reporting when the second write fails. Patch result/progress parse errors after a fixed child completes retain available host/physical-root/shell and exact changed/not-changed/unknown partitions.
 
-- [ ] **Step 2: Run patch tests and verify red**
+- [x] **Step 2: Run patch tests and verify red**
 
 Run: `cargo test --test remote_ops -- --nocapture`
 
 Expected: missing patch parser and bridge method fail compilation.
 
-- [ ] **Step 3: Implement strict parsing and local application**
+- [x] **Step 3: Implement strict parsing and local application**
 
 Parse line-by-line with explicit file/hunk state and checked integer arithmetic. Require every context/deletion line to match the downloaded base byte-for-byte. Preserve final-newline state. Cap file count, hunk count, and total output under configured write ceilings.
 
 `apply_patch` first resolves every path and reads every base/version, then computes every output. Only after all validation succeeds does it call guarded write/delete sequentially. Record `changed_paths` after each confirmed operation; on failure return those paths plus `not_changed_paths` and the underlying typed error. Attach available safe remote context at parser/facade boundaries without overwriting progress.
 
-- [ ] **Step 4: Verify all patch behavior**
+- [x] **Step 4: Verify all patch behavior**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test remote_ops`
 
 Expected: all patch cases pass, and traversal/binary patches launch no SSH process.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```bash
 git add src/remote tests/remote_ops.rs
@@ -460,7 +460,7 @@ git commit -m "feat: add guarded remote patch application"
 - Produces: `McpServer::serve<R, W>(reader, writer)`, `ProtocolState`, typed `RequestId`, and response constructors.
 - Supports initialize, initialized notification, ping, tools/list, tools/call, notifications/cancelled, and orderly EOF/shutdown behavior.
 
-- [ ] **Step 1: Write failing protocol state and frame tests**
+- [x] **Step 1: Write failing protocol state and frame tests**
 
 Test valid initialize flow for both supported versions plus JSON-RPC 1.0 rejection, non-object valid JSON (`-32600`), parse error (`-32700`), invalid/null/overlong IDs, requested-version `clientInfo`, unsupported-version bounded-current-union behavior, open capabilities and `_meta`, ping in AwaitInitialized and Ready, tool calls before initialization, duplicated initialize, unknown methods, notifications without responses, exact `DuplicateKey`/`StructuralBudget`/`Syntax` classification, oversized/over-depth/over-node/member/key-byte input rejection before excess allocation, wide-array/object RSS, exact frame minimum/minimum-minus-one, and cancellation read while another tool future is blocked. Add a two-version project-policy golden matrix based on the official methods for initialize/ping/initialized/list/call/cancelled: 2025-06 accepts bounded extra top-level params and ignores/never reflects them; the project's 2025-11 validator rejects fields outside the known official field set while keeping object `_meta` open; closed tool `arguments` stay closed in both, unnegotiated `task` is rejected, and invalid notifications cause no state/cancellation effect.
 
@@ -486,13 +486,13 @@ Assert malformed envelope/lifecycle/unknown-name cases are `calls=0, polls=0,
 bridge_ops=0`; known-tool invalid arguments are `calls=1, polls=1,
 bridge_ops=0`.
 
-- [ ] **Step 2: Run protocol tests and verify red**
+- [x] **Step 2: Run protocol tests and verify red**
 
 Run: `cargo test --test mcp_protocol -- --nocapture`
 
 Expected: missing MCP server fails compilation.
 
-- [ ] **Step 3: Implement bounded framing and concurrent registry**
+- [x] **Step 3: Implement bounded framing and concurrent registry**
 
 Read with `AsyncBufReadExt::fill_buf`, scanning for newline while counting bytes; discard and return `REQUEST_TOO_LARGE` once the configured effective `max_frame_bytes` is exceeded without constructing a larger `String` or `Value`. Eight MiB is the default and compiled maximum, not a hardcoded per-server acceptance bound. Parse only complete UTF-8 JSON lines.
 
@@ -581,13 +581,13 @@ constructor min/minus-one. Task 7 owns the real `RenderedErrorCore`, every
 bulk/mutation compact fallback, and repeated constructor exact/minus-one with
 the actual fallback count.
 
-- [ ] **Step 4: Verify strict MCP behavior**
+- [x] **Step 4: Verify strict MCP behavior**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test mcp_protocol && cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture`
 
 Expected: exact JSON-RPC codes and no pre-initialize tool execution.
 
-- [ ] **Step 5: Commit Task 7**
+- [x] **Step 5: Commit Task 7**
 
 ```bash
 git add src/mcp src/lib.rs src/main.rs tests/mcp_protocol.rs
@@ -617,19 +617,19 @@ git commit -m "feat: add strict asynchronous MCP protocol"
 - Consumes: every `RemoteBridge` high-level operation and bridge-owned opaque-reference paging; MCP never imports `OutputStore`.
 - Produces exact schemas and handlers for `remote_hosts`, `remote_list`, `remote_stat`, `remote_search`, `remote_read`, `remote_output_read`, `remote_apply_patch`, `remote_write`, and `remote_run`.
 
-- [ ] **Step 1: Add failing schema and result tests**
+- [x] **Step 1: Add failing schema and result tests**
 
 Assert the exact nine-tool list, `remote_` names, required host fields, `additionalProperties=false`, size/range constraints, read-only/destructive/open-world annotations, server-side read-only rejection, automatic probe behavior, shell/fallback metadata, actionable sh warnings on success and errors, and remote labels.
 
 Serialize 1 MiB and hostile NUL-heavy output and assert payload appears in only one MCP content representation, the text block's JSON itself contains remote/host/root/shell plus bulk, total wire size remains within response budget, and structured content repeats only small metadata rather than stdout/stderr or other bulk. Bridge-error text is compact JSON with every available remote context plus bounded safe error/warning fields; `RenderedErrorCore` prevents nested structured error details from repeating host/root/shell. Force compact fallbacks for hosts/list/stat/search/read/output-read/run and applied/partial/unknown mutations. Assert truth/counts survive without `-32603`; inject retention success and storage/admission failure for each new read-only ref and mutation detail. Retention tests use actual serialized canonical sizes at exactly `MAX_OUTPUT_BYTES` and +1, cancellation and serializer failure, proving false/no-ref and zero temp residue on failure plus TTL, disk-admission, and concurrency bounds. Use more than five configured hosts without probing. Test aggregate host-list output paging and single-host provenance, plus multi-page UTF-8/Base64 reassembly where shrunk pages use raw-byte offsets with no gaps/overlaps. Release RSS cases for large retained hosts/list/stat/search prove no second full-size vector/JSON clone.
 
-- [ ] **Step 2: Run tool tests and verify red**
+- [x] **Step 2: Run tool tests and verify red**
 
 Run: `cargo test --test mcp_protocol -- --nocapture`
 
 Expected: missing tool registry/handlers fail compilation.
 
-- [ ] **Step 3: Implement schemas and dispatch**
+- [x] **Step 3: Implement schemas and dispatch**
 
 Deserialize each argument object into a dedicated `#[serde(deny_unknown_fields)]` struct. Resolve aliases only through `Config::host`. Let `RemoteBridge` own probe, quoting, limits, and errors; handlers only translate typed requests/results.
 
@@ -653,13 +653,13 @@ charge/slot until final close. Test both lock orders, the former
 lease-before-open window, 1,024 entries without resident-FD amplification,
 concurrent different-offset pages, and last-reader release.
 
-- [ ] **Step 4: Verify the complete MCP surface**
+- [x] **Step 4: Verify the complete MCP surface**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test mcp_protocol && cargo test --test mcp_tools && cargo test --release --test mcp_tools task78_release_dispatch_p95_ -- --nocapture && cargo test --release --test mcp_tools task78_release_fake_call_p95_ -- --nocapture && cargo test --release --test mcp_tools task8_five_hosts_ -- --nocapture && cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture && cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture`
 
 Expected: lifecycle, schema, cancellation, readonly, amplification, dispatch/fake-call p95, five-host, release cancellation, and RSS gates pass. Task 11 still repeats and records the final whole-product/real-SSH acceptance.
 
-- [ ] **Step 5: Commit Task 8**
+- [x] **Step 5: Commit Task 8**
 
 ```bash
 git add src/mcp src/config.rs config.example.toml src/remote/mod.rs src/output.rs src/ssh/process.rs tests/core.rs tests/mcp_protocol.rs tests/mcp_tools.rs tests/ssh_transport.rs tests/remote_ops.rs
@@ -680,19 +680,19 @@ git commit -m "feat: expose high-level remote MCP tools"
 - Consumes: config atomic save, transport policy, capability probe, shared remote run.
 - Produces Clap commands `hosts list/add/remove/show`, `doctor`, `run`, `mount`, `unmount`, `mount-status`, `install --user`, and `uninstall --user`.
 
-- [ ] **Step 1: Add failing CLI tests**
+- [x] **Step 1: Add failing CLI tests**
 
 Use `assert_cmd` to test dry-run defaults, explicit `--apply`, host addition validation, config mode `0600`, doctor root/shell reporting, direct run shell reporting, mountpoint validation, no overwrite of unrelated Codex entries, differentiated `codex mcp get` failures, subprocess timeout, rollback after Skill failure, and identity-checked uninstall. Feed verbose doctor output containing agent socket paths, identity paths, command data, and credential-like tokens, then assert the displayed diagnostic is redacted.
 
 Assert SSHFS argv includes BatchMode, strict host keys, disabled agent/X11/forwarding/local command, connect timeout, keepalives, reconnect, and `ro` for read-only profiles. Assert no MCP source file contains an SSHFS tool.
 
-- [ ] **Step 2: Run CLI tests and verify red**
+- [x] **Step 2: Run CLI tests and verify red**
 
 Run: `cargo test --test cli -- --nocapture`
 
 Expected: CLI subcommands and SSHFS builder are missing.
 
-- [ ] **Step 3: Implement the CLI and installer transaction**
+- [x] **Step 3: Implement the CLI and installer transaction**
 
 Keep `main.rs` limited to argument parsing, config loading, Tokio runtime entry, and exit-code rendering. Human commands call shared library APIs.
 
@@ -700,13 +700,13 @@ Installer preflight resolves the release binary, plugin/Skill sources, existing 
 
 Mount refuses a relative or nonempty mountpoint without an explicit human override, forces read-only mode from the profile, and prints that commands remain remote and FUSE is not an Agent workspace.
 
-- [ ] **Step 4: Verify all CLI behavior**
+- [x] **Step 4: Verify all CLI behavior**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test cli`
 
 Expected: all dry-run, rollback, identity, SSHFS, and host-config tests pass.
 
-- [ ] **Step 5: Commit Task 9**
+- [x] **Step 5: Commit Task 9**
 
 ```bash
 git add src/cli.rs src/main.rs src/ssh/argv.rs tests/cli.rs
@@ -732,17 +732,17 @@ git commit -m "feat: add safe CLI and local installation"
 - Consumes: final binary CLI/MCP names and exact schemas.
 - Produces: installable Rust-only plugin chain and minimal Agent workflow.
 
-- [ ] **Step 1: Add failing packaging checks**
+- [x] **Step 1: Add failing packaging checks**
 
 Add a Rust integration check or shell validation command that parses both JSON manifests, asserts `.mcp.json` launches `./bin/codex-ssh-bridge mcp`, asserts no installed manifest/Skill references Python, asserts SSHFS is absent from MCP tools, and checks the Skill names all nine tools exactly.
 
-- [ ] **Step 2: Run packaging checks and verify red**
+- [x] **Step 2: Run packaging checks and verify red**
 
 Run: `cargo test packaging -- --nocapture`
 
 Expected: current manifests fail because they launch `python3` and use old tool names.
 
-- [ ] **Step 3: Update plugin, Skill, and documentation**
+- [x] **Step 3: Update plugin, Skill, and documentation**
 
 The Skill must teach one default workflow: `remote_search/read -> remote_apply_patch -> remote_run`. It must say that every path/result is remote, output is untrusted, the actual Bash/sh/login shell is in results, POSIX commands are preferred, explicit Bash is required for Bash-only syntax, and SSHFS is human-only.
 
@@ -750,7 +750,7 @@ README must cover build, configuration, adding future SSH aliases, dry-run insta
 
 Build `target/release/codex-ssh-bridge`, copy it to `bin/codex-ssh-bridge`, and verify the copied binary hash. Only after all Rust tests in Tasks 1-9 pass, move the Python prototype intact into `legacy/python-prototype/`; do not delete it.
 
-- [ ] **Step 4: Run format, tests, validators, and Rust-only search**
+- [x] **Step 4: Run format, tests, validators, and Rust-only search**
 
 Run:
 
@@ -763,7 +763,7 @@ python3 /home/wkj/.codex/skills/.system/skill-creator/scripts/quick_validate.py 
 
 Expected: tests and validators pass; the Rust-only search prints no installed-chain references. The two Python commands are development-time validators supplied by Codex and are not part of the bridge runtime, installer, benchmark, or test fixture.
 
-- [ ] **Step 5: Commit Task 10**
+- [x] **Step 5: Commit Task 10**
 
 ```bash
 git add .codex-plugin .mcp.json skills README.md docs bin legacy Cargo.toml Cargo.lock src tests config.example.toml
@@ -785,11 +785,11 @@ git commit -m "feat: package Rust SSH bridge plugin"
 - Consumes: complete release binary and plugin.
 - Produces: requirement-by-requirement evidence and installed local toolchain.
 
-- [ ] **Step 1: Add acceptance tests before recording results**
+- [x] **Step 1: Add acceptance tests before recording results**
 
 The release-only performance test must measure at least 100 dispatches/fake calls for p95, five concurrent one-second commands, cancellation latency, 64 MiB output RSS delta, maximum-budget wide JSON array/object RSS deltas below 48 MiB, and maximum MCP wire bytes. Run the wide array and wide object in separate fresh release child processes. Each child records an idle/warmed baseline, samples peak during repeated parsing, prints raw baseline/peak/delta, and asserts `peak-baseline < 48 MiB`; never reuse one test-binary process where allocator-retained memory or parallel tests can contaminate the second shape. Task 11 deliberately repeats the Tasks 7–8 wide-JSON gate as final whole-product acceptance. The real-SSH test creates an isolated local `sshd` fixture when facilities permit and otherwise prints one explicit skip reason; it tests host keys, ControlMaster reuse, Bash/sh metadata, raw command, read/search/patch/write, timeout, and cleanup.
 
-- [ ] **Step 2: Run acceptance tests to expose remaining failures**
+- [x] **Step 2: Run acceptance tests to expose remaining failures**
 
 Run:
 
@@ -800,13 +800,13 @@ cargo test --release --test real_ssh -- --nocapture
 
 Expected before final tuning: any unmet threshold or unavailable fixture is visible and not summarized as a pass.
 
-- [ ] **Step 3: Fix measured regressions without weakening thresholds**
+- [x] **Step 3: Fix measured regressions without weakening thresholds**
 
 Use profiling evidence to remove avoidable allocations, clone-free payload paths, blocking locks, duplicate serialization, or excess process setup. Do not replace actual acceptance with mocks. Record host/kernel/Rust/OpenSSH versions, raw samples, p50/p95/max, RSS delta, and real-SSH status in `docs/performance.md`.
 
 Re-run the original predictable-temp symlink exploit, 16 MiB stdout+stderr serializer case, oversized-frame case, cancellation case, and SSHFS policy test; record the passing commands in `docs/security.md`.
 
-- [ ] **Step 4: Run the full completion audit**
+- [x] **Step 4: Run the full completion audit**
 
 Run:
 
@@ -824,7 +824,7 @@ python3 /home/wkj/.codex/skills/.system/skill-creator/scripts/quick_validate.py 
 
 Expected: all mandatory checks pass, any real-SSH skip is explicitly reported for user judgment, help lists no Python dependency, and install dry-run reports only expected Rust MCP/Skill changes.
 
-- [ ] **Step 5: Install with approval and smoke-test Codex MCP**
+- [x] **Step 5: Install with approval and smoke-test Codex MCP**
 
 Request approval for writes under the user's Codex/config directories, then run:
 
@@ -835,7 +835,7 @@ codex mcp get ssh-bridge
 
 Start the MCP binary directly, send initialize/initialized/tools-list frames, and confirm all nine tools. If an allowlisted real host exists, run `remote_hosts` and one bounded `remote_list`; do not mutate a real server without separate explicit authorization.
 
-- [ ] **Step 6: Commit final evidence**
+- [x] **Step 6: Commit final evidence**
 
 ```bash
 git add tests/performance_acceptance.rs tests/real_ssh.rs docs/performance.md docs/security.md README.md
@@ -856,3 +856,13 @@ git commit -m "test: verify SSH bridge security and performance"
 - Strict MCP: lifecycle/frame/schema suite.
 - Rust-only runtime: manifest search, binary help, legacy move, plugin validators.
 - Complete local toolchain: dry-run, transactional apply, Codex MCP registration, direct stdio smoke test.
+
+## Final Review Evidence — 2026-07-19
+
+- All 56 implementation-plan steps above are complete; final hardening preserved every compiled security, memory, wire, latency, and cancellation threshold.
+- RED evidence reproduced identity resolution caching, resolved-identity drift acceptance, absent ordinary-SSH keepalives, unsupported configuration versions, and unconditional real-SSH setup skipping before their fixes.
+- Focused GREEN evidence covers two `ssh -G` calls across two operations, rejection of changed resolved configuration before `P`/`R`/`C`, exact-once keepalives in bootstrap/operational/SSHFS argv, rejection of config versions 0 and 2 on load/save, and required-mode setup failure with its original reason.
+- `cargo fmt --all -- --check`, warning-free Clippy, and `cargo test --all-targets --all-features -- --test-threads=1` passed after the final changes.
+- `cargo test --release --test performance_acceptance -- --nocapture` passed all five tests with unchanged gates; `docs/performance.md` records the final samples.
+- `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture` failed closed in the managed sandbox with `cannot reserve a localhost port: Operation not permitted (os error 1)` and no integration skip. This exact command requires an outside-sandbox rerun before release sign-off.
+- `cargo build --release` succeeded; `bin/codex-ssh-bridge` is mode `0755`, and it matched the release artifact at SHA-256 `92e47acbe4ea9738ed9c660e204e9901ffb6d773c641308ee7746408878d5749`.

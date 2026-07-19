@@ -192,7 +192,7 @@ async fn task11_release_latency_concurrency_cancellation_and_wire_acceptance() {
     let complete_kinds = transport_call_kinds(&complete.log);
     assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "G").count(),
-        1
+        SSH_WARM_CALLS + SSH_MEASURED_CALLS
     );
     assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "P").count(),

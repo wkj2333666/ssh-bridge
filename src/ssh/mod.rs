@@ -30,6 +30,8 @@ pub use process::{RunRequest, RunResult, SshRunner};
 const RUNTIME_DIRECTORY: &str = "codex-ssh-bridge";
 const CONTROL_FILENAME_BYTES: usize = 3 + 32;
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+pub(crate) const SERVER_ALIVE_INTERVAL_SECONDS: u64 = 15;
+pub(crate) const SERVER_ALIVE_COUNT_MAX: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -280,6 +282,10 @@ impl SshPolicy {
             options.push(OsString::from("-o"));
             options.push(OsString::from(option));
         }
+        for option in server_alive_options() {
+            options.push(OsString::from("-o"));
+            options.push(option);
+        }
         options.push(OsString::from("-o"));
         options.push(openssh_connect_timeout_option(
             host.limits.connect_timeout_ms,
@@ -296,6 +302,15 @@ impl SshPolicy {
     pub fn control_path(&self) -> &Path {
         &self.control_path
     }
+}
+
+pub(crate) fn server_alive_options() -> [OsString; 2] {
+    [
+        OsString::from(format!(
+            "ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECONDS}"
+        )),
+        OsString::from(format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}")),
+    ]
 }
 
 fn openssh_connect_timeout_option(milliseconds: u64) -> OsString {

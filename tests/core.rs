@@ -233,6 +233,33 @@ fn config_loads_defaults_and_resolves_exact_aliases_with_overrides() {
 }
 
 #[test]
+fn config_rejects_unsupported_version_when_loading_and_saving() {
+    for version in [0, 2] {
+        let file = write_config(&format!("version = {version}\n[hosts]\n"));
+        let load_error = Config::load(file.path()).unwrap_err();
+        assert_eq!(
+            load_error.code,
+            ErrorCode::InvalidConfig,
+            "load version={version}"
+        );
+
+        let config = Config {
+            version,
+            ..Config::default()
+        };
+        let directory = TempDir::new().unwrap();
+        let destination = directory.path().join("config.toml");
+        let save_error = config.save_atomic(&destination).unwrap_err();
+        assert_eq!(
+            save_error.code,
+            ErrorCode::InvalidConfig,
+            "save version={version}"
+        );
+        assert!(!destination.exists(), "save version={version}");
+    }
+}
+
+#[test]
 fn config_defaults_match_compiled_limits() {
     let limits = Limits::default();
     assert_eq!(limits.connect_timeout_ms, 10_000);

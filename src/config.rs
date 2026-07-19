@@ -23,6 +23,7 @@ const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
 const MAX_GLOBAL_CONCURRENCY: usize = 32;
 const MAX_PER_HOST_CONCURRENCY: usize = 8;
 
+pub const CONFIG_VERSION: u32 = 1;
 pub const MAX_REMOTE_CONTEXT_ROOT_BYTES: usize = 65_536;
 pub const DEFAULT_GLOBAL_SPOOL_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
 pub const MIN_GLOBAL_SPOOL_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
@@ -42,7 +43,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: CONFIG_VERSION,
             limits: Limits::default(),
             hosts: BTreeMap::new(),
         }
@@ -230,6 +231,12 @@ impl Config {
     }
 
     fn validate(&self) -> BridgeResult<()> {
+        if self.version != CONFIG_VERSION {
+            return Err(BridgeError::invalid_config(format!(
+                "unsupported configuration version {}; expected {CONFIG_VERSION}",
+                self.version
+            )));
+        }
         validate_limits(&self.limits)?;
         for (alias, profile) in &self.hosts {
             if !valid_alias(alias) {

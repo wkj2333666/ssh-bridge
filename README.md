@@ -73,9 +73,11 @@ ssh devbox
 ./bin/codex-ssh-bridge doctor devbox
 ```
 
-Add future servers with another concrete alias and `hosts add`; there is no five-host ceiling. Use `--read-only` for inspection-only profiles. The default local config is `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml) documents limits. It contains aliases, roots, descriptions, and limits—never credentials.
+Add future servers with another concrete alias and `hosts add`; there is no five-host ceiling. Use `--read-only` for inspection-only profiles. The default local config is `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml) documents limits. It accepts exactly configuration `version = 1` and contains aliases, roots, descriptions, and limits—never credentials.
 
-`doctor` probes the configured root's physical path and device/inode identity as well as shell and utility capabilities. Every later operation revalidates that identity through the reused SSH connection and pins the checked directory as its working directory before the business script. Reads may follow a newly observed physical root and report it; writes, patches, and `remote_run` compare against the bridge process's immutable first trust and fail closed if it changed. Refreshing tool capabilities never refreshes root trust: intentionally accepting a replacement root requires a bridge restart and fresh probe.
+Before every operation, the bridge reruns bounded system `ssh -G`, hashes the resolved OpenSSH configuration, and compares it with the first immutable connection identity for that alias. A mismatch fails with `INVALID_CONFIG` before capability probing, root observation, or the business command; verify the alias and restart the bridge to accept an intentional change. The local Unix user and that user's OpenSSH configuration remain trusted execution authority.
+
+`doctor` probes the configured root's physical path and device/inode identity as well as shell and utility capabilities. Every later operation revalidates that root identity through the reused SSH connection and pins the checked directory as its working directory before the business script. Reads may follow a newly observed physical root and report it; writes, patches, and `remote_run` compare against the bridge process's immutable first root trust and fail closed if it changed. Refreshing tool capabilities never refreshes root trust: intentionally accepting a replacement root requires a bridge restart and fresh probe.
 
 `doctor devbox --verbose-ssh` also runs a bounded local OpenSSH diagnostic and redacts identity paths, agent sockets, commands, and credential-like fields.
 
@@ -166,7 +168,7 @@ Use SSHFS for browsing or narrow human editing. Keep builds, Git, tests, contain
 
 ## Security and performance
 
-The bridge forces non-interactive authentication, strict host keys, no agent/X11/port forwarding, no local command, no TTY, bounded connection time, encrypted keepalives, and a private hashed ControlMaster socket. It never accepts arbitrary SSH options from MCP. Remote output remains untrusted and remote Unix permissions are the hard isolation boundary.
+The bridge forces non-interactive authentication, strict host keys, no agent/X11/port forwarding, no local command, no TTY, bounded connection time, `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and a private hashed ControlMaster socket for ordinary SSH and SSHFS. It never accepts arbitrary SSH options from MCP. Remote output remains untrusted and remote Unix permissions are the hard isolation boundary.
 
 Read [docs/security.md](docs/security.md) for the complete trust model and flags. Read [docs/performance.md](docs/performance.md) for reproducible commands and raw measurements.
 

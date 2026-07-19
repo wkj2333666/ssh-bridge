@@ -99,11 +99,15 @@ Every connection uses system OpenSSH and therefore consumes normal user configur
 - `ClearAllForwardings=yes`
 - `PermitLocalCommand=no`
 - `RequestTTY=no`
-- bounded connect timeout and server-alive settings
+- bounded connect timeout
+- `ServerAliveInterval=15`
+- `ServerAliveCountMax=3`
 
 Disabling agent forwarding does not disable using the local agent for authentication. `ProxyJump`, `ProxyCommand`, `IdentityFile`, `IdentityAgent`, certificates, and hardware keys continue to work. The user's SSH config is trusted local authority; a configured `ProxyCommand` can execute local programs by design.
 
-The bridge owns a directory below `${XDG_RUNTIME_DIR}` with mode `0700` and a dedicated hashed ControlPath. When `XDG_RUNTIME_DIR` is unavailable, it creates and validates `/tmp/codex-ssh-bridge-<uid>` as a non-symlink directory owned by the current user with mode `0700`. Its master sessions use `ControlMaster=auto` and `ControlPersist=300`. This prevents reuse of an externally created permissive master while amortizing handshake and authentication cost. The first capability probe establishes the reusable session.
+The bridge owns a directory below `${XDG_RUNTIME_DIR}` with mode `0700` and a dedicated hashed ControlPath. When `XDG_RUNTIME_DIR` is unavailable, it creates and validates `/tmp/codex-ssh-bridge-<uid>` as a non-symlink directory owned by the current user with mode `0700`. Its master sessions use `ControlMaster=auto` and `ControlPersist=300`; normal SSH and SSHFS both receive the two server-alive options exactly once. This prevents reuse of an externally created permissive master while amortizing handshake and authentication cost.
+
+Before every operation, bounded system `ssh -G` resolves the alias under the forced policy. The first resolved-configuration digest is immutable for the bridge process and determines its ControlPath; a later mismatch returns non-retryable `INVALID_CONFIG` before probe, root observation, or business command and never replaces the digest. The local Unix user and local SSH configuration remain trusted. A same-UID configuration change in the exact interval after comparison and before the next OpenSSH invocation is inside that trust boundary; accepting an intentional identity change requires review and bridge restart.
 
 Global concurrency defaults to eight tasks and per-host concurrency to two tasks. Both are hard-bounded. The expected peak is five hosts.
 
@@ -396,7 +400,7 @@ fields.
 
 ## 13. SSHFS Policy
 
-SSHFS is optional and human-only. `mount`, `unmount`, and `mount-status` require explicit local paths and never appear in MCP schemas or Skill workflows. The mount command applies relevant SSH hardening, connection keepalives, and reconnect behavior. Read-only host profiles force `-o ro`. It refuses a nonempty mountpoint unless the human supplies an explicit override and clearly reports the semantic and disconnect limitations of FUSE/SFTP.
+SSHFS is optional and human-only. `mount`, `unmount`, and `mount-status` require explicit local paths and never appear in MCP schemas or Skill workflows. The mount command inherits the normal SSH hardening and its single copy of `ServerAliveInterval=15` and `ServerAliveCountMax=3`, then adds reconnect behavior. Read-only host profiles force `-o ro`. It refuses a nonempty mountpoint unless the human supplies an explicit override and clearly reports the semantic and disconnect limitations of FUSE/SFTP.
 
 ## 14. Testing Strategy
 
@@ -423,7 +427,7 @@ Integration tests use a controllable fake SSH executable and, when available, a 
 - Temporary symlink attacks, dangling target symlinks, no-clobber creates, overwrite conflicts, and cleanup.
 - Malformed requests, pre-initialize calls, oversized frames, serializer amplification, and hostile output.
 
-The real-SSH suite is skipped only with a visible reason when local privileges or facilities genuinely cannot provide an `sshd`; its absence cannot be reported as a pass.
+Developer real-SSH runs skip only with a visible reason when local privileges or facilities genuinely cannot provide an `sshd`. Final release acceptance sets `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1`, which makes the original setup reason fatal so absence cannot be reported as a pass.
 
 ## 15. Performance Acceptance
 

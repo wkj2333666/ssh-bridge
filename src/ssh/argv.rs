@@ -44,8 +44,6 @@ pub fn build_sshfs_argv(
     argv.push(mountpoint.as_os_str().to_owned());
     push_option(&mut argv, "ssh_command=/usr/bin/ssh");
     argv.extend(policy.options.iter().cloned());
-    push_option(&mut argv, "ServerAliveInterval=15");
-    push_option(&mut argv, "ServerAliveCountMax=3");
     push_option(&mut argv, "reconnect");
     if host.profile.read_only {
         push_option(&mut argv, "ro");

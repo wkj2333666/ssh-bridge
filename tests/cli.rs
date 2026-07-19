@@ -223,6 +223,12 @@ fn option_is_distinct(argv: &[std::ffi::OsString], expected: &str) -> bool {
         .any(|pair| pair[0] == "-o" && pair[1] == expected)
 }
 
+fn option_count(argv: &[std::ffi::OsString], expected: &str) -> usize {
+    argv.windows(2)
+        .filter(|pair| pair[0] == "-o" && pair[1] == expected)
+        .count()
+}
+
 #[test]
 fn task9_sshfs_argv_has_exact_hardening_reconnect_and_forced_read_only() {
     let private = tempfile::TempDir::new().unwrap();
@@ -259,6 +265,13 @@ fn task9_sshfs_argv_has_exact_hardening_reconnect_and_forced_read_only() {
         assert!(
             option_is_distinct(&argv, option),
             "missing {option:?}: {argv:?}"
+        );
+    }
+    for option in ["ServerAliveInterval=15", "ServerAliveCountMax=3"] {
+        assert_eq!(
+            option_count(&argv, option),
+            1,
+            "option={option:?}, argv={argv:?}"
         );
     }
     assert!(!argv.iter().any(|argument| argument == "allow_other"));
