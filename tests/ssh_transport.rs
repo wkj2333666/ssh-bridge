@@ -161,6 +161,45 @@ fn argv_uses_hardened_distinct_options_and_a_private_hashed_control_path() {
 }
 
 #[test]
+fn operational_argv_rounds_connect_timeout_up_to_openssh_seconds_exactly() {
+    for (milliseconds, expected_seconds) in [
+        (1, 1),
+        (999, 1),
+        (1_000, 1),
+        (1_001, 2),
+        (2_500, 3),
+        (120_000, 120),
+    ] {
+        let base = TempDir::new().unwrap();
+        let paths = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let mut config = config_with_host("dev-box", "/srv/project");
+        config.limits.connect_timeout_ms = milliseconds;
+        let policy = policy(&config, &paths, "stable identity");
+        let argv = build_ssh_argv(&policy, "dev-box", "printf safe");
+        let expected = format!("ConnectTimeout={expected_seconds}");
+
+        assert_eq!(
+            argv.windows(2)
+                .filter(|pair| pair[0] == OsStr::new("-o") && pair[1] == OsStr::new(&expected))
+                .count(),
+            1,
+            "milliseconds={milliseconds}, argv={argv:?}"
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|argument| {
+                    argument
+                        .to_str()
+                        .is_some_and(|value| value.starts_with("ConnectTimeout="))
+                })
+                .count(),
+            1,
+            "milliseconds={milliseconds}, argv={argv:?}"
+        );
+    }
+}
+
+#[test]
 fn hostile_host_text_is_only_an_operand_after_the_option_separator() {
     let base = TempDir::new().unwrap();
     let paths = RuntimePaths::ensure_from_base(base.path()).unwrap();
@@ -1501,6 +1540,68 @@ async fn runner_resolves_once_probes_once_and_uses_hardened_ssh_g() {
     assert!(!config_call.contains("ControlMaster="));
     assert!(!config_call.contains("ControlPath="));
     assert!(config_call.contains("arg=--\narg=dev\n"));
+}
+
+#[tokio::test]
+async fn cached_host_reconnect_command_still_carries_configured_connect_timeout() {
+    let files = TempDir::new().unwrap();
+    let marker = files.path().join("first-command-complete");
+    let log = files.path().join("calls.log");
+    let limits = Limits {
+        connect_timeout_ms: 1_001,
+        ..Limits::default()
+    };
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+            (
+                "FAKE_SSH_ENFORCE_CONNECT_TIMEOUT_AFTER",
+                marker.display().to_string(),
+            ),
+            (
+                "FAKE_SSH_EXPECT_CONNECT_TIMEOUT",
+                "ConnectTimeout=2".to_owned(),
+            ),
+            ("FAKE_SSH_MISSING_OPTION_SLEEP_SECONDS", "2".to_owned()),
+        ],
+    );
+
+    fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_millis(250)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let started = Instant::now();
+    fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_millis(250)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("cached command must not hang when reconnecting");
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let calls = fs::read_to_string(log).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
+    for call in calls.split("END\n").filter(|call| !call.is_empty()) {
+        assert_eq!(
+            call.lines()
+                .filter(|line| *line == "arg=ConnectTimeout=2")
+                .count(),
+            1,
+            "call={call:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -280,6 +280,10 @@ impl SshPolicy {
             options.push(OsString::from(option));
         }
         options.push(OsString::from("-o"));
+        options.push(openssh_connect_timeout_option(
+            host.limits.connect_timeout_ms,
+        ));
+        options.push(OsString::from("-o"));
         options.push(control_option);
 
         Ok(Self {
@@ -291,6 +295,11 @@ impl SshPolicy {
     pub fn control_path(&self) -> &Path {
         &self.control_path
     }
+}
+
+fn openssh_connect_timeout_option(milliseconds: u64) -> OsString {
+    let seconds = milliseconds.div_ceil(1_000).max(1);
+    OsString::from(format!("ConnectTimeout={seconds}"))
 }
 
 fn control_path_candidate_is_usable(directory: &Path) -> bool {

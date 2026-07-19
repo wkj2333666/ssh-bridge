@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{RuntimePaths, SshPolicy, build_ssh_argv};
+use super::{RuntimePaths, SshPolicy, build_ssh_argv, openssh_connect_timeout_option};
 use crate::capability::{
     CAPABILITY_PROBE_SCRIPT, Capability, CapabilityCache, ShellKind, ShellRequest, ShellSelection,
     parse_probe_output, select_shell,
@@ -528,6 +528,8 @@ impl SshRunner {
             argv.push(OsString::from("-o"));
             argv.push(OsString::from(option));
         }
+        argv.push(OsString::from("-o"));
+        argv.push(openssh_connect_timeout_option(connect_timeout_ms));
         argv.push(OsString::from("--"));
         argv.push(OsString::from(host));
         let total_limit = RESOLVED_STDOUT_LIMIT + RESOLVED_STDERR_LIMIT;
