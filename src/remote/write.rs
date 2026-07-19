@@ -67,7 +67,7 @@ codex_mutation_replace() {
 }
 
 codex_mutation_mode() {
-    chmod -h "$1" -- "$2"
+    chmod "$1" -- "$2"
 }
 
 codex_mutation_remove() {
@@ -275,10 +275,7 @@ codex_safe_write_sentinel() (
     codex_sentinel_hash_status=0
     codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_link") || codex_sentinel_hash_status=$?
     [ "$codex_sentinel_hash_status" -eq 9 ] || exit 1
-    codex_mutation_mode 0640 "$codex_sentinel_link" || exit 9
-    codex_sentinel_outside_mode=$(stat --printf='%a' -- "$codex_sentinel_outside") || exit 9
     codex_sentinel_outside_content=$(cat "$codex_sentinel_outside") || exit 9
-    [ "$codex_sentinel_outside_mode" = 600 ] || exit 1
     [ "$codex_sentinel_outside_content" = OUTSIDE ] || exit 1
 
     cleanup_codex_sentinel || exit 9
@@ -511,6 +508,13 @@ if [ "$expected_hash_present" = 1 ]; then
     [ "$target_hash" = "$expected_target_hash" ] || emit_one WRITE_CONFLICT
 fi
 
+# Apply mode before exposing the staged inode at the target path.  This keeps
+# chmod from ever following an attacker-replaced target symlink.
+codex_mutation_mode "$target_mode" "$tmp" || exit 5
+codex_mutation_stat_valid "$tmp" || exit 5
+case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_device:$stage_inode:$target_mode:$expected_size:1" ] || exit 5
+
 codex_mutation_replace "$tmp" "$target" || exit 5
 [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
 tmp=
@@ -518,15 +522,10 @@ tmp=
 codex_mutation_stat_valid "$target" || exit 5
 case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
 [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
-[ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:600:$expected_size:1" ] || exit 5
+[ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:$target_mode:$expected_size:1" ] || exit 5
 target_hash=$(codex_mutation_hash "$target") || exit 5
 [ "$target_hash" = "$expected_content_hash" ] || exit 5
 
-codex_mutation_mode "$target_mode" "$target" || exit 5
-codex_mutation_stat_valid "$target" || exit 5
-case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
-[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
-[ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:$target_mode:$expected_size:1" ] || exit 5
 [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
 
 mode_decimal=$((0$CODEX_STAT_MODE))
@@ -1906,6 +1905,9 @@ mod tests {
             assert!(script.contains("codex_mutation_decimal_valid \"$6\" || return 1"));
             assert!(script.contains("codex_mutation_decimal_valid \"$7\" || return 1"));
         }
+        assert!(!super::WRITE_SCRIPT.contains("chmod -h"));
+        assert!(super::WRITE_SCRIPT.contains("codex_mutation_mode \"$target_mode\" \"$tmp\""));
+        assert!(!super::WRITE_SCRIPT.contains("codex_mutation_mode \"$target_mode\" \"$target\""));
     }
 
     #[test]
