@@ -61,21 +61,25 @@ fn policy(
 
 fn bash_probe(requested: &str, physical: &str) -> Vec<u8> {
     format!(
-        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=bash\0BASH_VERSION=5.2.15\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=bash\0BASH_VERSION=5.2.15\0LOGIN_SHELL=/bin/sh\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
     )
     .into_bytes()
 }
 
 fn bash_probe_with_version(requested: &str, physical: &str, version: &str) -> Vec<u8> {
     format!(
-        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=bash\0BASH_VERSION={version}\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=bash\0BASH_VERSION={version}\0LOGIN_SHELL=/bin/sh\0TOOL_rg=1\0TOOL_dd_nofollow=1\0TOOL_timeout=0\0"
     )
     .into_bytes()
 }
 
 fn sh_probe(requested: &str, physical: &str) -> Vec<u8> {
+    sh_probe_with_login(requested, physical, "/bin/sh")
+}
+
+fn sh_probe_with_login(requested: &str, physical: &str, login_shell: &str) -> Vec<u8> {
     format!(
-        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=sh\0BASH_VERSION=\0TOOL_rg=0\0"
+        "CODEX_SSH_PROBE=1\0REQUESTED_ROOT={requested}\0ROOT={physical}\0ROOT_DEVICE=1\0ROOT_INODE=2\0SHELL_KIND=sh\0BASH_VERSION=\0LOGIN_SHELL={login_shell}\0TOOL_rg=0\0"
     )
     .into_bytes()
 }
@@ -91,6 +95,7 @@ fn capability(shell: ShellKind) -> Capability {
         root_inode: 2,
         shell,
         bash_version,
+        login_shell: Some("/bin/sh".to_owned()),
         tools: BTreeMap::new(),
     }
 }
@@ -492,6 +497,43 @@ fn parser_accepts_bash_sh_and_newlines_without_conflating_requested_and_physical
     assert_eq!(sh.physical_root, "/srv/physical");
     assert_eq!(sh.shell, ShellKind::PosixSh);
     assert_eq!(sh.bash_version, None);
+    assert_eq!(sh.login_shell.as_deref(), Some("/bin/sh"));
+}
+
+#[test]
+fn login_shell_probe_field_is_closed_bounded_and_optional() {
+    let expected = RemotePath::resolve("/srv/project", ".").unwrap();
+    let missing = parse_probe_output(
+        &sh_probe_with_login(expected.absolute(), "/srv/project", ""),
+        &expected,
+    )
+    .unwrap();
+    assert_eq!(missing.login_shell, None);
+
+    let valid = String::from_utf8(sh_probe(expected.absolute(), "/srv/project")).unwrap();
+    for malformed in [
+        valid.replace("LOGIN_SHELL=/bin/sh\0", ""),
+        valid.replace(
+            "LOGIN_SHELL=/bin/sh\0",
+            "LOGIN_SHELL=/bin/sh\0LOGIN_SHELL=/bin/bash\0",
+        ),
+    ] {
+        let error = parse_probe_output(malformed.as_bytes(), &expected).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolError);
+    }
+
+    for invalid in [
+        "relative/sh".to_owned(),
+        "/bin/sh\nother".to_owned(),
+        format!("/{}", "x".repeat(4096)),
+    ] {
+        let error = parse_probe_output(
+            &sh_probe_with_login(expected.absolute(), "/srv/project", &invalid),
+            &expected,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolError, "{invalid:?}");
+    }
 }
 
 #[test]
@@ -554,6 +596,13 @@ fn shell_selection_records_profile_free_bash_posix_fallback_and_login_semantics(
     let automatic_login = select_shell(&reported_login, ShellRequest::Auto).unwrap();
     assert_eq!(automatic_login.shell, ShellKind::PosixSh);
     assert!(automatic_login.fallback);
+
+    let mut missing_login = sh.clone();
+    missing_login.login_shell = None;
+    let error = select_shell(&missing_login, ShellRequest::Login).unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+    assert!(select_shell(&missing_login, ShellRequest::Auto).is_ok());
+    assert!(select_shell(&missing_login, ShellRequest::Sh).is_ok());
 }
 
 #[test]
@@ -967,6 +1016,71 @@ fn fixed_probe_script_emits_parseable_nul_records_and_cleans_its_private_directo
         );
     }
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn capability_probe_accepts_only_one_strict_nss_login_shell_record() {
+    let root = TempDir::new().unwrap();
+    let uid = fs::metadata(root.path()).unwrap().uid();
+    let expected = RemotePath::resolve(root.path().to_str().unwrap(), ".").unwrap();
+    let run_probe = |getent_script: &str| {
+        let shim = TempDir::new().unwrap();
+        let getent = shim.path().join("getent");
+        fs::write(&getent, getent_script).unwrap();
+        fs::set_permissions(&getent, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(std::iter::once(shim.path().to_path_buf()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                CAPABILITY_PROBE_SCRIPT,
+                "probe",
+                root.path().to_str().unwrap(),
+            ])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "probe stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_probe_output(&output.stdout, &expected).unwrap()
+    };
+    let valid_record = format!("fixture:x:{uid}:{uid}::/tmp:/bin/sh\n");
+    let valid_script = format!(
+        "#!/bin/sh\nprintf %s {}\n",
+        codex_ssh_bridge::quote::shell_word(&valid_record).unwrap()
+    );
+    assert_eq!(
+        run_probe(&valid_script).login_shell.as_deref(),
+        Some("/bin/sh")
+    );
+    let empty_shell_record = format!("fixture:x:{uid}:{uid}::/tmp:\n");
+    let empty_shell_script = format!(
+        "#!/bin/sh\nprintf %s {}\n",
+        codex_ssh_bridge::quote::shell_word(&empty_shell_record).unwrap()
+    );
+    assert_eq!(
+        run_probe(&empty_shell_script).login_shell.as_deref(),
+        Some("/bin/sh")
+    );
+
+    let duplicate = format!("{valid_record}{valid_record}");
+    let trailing_empty = format!("{valid_record}\n");
+    let malformed = format!("fixture:x:{uid}:{uid}::/bin/sh\n");
+    let relative = format!("fixture:x:{uid}:{uid}::/tmp:bin/sh\n");
+    let oversized = format!("fixture:x:{uid}:{uid}::/tmp:/{}\n", "x".repeat(4096));
+    for rejected in [duplicate, trailing_empty, malformed, relative, oversized] {
+        let script = format!(
+            "#!/bin/sh\nprintf %s {}\n",
+            codex_ssh_bridge::quote::shell_word(&rejected).unwrap()
+        );
+        assert_eq!(run_probe(&script).login_shell, None, "{rejected:?}");
+    }
+    assert_eq!(run_probe("#!/bin/sh\nexit 1\n").login_shell, None);
 }
 
 #[test]
@@ -1772,11 +1886,55 @@ async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
         .unwrap();
     assert_eq!(result.shell.shell, ShellKind::Login);
     let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
-    assert!(rendered.contains("i='1:1'"));
-    assert!(rendered.contains("cwd='.'"));
-    assert!(rendered.contains("payload='printf safe'"));
-    assert!(rendered.contains("eval \"$payload\""));
+    assert!(rendered.starts_with("exec sh -c "));
+    assert!(rendered.contains("codex-ssh-bridge-op"));
+    assert!(rendered.contains("exec \"$login_shell\" -c \"$payload\""));
+    assert!(rendered.contains(" '/bin/sh' 'printf safe'"));
+    assert!(!rendered.contains("eval \"$payload\""));
     assert!(!rendered.contains("timeout --signal"));
+}
+
+#[tokio::test]
+async fn unresolved_login_shell_fails_before_command_while_auto_and_sh_remain_available() {
+    let controls = TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOGIN_SHELL", String::new()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Login, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "C")
+            .count(),
+        0
+    );
+    for shell in [ShellRequest::Auto, ShellRequest::Sh] {
+        fixture
+            .runner
+            .execute(
+                request("dev", shell, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

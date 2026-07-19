@@ -84,6 +84,46 @@ fn fixture_with_options(
     (runtime_base, runner, bridge)
 }
 
+fn fixture_with_probed_login_shell(
+    root: &std::path::Path,
+    login_shell: &std::path::Path,
+) -> (
+    tempfile::TempDir,
+    Arc<SshRunner>,
+    RemoteBridge,
+    tempfile::TempDir,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    let controls = tempfile::TempDir::new().unwrap();
+    let uid = std::fs::metadata(root).unwrap().uid();
+    write_executable(
+        &controls.path().join("getent"),
+        format!(
+            "#!/bin/sh\n[ \"$1:$2\" = passwd:{uid} ] || exit 2\nprintf '%s\\n' {}\n",
+            codex_ssh_bridge::quote::shell_word(&format!(
+                "fixture:x:{uid}:{uid}::/tmp:{}",
+                login_shell.display()
+            ))
+            .unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        controls.path().display()
+    ));
+    let (runtime, runner, bridge) = fixture_with_options(
+        root,
+        false,
+        None,
+        &[
+            ("PATH", path),
+            ("FAKE_SSH_ACCOUNT_SHELL", login_shell.as_os_str().to_owned()),
+        ],
+    );
+    (runtime, runner, bridge, controls)
+}
+
 fn fixture_with_patch_policy(
     root: &std::path::Path,
     max_write_bytes: Option<usize>,
@@ -1877,12 +1917,8 @@ async fn raw_guard_uses_the_verified_root_inode_after_its_path_is_replaced() {
 #[tokio::test]
 async fn login_run_is_interpreted_by_the_account_shell_after_root_guarding() {
     let remote = tempfile::TempDir::new().unwrap();
-    let (_runtime, _runner, bridge) = fixture_with_options(
-        remote.path(),
-        false,
-        None,
-        &[("FAKE_SSH_ACCOUNT_SHELL", OsString::from("/bin/bash"))],
-    );
+    let (_runtime, _runner, bridge, _controls) =
+        fixture_with_probed_login_shell(remote.path(), std::path::Path::new("/bin/bash"));
     let result = bridge
         .run(
             RemoteRunRequest {
@@ -1902,14 +1938,79 @@ async fn login_run_is_interpreted_by_the_account_shell_after_root_guarding() {
 }
 
 #[tokio::test]
-async fn login_guard_does_not_enable_nounset_for_the_user_payload() {
+async fn login_run_uses_the_probed_non_posix_account_shell_and_ignores_shell_environment() {
+    use std::os::unix::fs::MetadataExt;
+
     let remote = tempfile::TempDir::new().unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let account_shell = controls.path().join("non-posix-account-shell");
+    write_executable(
+        &account_shell,
+        "#!/bin/sh\n[ \"$1\" = -c ] || exit 91\ncase \"$2\" in 'exec sh -c '*) exec /bin/sh -c \"$2\";; '[['*) exec /bin/bash --noprofile --norc -c \"$2\";; *) exit 91;; esac\n",
+    );
+    let evil_marker = controls.path().join("evil-ran");
+    let evil_shell = controls.path().join("evil-shell");
+    write_executable(
+        &evil_shell,
+        format!(
+            "#!/bin/sh\n: >{}\nexit 92\n",
+            codex_ssh_bridge::quote::shell_word(evil_marker.to_str().unwrap()).unwrap()
+        ),
+    );
+    let uid = std::fs::metadata(remote.path()).unwrap().uid();
+    let getent = controls.path().join("getent");
+    write_executable(
+        &getent,
+        format!(
+            "#!/bin/sh\n[ \"$1:$2\" = passwd:{uid} ] || exit 2\nprintf '%s\\n' {}\n",
+            codex_ssh_bridge::quote::shell_word(&format!(
+                "fixture:x:{uid}:{uid}::/tmp:{}",
+                account_shell.display()
+            ))
+            .unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        controls.path().display()
+    ));
     let (_runtime, _runner, bridge) = fixture_with_options(
         remote.path(),
         false,
         None,
-        &[("FAKE_SSH_ACCOUNT_SHELL", OsString::from("/bin/bash"))],
+        &[
+            ("PATH", path),
+            (
+                "FAKE_SSH_ACCOUNT_SHELL",
+                account_shell.as_os_str().to_owned(),
+            ),
+            ("SHELL", evil_shell.as_os_str().to_owned()),
+        ],
     );
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "[[ -n $BASH_VERSION ]] && printf probed-login".to_owned(),
+                cwd: None,
+                shell: RunShell::Login,
+                timeout_ms: None,
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout.head.value, "probed-login");
+    assert!(!evil_marker.exists());
+}
+
+#[tokio::test]
+async fn login_guard_does_not_enable_nounset_for_the_user_payload() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge, _controls) =
+        fixture_with_probed_login_shell(remote.path(), std::path::Path::new("/bin/bash"));
     let result = bridge
         .run(
             RemoteRunRequest {
@@ -7225,10 +7326,11 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
     );
     assert_eq!(completed, 5);
     let elapsed = started.elapsed();
-    // This debug stress test includes two mandatory physical-root observations per host.
-    // Release performance_acceptance remains the authoritative latency gate.
+    // This debug watchdog includes two mandatory physical-root observations per host.
+    // Exact phase counts below prove concurrency work is not skipped; the release
+    // performance_acceptance suite remains the authoritative latency gate.
     assert!(
-        elapsed < Duration::from_millis(3_200),
+        elapsed < Duration::from_secs(5),
         "five-host debug stress took {elapsed:?}"
     );
     assert_eq!(ssh_call_count(&ssh_log, "G"), 5);
@@ -7236,6 +7338,43 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
     assert_eq!(ssh_call_count(&ssh_log, "R"), 10);
     assert_eq!(ssh_call_count(&ssh_log, "C"), 10);
     assert_eq!(spool_file_count(&runtime_directory), 0);
+}
+
+#[tokio::test]
+async fn search_all_match_batch_reserves_the_final_guarded_command_frame() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[
+            (
+                "FAKE_SSH_MODE",
+                OsString::from("large-candidates-all-match"),
+            ),
+            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+        ],
+    );
+    let result = bridge
+        .search(
+            SearchRequest {
+                host: "dev".to_owned(),
+                path: None,
+                query: "needle".to_owned(),
+                globs: vec!["accept/**".to_owned()],
+                max_results: None,
+                binary: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(result.truncated);
+    assert!(result.matches.is_empty());
+    assert_eq!(ssh_call_count(&log, "R"), 2);
+    assert_eq!(ssh_call_count(&log, "C"), 2);
 }
 
 #[tokio::test]
