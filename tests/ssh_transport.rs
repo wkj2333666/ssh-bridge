@@ -706,7 +706,10 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
         // take longer on a busy CI runner than the ordinary transport tests.
         let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(10));
         run.cwd = root.clone();
-        let result = runner.execute(run, CancellationToken::new()).await.unwrap();
+        let result = runner
+            .execute(run, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("boundary cache execution failed: {error:?}"));
         assert_eq!(result.physical_root, root);
         assert_eq!(
             result.shell.shell,
