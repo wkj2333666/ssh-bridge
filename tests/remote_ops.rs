@@ -1915,6 +1915,33 @@ async fn raw_guard_uses_the_verified_root_inode_after_its_path_is_replaced() {
 }
 
 #[tokio::test]
+async fn raw_remote_run_preserves_the_callers_configured_locale() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("LC_ALL", OsString::from("codex_TEST.UTF-8"))],
+    );
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "printf %s \"$LC_ALL\"".to_owned(),
+                cwd: None,
+                shell: RunShell::Sh,
+                timeout_ms: None,
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout.head.value, "codex_TEST.UTF-8");
+}
+
+#[tokio::test]
 async fn login_run_is_interpreted_by_the_account_shell_after_root_guarding() {
     let remote = tempfile::TempDir::new().unwrap();
     let (_runtime, _runner, bridge, _controls) =

@@ -945,11 +945,13 @@ impl SshRunner {
         command
             .args(spec.argv)
             .envs(&self.environment)
-            .env("LC_ALL", "C")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if spec.phase.forces_c_locale() {
+            command.env("LC_ALL", "C");
+        }
         // SAFETY: pre_exec runs in the child after fork and calls only setpgid,
         // an async-signal-safe libc function. It captures no parent references.
         unsafe {
@@ -1338,6 +1340,10 @@ enum Phase {
 }
 
 impl Phase {
+    fn forces_c_locale(self) -> bool {
+        !matches!(self, Self::Command { .. })
+    }
+
     fn remote_started(self) -> bool {
         !matches!(self, Self::Resolve)
     }

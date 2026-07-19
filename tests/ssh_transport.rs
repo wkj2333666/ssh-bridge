@@ -2062,6 +2062,32 @@ async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
 }
 
 #[tokio::test]
+async fn ssh_diagnostic_classification_phase_forces_the_c_locale() {
+    let controls = TempDir::new().unwrap();
+    let locale_log = controls.path().join("locale.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("LC_ALL", "caller_TEST.UTF-8".to_owned()),
+            ("FAKE_SSH_G_ERROR", "auth".to_owned()),
+            ("FAKE_SSH_LOCALE_LOG", locale_log.display().to_string()),
+        ],
+    );
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Sh, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::AuthRequired);
+    assert_eq!(fs::read_to_string(locale_log).unwrap(), "G=C\n");
+}
+
+#[tokio::test]
 async fn bootstrap_crlf_host_key_diagnostic_is_strictly_classified() {
     let fixture = task3_runner(
         &["dev"],

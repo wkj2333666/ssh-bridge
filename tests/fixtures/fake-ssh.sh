@@ -88,6 +88,9 @@ emit_fake_error() {
 
 if [ "$is_config" = 1 ]; then
     log_call G "$@"
+    if [ -n "${FAKE_SSH_LOCALE_LOG:-}" ]; then
+        printf 'G=%s\n' "${LC_ALL-}" >>"$FAKE_SSH_LOCALE_LOG"
+    fi
     if [ -n "${FAKE_SSH_G_ERROR:-}" ]; then
         emit_fake_error "$FAKE_SSH_G_ERROR"
     fi
