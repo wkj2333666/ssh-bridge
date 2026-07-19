@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedOperationKind, FixedRunRequest};
+use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs};
 
 use super::protocol::{
     SpoolCursor, context, encode_bytes, entry_error, kind, parse_mode, parse_mtime, parse_u64,
@@ -51,54 +51,43 @@ if [ ! -d "$R" ];then printf 'NOT_DIRECTORY\000' >&2;exit 0;fi
 if [ ! -r "$R" ];then printf 'PERMISSION_DENIED\000' >&2;exit 0;fi
 cd -- "$R" 2>/dev/null||{ printf 'PERMISSION_DENIED\000' >&2;exit 0;}
 umask 077
-scratch=$(mktemp -d /tmp/codex-ssh-list.XXXXXX) || exit 2
-cleanup() { rm -rf -- "$scratch"; }
-trap cleanup EXIT HUP INT TERM
-raw_fifo=$scratch/raw-fifo
-out_fifo=$scratch/out-fifo
-data=$scratch/data
-find_status=$scratch/find-status
-xargs_status=$scratch/xargs-status
-count_file=$scratch/count
-printf 0 >"$count_file"
-mkfifo "$raw_fifo" "$out_fifo" || exit 2
+t=$(mktemp -d /tmp/codex-ssh-list.XXXXXX)||exit 2
+cleanup(){ rm -rf -- "$t"; }
+trap cleanup 0 1 2 15
+a=$t/a;b=$t/b;c=$t/c;d=$t/d;e=$t/e;f=$t/f
+printf 0 >"$f"
+mkfifo "$a" "$b"||exit 2
 (
-lf . "$D" "$H" 2>/dev/null >"$raw_fifo"
-printf '%s' "$?" >"$find_status"
+lf . "$D" "$H" 2>/dev/null >"$a"
+printf %s "$?">"$d"
 ) &
-find_pid=$!
+p=$!
 (
 lx sh -c '
-count_file=$1;m=$2;shift 2
-count=$(cat "$count_file")||exit 65
+c=$1;m=$2;shift 2
+n=$(cat "$c")||exit 65
 while [ "$#" -ge 5 ];do
-if [ "$count" -lt $((m+1)) ];then count=$((count+1));printf "%s\000%s\000%s\000%s\000%s\000" "$1" "$2" "$3" "$4" "$5";fi
+if [ "$n" -lt $((m+1)) ];then n=$((n+1));printf "%s\000%s\000%s\000%s\000%s\000" "$1" "$2" "$3" "$4" "$5";fi
 shift 5
 done
 [ "$#" -eq 0 ]||exit 65
-printf %s "$count">"$count_file"
-' codex-ssh-list "$count_file" "$M" <"$raw_fifo" >"$out_fifo" 2>/dev/null
-printf '%s' "$?" >"$xargs_status"
+printf %s "$n">"$c"
+' codex-ssh-list "$f" "$M" <"$a" >"$b" 2>/dev/null
+printf %s "$?">"$e"
 ) &
-xargs_pid=$!
-exec 3<"$out_fifo"
-head -c "$L" <&3 >"$data"
-head_status=$?
+q=$!
+exec 3<"$b"
+head -c "$L" <&3 >"$c";h=$?
 cat <&3 >/dev/null
-drain_status=$?
-exec 3<&-
-wait "$xargs_pid" 2>/dev/null
-xargs_wait=$?
-wait "$find_pid" 2>/dev/null
-find_wait=$?
-bytes=$(wc -c <"$data")
-xargs_final=$(cat "$xargs_status" 2>/dev/null || printf 2)
-find_final=$(cat "$find_status" 2>/dev/null || printf 2)
-if [ "$head_status" -ne 0 ] || [ "$drain_status" -ne 0 ] ||
-   [ "$xargs_wait" -ne 0 ] || [ "$find_wait" -ne 0 ] ||
-   [ "$xargs_final" -ne 0 ] || [ "$find_final" -ne 0 ]; then exit 2; fi
-cat "$data"
-if [ "$bytes" -eq "$L" ];then printf 'CAPPED\000' >&2;fi
+r=$?;exec 3<&-
+wait "$q" 2>/dev/null;s=$?
+wait "$p" 2>/dev/null;u=$?
+n=$(wc -c <"$c")
+x=$(cat "$e" 2>/dev/null||printf 2)
+y=$(cat "$d" 2>/dev/null||printf 2)
+[ "$h:$r:$s:$u:$x:$y" = 0:0:0:0:0:0 ]||exit 2
+cat "$c"
+if [ "$n" -eq "$L" ];then printf 'CAPPED\000' >&2;fi
 "#;
 
 const STAT_SCRIPT: &str = r#"
@@ -174,6 +163,11 @@ pub(super) async fn list(
                     (limits.max_frame_bytes + 1).to_string(),
                 ],
                 stdin: None,
+                rooted_paths: RootedPathInputs {
+                    argument_indices: &[0],
+                    stdin_nul_paths: false,
+                },
+                expected_root: None,
                 required_capabilities: &["find_nul", "xargs_nul", "search_bound"],
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
                 stderr_limit: 1024,
@@ -319,6 +313,11 @@ pub(super) async fn stat(
                 script: STAT_SCRIPT,
                 args: Vec::new(),
                 stdin: Some(stdin),
+                rooted_paths: RootedPathInputs {
+                    argument_indices: &[],
+                    stdin_nul_paths: true,
+                },
+                expected_root: None,
                 required_capabilities: &["stat_printf", "xargs_nul"],
                 stdout_limit: limits.max_frame_bytes as u64,
                 stderr_limit: 1024,
@@ -351,10 +350,14 @@ pub(super) async fn stat(
             .map_err(&attach)?
             .ok_or_else(|| protocol_error("stat response is incomplete"))
             .map_err(&attach)?;
-        if actual != requested.absolute().as_bytes() {
+        let observed_actual = join_raw(
+            result.capability.physical_root.as_bytes(),
+            requested.relative().as_bytes(),
+        );
+        if actual != observed_actual {
             return Err(attach(protocol_error("stat response order is invalid")));
         }
-        let actual_path = encode_bytes(&actual);
+        let actual_path = encode_bytes(requested.absolute().as_bytes());
         let relative_path = encode_bytes(requested.relative().as_bytes());
         if status == b"OK" {
             let mode = cursor
@@ -417,6 +420,9 @@ pub(super) async fn stat(
 }
 
 fn join_raw(base: &[u8], relative: &[u8]) -> Vec<u8> {
+    if relative.is_empty() {
+        return base.to_vec();
+    }
     let needs_separator = !base.is_empty() && !base.ends_with(b"/");
     let mut joined = Vec::with_capacity(base.len() + usize::from(needs_separator) + relative.len());
     joined.extend_from_slice(base);

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedOperationKind, FixedRunRequest, render_fixed_command};
+use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs, render_fixed_command};
 
 use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
 use super::{
@@ -260,6 +260,11 @@ pub(super) async fn search(
                     (limits.max_frame_bytes + 1).to_string(),
                 ],
                 stdin: None,
+                rooted_paths: RootedPathInputs {
+                    argument_indices: &[0],
+                    stdin_nul_paths: false,
+                },
+                expected_root: None,
                 required_capabilities: &["find_nul", "search_bound"],
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
                 stderr_limit: 1024,
@@ -425,6 +430,8 @@ pub(super) async fn search(
                 script,
                 args,
                 stdin: Some(stdin),
+                rooted_paths: RootedPathInputs::default(),
+                expected_root: Some(candidates_result.root_identity.clone()),
                 required_capabilities: required,
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
                 stderr_limit: 1024,
