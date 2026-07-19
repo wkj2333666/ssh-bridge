@@ -131,6 +131,10 @@ async fn remote_run_nonzero_exit_is_a_failed_result_not_an_mcp_error() {
             rendered["structuredContent"]["remote_process_may_continue"],
             false
         );
+        assert_eq!(
+            rendered["structuredContent"]["mutation_may_have_applied"],
+            true
+        );
         let text = rendered["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("stdout-{exit_status}")), "{text}");
         assert!(text.contains(&format!("stderr-{exit_status}")), "{text}");
@@ -145,12 +149,20 @@ async fn remote_run_nonzero_exit_is_a_failed_result_not_an_mcp_error() {
         "remote_run",
         json!({
             "host":"dev",
-            "command":"dd if=/dev/zero bs=1024 count=300 >&2 2>/dev/null; exit 2",
+            "command":"printf applied > review-side-effect; dd if=/dev/zero bs=1024 count=300 >&2 2>/dev/null; exit 2",
             "shell":"sh"
         }),
     )
     .await;
     assert_eq!(rendered["structuredContent"]["status"], "failed");
+    assert_eq!(
+        rendered["structuredContent"]["mutation_may_have_applied"],
+        true
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote.path().join("review-side-effect")).unwrap(),
+        "applied"
+    );
     let output_ref = rendered["structuredContent"]["output_ref"]
         .as_str()
         .expect("failed command's large stderr must publish an output reference");

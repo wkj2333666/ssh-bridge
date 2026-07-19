@@ -415,6 +415,8 @@ pub async fn run(
             } else {
                 "failed"
             };
+            let mutation_may_have_applied =
+                result.exit_status != 0 || result.remote_process_may_continue;
             let metadata = with_context(
                 &result.context,
                 json!({
@@ -426,7 +428,7 @@ pub async fn run(
                     "aggregate_bytes":result.aggregate_bytes,
                     "output_ref":result.output_ref,
                     "remote_process_may_continue":result.remote_process_may_continue,
-                    "mutation_may_have_applied":result.remote_process_may_continue,
+                    "mutation_may_have_applied":mutation_may_have_applied,
                     "warnings":result.warnings,
                     "warnings_truncated":warnings_truncated,
                     "truncated":result.stdout.truncated || result.stderr.truncated,

@@ -540,7 +540,7 @@ async fn remote_run_nonzero_exit_retains_large_stderr_for_paging() {
             RemoteRunRequest {
                 host: "dev".to_owned(),
                 command: format!(
-                    "dd if=/dev/zero bs=1024 count={} >&2 2>/dev/null; exit 2",
+                    "printf applied > review-side-effect; dd if=/dev/zero bs=1024 count={} >&2 2>/dev/null; exit 2",
                     stderr_bytes / 1024
                 ),
                 cwd: None,
@@ -557,6 +557,10 @@ async fn remote_run_nonzero_exit_retains_large_stderr_for_paging() {
     assert_eq!(result.stderr.raw_bytes, stderr_bytes);
     assert!(result.stderr.truncated);
     assert!(!result.remote_process_may_continue);
+    assert_eq!(
+        std::fs::read_to_string(remote.path().join("review-side-effect")).unwrap(),
+        "applied"
+    );
     let output_ref = result.output_ref.expect("large stderr must be retained");
     let page = bridge
         .output_read(
