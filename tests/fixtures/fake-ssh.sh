@@ -170,6 +170,22 @@ esac
 
 log_call C "$@"
 
+if [ -n "${FAKE_SSH_ENFORCE_CONNECT_TIMEOUT_AFTER:-}" ]; then
+    if [ -e "$FAKE_SSH_ENFORCE_CONNECT_TIMEOUT_AFTER" ]; then
+        found_connect_timeout=0
+        for argument do
+            if [ "$argument" = "${FAKE_SSH_EXPECT_CONNECT_TIMEOUT:-}" ]; then
+                found_connect_timeout=1
+            fi
+        done
+        if [ "$found_connect_timeout" = 0 ]; then
+            run_fake_sleep "${FAKE_SSH_MISSING_OPTION_SLEEP_SECONDS:-2}"
+        fi
+    else
+        : >"$FAKE_SSH_ENFORCE_CONNECT_TIMEOUT_AFTER"
+    fi
+fi
+
 if [ -n "${FAKE_SSH_MISMATCH_FILE:-}" ] && [ ! -e "$FAKE_SSH_MISMATCH_FILE" ]; then
     : >"$FAKE_SSH_MISMATCH_FILE"
     if [ -n "${FAKE_SSH_MISMATCH_STDOUT:-}" ]; then

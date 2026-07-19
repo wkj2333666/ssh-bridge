@@ -44,8 +44,6 @@ pub fn build_sshfs_argv(
     argv.push(mountpoint.as_os_str().to_owned());
     push_option(&mut argv, "ssh_command=/usr/bin/ssh");
     argv.extend(policy.options.iter().cloned());
-    let connect_seconds = host.limits.connect_timeout_ms.div_ceil(1_000).max(1);
-    push_option(&mut argv, format!("ConnectTimeout={connect_seconds}"));
     push_option(&mut argv, "ServerAliveInterval=15");
     push_option(&mut argv, "ServerAliveCountMax=3");
     push_option(&mut argv, "reconnect");
