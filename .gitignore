@@ -3,3 +3,11 @@ target/
 .superpowers/
 __pycache__/
 *.pyc
+.env
+.env.*
+*.pem
+*.key
+known_hosts
+id_rsa*
+id_ed25519*
+config.toml

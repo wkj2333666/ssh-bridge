@@ -2,8 +2,8 @@
 
 ## Measurement host
 
-- Host: Raspberry Pi-class aarch64 local machine (`aarch64-test-host`)
-- Kernel: Linux `6.18.34+rpt-rpi-2712` aarch64
+- Host: Raspberry Pi-class aarch64 Linux machine
+- Kernel: Linux aarch64 (exact kernel release intentionally omitted)
 - Rust: `rustc 1.91.1 (ed61e7d7 2025-11-07)`, LLVM 21.1.2
 - OpenSSH: 10.0p2 Debian 7+deb13u4, OpenSSL 3.5.6
 - Profile: Cargo `release`, thin LTO, one codegen unit, stripped symbols
