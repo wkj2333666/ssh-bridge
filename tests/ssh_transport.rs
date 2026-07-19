@@ -1861,18 +1861,20 @@ async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
             ("FAKE_SSH_ERROR", "remote".to_owned()),
         ],
     );
-    let error = remote
+    let result = remote
         .runner
         .execute(
             request("dev", ShellRequest::Auto, Duration::from_secs(2)),
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::RemoteExit);
-    assert!(!error.retryable);
-    assert_eq!(error.details.exit_status, Some(7));
-    assert!(!error.message.contains("VERY_SECRET"));
+        .unwrap();
+    assert_eq!(result.status, 7);
+    assert_eq!(
+        preview_bytes(&result.output.stderr),
+        b"VERY_SECRET_REMOTE_DIAGNOSTIC\n"
+    );
+    assert!(!result.remote_process_may_continue);
 }
 
 #[tokio::test]
@@ -2066,6 +2068,7 @@ async fn task78_selected_remote_context_is_attached_to_exit_timeout_cancel_and_o
         &[
             ("FAKE_SSH_MODE", "error".to_owned()),
             ("FAKE_SSH_ERROR", "remote".to_owned()),
+            ("FAKE_SSH_EXIT_STATUS", "255".to_owned()),
         ],
     );
     let error = exited
@@ -2803,6 +2806,83 @@ async fn stdout_and_stderr_are_drained_concurrently_with_aggregate_previews() {
     assert!(result.output.stdout.truncated);
     assert!(result.output.stderr.truncated);
     assert!(result.output.reference.is_none());
+}
+
+#[tokio::test]
+async fn user_command_nonzero_status_preserves_captured_output() {
+    for exit_status in [1, 2, 127] {
+        let fixture = task3_runner(
+            &["dev"],
+            Limits::default(),
+            Duration::from_secs(600),
+            &[
+                ("FAKE_SSH_MODE", "streams".to_owned()),
+                ("FAKE_SSH_STDOUT", format!("stdout-{exit_status}")),
+                ("FAKE_SSH_STDERR", format!("stderr-{exit_status}")),
+                ("FAKE_SSH_EXIT_STATUS", exit_status.to_string()),
+            ],
+        );
+
+        let result = fixture
+            .runner
+            .execute(
+                request("dev", ShellRequest::Sh, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a completed user command is a result even when it fails");
+
+        assert_eq!(result.status, exit_status);
+        assert_eq!(
+            preview_bytes(&result.output.stdout),
+            format!("stdout-{exit_status}").as_bytes()
+        );
+        assert_eq!(
+            preview_bytes(&result.output.stderr),
+            format!("stderr-{exit_status}").as_bytes()
+        );
+        assert!(!result.remote_process_may_continue);
+    }
+
+    let limits = Limits {
+        preview_bytes: 16,
+        ..Limits::default()
+    };
+    let stderr_bytes = 300 * 1024_u64;
+    let fixture = task3_runner(
+        &["dev"],
+        limits,
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "bytes".to_owned()),
+            ("FAKE_SSH_STDERR_BYTES", stderr_bytes.to_string()),
+            ("FAKE_SSH_EXIT_STATUS", "2".to_owned()),
+        ],
+    );
+    let result = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Sh, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, 2);
+    assert_eq!(result.output.stderr.bytes_seen, stderr_bytes);
+    assert!(result.output.stderr.truncated);
+    let reference = result
+        .output
+        .reference
+        .as_ref()
+        .expect("failed command's large stderr must be retained");
+    let page = fixture
+        .store
+        .read(reference, StreamKind::Stderr, 256 * 1024, 4096)
+        .await
+        .unwrap();
+    assert_eq!(page.bytes, vec![0; 4096]);
+    assert_eq!(page.next_offset, 260 * 1024);
+    assert!(!page.eof);
 }
 
 fn private_spool_files(runtime: &RuntimePaths) -> Vec<std::path::PathBuf> {

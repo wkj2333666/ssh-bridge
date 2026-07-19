@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use codex_ssh_bridge::capability::ShellRequest;
 use codex_ssh_bridge::output::OutputStore;
 use codex_ssh_bridge::output::StreamKind;
@@ -529,6 +530,56 @@ async fn task78_remote_run_is_bridge_owned_and_reports_explicit_shell() {
 }
 
 #[tokio::test]
+async fn remote_run_nonzero_exit_retains_large_stderr_for_paging() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
+    let stderr_bytes = 300 * 1024_u64;
+
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: format!(
+                    "dd if=/dev/zero bs=1024 count={} >&2 2>/dev/null; exit 2",
+                    stderr_bytes / 1024
+                ),
+                cwd: None,
+                shell: RunShell::Sh,
+                timeout_ms: Some(5_000),
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("nonzero user command output must remain inspectable");
+
+    assert_eq!(result.exit_status, 2);
+    assert_eq!(result.stderr.raw_bytes, stderr_bytes);
+    assert!(result.stderr.truncated);
+    assert!(!result.remote_process_may_continue);
+    let output_ref = result.output_ref.expect("large stderr must be retained");
+    let page = bridge
+        .output_read(
+            codex_ssh_bridge::remote::OutputReadRequest {
+                output_ref,
+                stream: StreamKind::Stderr,
+                offset: 256 * 1024,
+                max_bytes: 4096,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.data.encoding, ValueEncoding::Base64);
+    assert_eq!(
+        page.data.value,
+        base64::engine::general_purpose::STANDARD.encode(vec![0; 4096])
+    );
+    assert_eq!(page.next_offset, 260 * 1024);
+    assert!(!page.eof);
+}
+
+#[tokio::test]
 async fn task78_remote_run_rejects_read_only_path_escape_and_nul_before_command_child() {
     let remote = tempfile::TempDir::new().unwrap();
     for (name, read_only, command, cwd, expected) in [
@@ -714,35 +765,14 @@ async fn task78_remote_run_early_stdin_close_preserves_actual_exit() {
                 value: "x".repeat(codex_ssh_bridge::MAX_WRITE_BYTES),
             }),
         };
-        if expected_status == 0 {
-            let result = bridge.run(request, CancellationToken::new()).await.unwrap();
-            assert_eq!(result.exit_status, 0);
-            assert_eq!(result.context.shell.kind, ShellName::Sh);
-            assert_eq!(
-                result.context.physical_root,
-                remote.path().to_str().unwrap()
-            );
-        } else {
-            let error = bridge
-                .run(request, CancellationToken::new())
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, ErrorCode::RemoteExit);
-            assert_eq!(error.details.exit_status, Some(expected_status));
-            assert_eq!(error.details.host.as_deref(), Some("dev"));
-            assert_eq!(
-                error.details.physical_root.as_deref(),
-                remote.path().to_str()
-            );
-            assert_eq!(
-                error
-                    .details
-                    .shell
-                    .as_ref()
-                    .map(|shell| shell.kind.as_str()),
-                Some("sh")
-            );
-        }
+        let result = bridge.run(request, CancellationToken::new()).await.unwrap();
+        assert_eq!(result.exit_status, expected_status);
+        assert_eq!(result.context.shell.kind, ShellName::Sh);
+        assert_eq!(
+            result.context.physical_root,
+            remote.path().to_str().unwrap()
+        );
+        assert!(!result.remote_process_may_continue);
     }
 }
 
@@ -798,13 +828,14 @@ async fn task78_remote_run_errors_after_selection_carry_shell_context() {
         &[
             ("FAKE_SSH_MODE", OsString::from("error")),
             ("FAKE_SSH_ERROR", OsString::from("remote")),
+            ("FAKE_SSH_EXIT_STATUS", OsString::from("255")),
         ],
     );
     let error = bridge
         .run(
             RemoteRunRequest {
                 host: "dev".to_owned(),
-                command: "exit 7".to_owned(),
+                command: "exit 255".to_owned(),
                 cwd: None,
                 shell: RunShell::Sh,
                 timeout_ms: Some(2_000),
