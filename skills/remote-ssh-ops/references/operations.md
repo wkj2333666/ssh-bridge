@@ -24,8 +24,8 @@ Host devbox
 
 ```bash
 ssh devbox
-./bin/codex-ssh-bridge hosts add devbox --root /srv/project
-./bin/codex-ssh-bridge doctor devbox
+./target/release/codex-ssh-bridge hosts add devbox --root /srv/project
+./target/release/codex-ssh-bridge doctor devbox
 ```
 
 Add future servers the same way. The bridge accepts concrete OpenSSH aliases and stores no credentials. The default bridge config is `~/.config/codex-ssh-bridge/config.toml`; set `CODEX_SSH_BRIDGE_CONFIG` only as trusted local execution-authority input.
@@ -82,11 +82,11 @@ Use `stream:"stderr"` for retained stderr. Advance by the returned byte offset u
 The human CLI accepts argv after `--` and performs the shell-word encoding inside the bridge:
 
 ```bash
-./bin/codex-ssh-bridge hosts list
-./bin/codex-ssh-bridge hosts show devbox
-./bin/codex-ssh-bridge doctor devbox
-./bin/codex-ssh-bridge doctor devbox --verbose-ssh
-./bin/codex-ssh-bridge run devbox --cwd . --shell auto -- git status --short
+./target/release/codex-ssh-bridge hosts list
+./target/release/codex-ssh-bridge hosts show devbox
+./target/release/codex-ssh-bridge doctor devbox
+./target/release/codex-ssh-bridge doctor devbox --verbose-ssh
+./target/release/codex-ssh-bridge run devbox --cwd . --shell auto -- git status --short
 ```
 
 The JSON result reports the physical remote root, actual shell, exit status, warnings, duration, output limits, and any retained output reference. Verbose SSH diagnostics are bounded and redact identity paths, agent sockets, commands, and credential-like values.
@@ -96,9 +96,9 @@ The JSON result reports the physical remote root, actual shell, exit status, war
 SSHFS is optional local software and a human-only convenience:
 
 ```bash
-./bin/codex-ssh-bridge mount devbox /absolute/local/mountpoint --remote-path .
-./bin/codex-ssh-bridge mount-status /absolute/local/mountpoint
-./bin/codex-ssh-bridge unmount /absolute/local/mountpoint
+./target/release/codex-ssh-bridge mount devbox /absolute/local/mountpoint --remote-path .
+./target/release/codex-ssh-bridge mount-status /absolute/local/mountpoint
+./target/release/codex-ssh-bridge unmount /absolute/local/mountpoint
 ```
 
 The CLI refuses relative, symlinked, foreign-owned, and nonempty mountpoints by default. `--allow-nonempty` is an explicit human override. Read-only profiles force `ro`; the bridge never adds `allow_other`.

@@ -1,6 +1,6 @@
 {
   "name": "codex-ssh-bridge",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Operate allowlisted SSH hosts through a local native bridge without installing or authenticating Codex remotely.",
   "author": {
     "name": "Local developer"
@@ -26,6 +26,5 @@
       "Use Remote SSH Ops to inspect my configured devbox.",
       "Run the tests on my configured SSH host and explain failures."
     ]
-  },
-  "mcpServers": "./.mcp.json"
+  }
 }
