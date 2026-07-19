@@ -131,6 +131,7 @@ fn transport_call_kinds(log: &std::path::Path) -> Vec<&'static str> {
         .filter_map(|line| match line {
             "G" => Some("G"),
             "P" => Some("P"),
+            "R" => Some("R"),
             "C" => Some("C"),
             _ => None,
         })
@@ -198,6 +199,10 @@ async fn task11_release_latency_concurrency_cancellation_and_wire_acceptance() {
         1
     );
     assert_eq!(
+        complete_kinds.iter().filter(|kind| **kind == "R").count(),
+        SSH_WARM_CALLS + SSH_MEASURED_CALLS
+    );
+    assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "C").count(),
         SSH_WARM_CALLS + SSH_MEASURED_CALLS
     );
@@ -242,7 +247,7 @@ async fn five_hosts_finish_in_parallel() {
         elapsed < FIVE_HOST_CEILING,
         "five one-second hosts took {elapsed:?}"
     );
-    for kind in ["G", "P", "C"] {
+    for kind in ["G", "P", "R", "C"] {
         assert_eq!(
             kinds.iter().filter(|observed| **observed == kind).count(),
             5,

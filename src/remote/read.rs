@@ -58,7 +58,7 @@ case "$codex_read_status" in
 esac
 if [ ! -e "$path" ]; then
     parent=${path%/*};[ -n "$parent" ]||parent=/
-    while [ "$parent" != / ]&&[ ! -d "$parent" ];do parent=${parent%/*};[ -n "$parent" ]||parent=/;done
+    while [ "$parent" != . ]&&[ ! -d "$parent" ];do parent=${parent%/*};[ -n "$parent" ]||parent=.;done
     if [ -d "$parent" ]&&[ ! -x "$parent" ];then printf 'PERMISSION_DENIED\000' >&2;else printf 'NOT_FOUND\000' >&2;fi
     exit 0
 fi
