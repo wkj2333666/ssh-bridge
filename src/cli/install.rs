@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,8 @@ pub struct InstallLayout {
     pub skill_target: PathBuf,
     pub identity_file: PathBuf,
     pub codex_executable: PathBuf,
+    #[doc(hidden)]
+    pub quarantine_delete_failure: Option<usize>,
 }
 
 impl InstallLayout {
@@ -64,6 +66,7 @@ impl InstallLayout {
             skill_target: home.join(".agents/skills/remote-ssh-ops"),
             identity_file: state_base.join("codex-ssh-bridge/install.toml"),
             codex_executable: find_executable("codex")?,
+            quarantine_delete_failure: None,
         })
     }
 }
@@ -135,12 +138,23 @@ enum Presence {
     Matching,
 }
 
-async fn install_preflight(layout: InstallLayout) -> BridgeResult<InstallPreflight> {
+async fn install_preflight(
+    layout: InstallLayout,
+    probe_mutations: bool,
+) -> BridgeResult<InstallPreflight> {
     let resolved = resolve_layout(layout)?;
     validate_install_destinations(&resolved)?;
-    let mcp = codex_get(&resolved).await?;
     let skill = skill_presence(&resolved)?;
     let marker = marker_presence(&resolved)?;
+    if probe_mutations {
+        if skill == Presence::Absent {
+            probe_absent_destination(&resolved.layout.skill_target)?;
+        }
+        if marker == Presence::Absent {
+            probe_absent_destination(&resolved.layout.identity_file)?;
+        }
+    }
+    let mcp = codex_get(&resolved).await?;
     let actions = vec![
         match mcp {
             Presence::Absent => "register MCP ssh-bridge".to_owned(),
@@ -164,7 +178,10 @@ async fn install_preflight(layout: InstallLayout) -> BridgeResult<InstallPreflig
     })
 }
 
-async fn uninstall_preflight(layout: InstallLayout) -> BridgeResult<InstallPreflight> {
+async fn uninstall_preflight(
+    layout: InstallLayout,
+    probe_mutations: bool,
+) -> BridgeResult<InstallPreflight> {
     let resolved = resolve_layout(layout)?;
     validate_install_destinations(&resolved)?;
     let marker = marker_presence(&resolved)?;
@@ -173,8 +190,14 @@ async fn uninstall_preflight(layout: InstallLayout) -> BridgeResult<InstallPrefl
             "recorded installation identity is missing",
         ));
     }
-    let mcp = codex_get(&resolved).await?;
     let skill = skill_presence(&resolved)?;
+    if probe_mutations {
+        if skill == Presence::Matching {
+            probe_parent_mutation(&resolved.layout.skill_target)?;
+        }
+        probe_parent_mutation(&resolved.layout.identity_file)?;
+    }
+    let mcp = codex_get(&resolved).await?;
     let actions = vec![
         match mcp {
             Presence::Absent => "MCP ssh-bridge is already absent".to_owned(),
@@ -240,9 +263,24 @@ async fn acquire_install_lock(resolved: &ResolvedInstall) -> BridgeResult<Instal
                 "installation lock must be a private current-user-owned regular file",
             ));
         }
-        // SAFETY: flock receives a live descriptor and a valid operation constant.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(BridgeError::io(std::io::Error::last_os_error()));
+        let deadline = Instant::now() + LOCAL_TIMEOUT;
+        loop {
+            // SAFETY: flock receives a live descriptor and valid operation constants.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(BridgeError::io(error));
+            }
+            if Instant::now() >= deadline {
+                return Err(BridgeError::new(
+                    crate::ErrorCode::CommandTimeout,
+                    "timed out waiting for the user installation lock",
+                    false,
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         Ok(InstallLock { _file: file })
     })
@@ -251,12 +289,14 @@ async fn acquire_install_lock(resolved: &ResolvedInstall) -> BridgeResult<Instal
 }
 
 pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<InstallReport> {
-    let preliminary = install_preflight(layout.clone()).await?;
     if !apply {
+        let preliminary = install_preflight(layout, false).await?;
         return Ok(report(false, &preliminary.resolved, preliminary.actions));
     }
-    let _lock = acquire_install_lock(&preliminary.resolved).await?;
-    let preflight = install_preflight(layout).await?;
+    let preliminary = resolve_layout(layout.clone())?;
+    validate_install_destinations(&preliminary)?;
+    let _lock = acquire_install_lock(&preliminary).await?;
+    let preflight = install_preflight(layout, true).await?;
     let InstallPreflight {
         resolved,
         mcp,
@@ -334,12 +374,14 @@ pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<In
 }
 
 pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<InstallReport> {
-    let preliminary = uninstall_preflight(layout.clone()).await?;
     if !apply {
+        let preliminary = uninstall_preflight(layout, false).await?;
         return Ok(report(false, &preliminary.resolved, preliminary.actions));
     }
-    let _lock = acquire_install_lock(&preliminary.resolved).await?;
-    let preflight = uninstall_preflight(layout).await?;
+    let preliminary = resolve_layout(layout.clone())?;
+    validate_install_destinations(&preliminary)?;
+    let _lock = acquire_install_lock(&preliminary).await?;
+    let preflight = uninstall_preflight(layout, true).await?;
     let InstallPreflight {
         resolved,
         mcp,
@@ -392,25 +434,17 @@ pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<
     }
     .await;
     if let Err(error) = removed {
-        let mut rollback_failed = false;
-        if let Some(quarantine) = marker_quarantine.as_ref()
-            && restore_quarantine(quarantine).is_err()
+        if rollback_uninstall(
+            &resolved,
+            mcp_removed,
+            skill_quarantine.as_ref(),
+            marker_quarantine.as_ref(),
+            false,
+            false,
+        )
+        .await
+        .is_err()
         {
-            rollback_failed = true;
-        }
-        if let Some(quarantine) = skill_quarantine.as_ref()
-            && restore_quarantine(quarantine).is_err()
-        {
-            rollback_failed = true;
-        }
-        if mcp_removed {
-            match codex_add_checked(&resolved).await {
-                Ok(()) => {}
-                Err(error) if error.outcome == MutationOutcome::Applied => {}
-                Err(_) => rollback_failed = true,
-            }
-        }
-        if rollback_failed {
             return Err(BridgeError::new(
                 crate::ErrorCode::Io,
                 "uninstall failed and rollback was incomplete",
@@ -419,13 +453,109 @@ pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<
         }
         return Err(error);
     }
-    if let Some(quarantine) = marker_quarantine {
-        fs::remove_file(quarantine.quarantine).map_err(BridgeError::io)?;
-    }
-    if let Some(quarantine) = skill_quarantine {
-        fs::remove_file(quarantine.quarantine).map_err(BridgeError::io)?;
+    let mut marker_deleted = false;
+    let mut skill_deleted = false;
+    let mut deletion_index = 0usize;
+    let cleanup = (|| {
+        if let Some(quarantine) = marker_quarantine.as_ref() {
+            deletion_index += 1;
+            remove_quarantine(
+                quarantine,
+                deletion_index,
+                resolved.layout.quarantine_delete_failure,
+            )?;
+            marker_deleted = true;
+        }
+        if let Some(quarantine) = skill_quarantine.as_ref() {
+            deletion_index += 1;
+            remove_quarantine(
+                quarantine,
+                deletion_index,
+                resolved.layout.quarantine_delete_failure,
+            )?;
+            skill_deleted = true;
+        }
+        Ok(())
+    })();
+    if let Err(error) = cleanup {
+        if rollback_uninstall(
+            &resolved,
+            mcp_removed,
+            skill_quarantine.as_ref(),
+            marker_quarantine.as_ref(),
+            skill_deleted,
+            marker_deleted,
+        )
+        .await
+        .is_err()
+        {
+            return Err(BridgeError::new(
+                crate::ErrorCode::Io,
+                "uninstall cleanup failed and rollback was incomplete",
+                false,
+            ));
+        }
+        return Err(error);
     }
     Ok(report(true, &resolved, actions))
+}
+
+fn remove_quarantine(
+    quarantine: &QuarantinedPath,
+    deletion_index: usize,
+    injected_failure: Option<usize>,
+) -> BridgeResult<()> {
+    if injected_failure == Some(deletion_index) {
+        return Err(BridgeError::io("injected quarantine deletion failure"));
+    }
+    fs::remove_file(&quarantine.quarantine).map_err(BridgeError::io)
+}
+
+async fn rollback_uninstall(
+    resolved: &ResolvedInstall,
+    mcp_removed: bool,
+    skill_quarantine: Option<&QuarantinedPath>,
+    marker_quarantine: Option<&QuarantinedPath>,
+    skill_deleted: bool,
+    marker_deleted: bool,
+) -> BridgeResult<()> {
+    let mut failed = false;
+    if marker_deleted {
+        if !matches!(marker_presence(resolved), Ok(Presence::Absent))
+            || write_identity_noclobber(resolved).is_err()
+        {
+            failed = true;
+        }
+    } else if let Some(quarantine) = marker_quarantine
+        && restore_quarantine(quarantine).is_err()
+    {
+        failed = true;
+    }
+    if skill_deleted {
+        if !matches!(skill_presence(resolved), Ok(Presence::Absent))
+            || symlink(&resolved.layout.skill_source, &resolved.layout.skill_target).is_err()
+        {
+            failed = true;
+        }
+    } else if let Some(quarantine) = skill_quarantine
+        && restore_quarantine(quarantine).is_err()
+    {
+        failed = true;
+    }
+    if mcp_removed {
+        match codex_add_checked(resolved).await {
+            Ok(()) => {}
+            Err(error) if error.outcome == MutationOutcome::Applied => {}
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(BridgeError::io(
+            "uninstall rollback could not restore every mutation",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -535,6 +665,80 @@ fn ensure_destination_directory(path: &Path, created: &mut Vec<PathBuf>) -> Brid
         }
     }
     Ok(())
+}
+
+fn probe_absent_destination(path: &Path) -> BridgeResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BridgeError::invalid_config("installation destination has no parent"))?;
+    let mut created = Vec::new();
+    let mut placeholder_created = false;
+    let probed = (|| {
+        ensure_destination_directory(parent, &mut created)?;
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let placeholder = options.open(path).map_err(BridgeError::io)?;
+        placeholder_created = true;
+        placeholder
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(BridgeError::io)?;
+        drop(placeholder);
+        fs::remove_file(path).map_err(BridgeError::io)?;
+        placeholder_created = false;
+        Ok(())
+    })();
+    let mut cleanup_failed = false;
+    if placeholder_created && fs::remove_file(path).is_err() {
+        cleanup_failed = true;
+    }
+    for directory in created.iter().rev() {
+        if let Err(error) = fs::remove_dir(directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            cleanup_failed = true;
+        }
+    }
+    if cleanup_failed {
+        return Err(BridgeError::io(
+            "destination creation probe cleanup was incomplete",
+        ));
+    }
+    probed
+}
+
+fn probe_parent_mutation(path: &Path) -> BridgeResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BridgeError::invalid_config("installation destination has no parent"))?;
+    for _ in 0..32 {
+        let probe = parent.join(format!(
+            ".codex-ssh-bridge.probe.{}.{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        match options.open(&probe) {
+            Ok(file) => {
+                drop(file);
+                fs::remove_file(&probe).map_err(BridgeError::io)?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(BridgeError::io(error)),
+        }
+    }
+    Err(BridgeError::io(
+        "could not reserve a destination mutation probe",
+    ))
 }
 
 fn quarantine_path(path: &Path) -> BridgeResult<QuarantinedPath> {
@@ -652,6 +856,7 @@ fn resolve_layout(layout: InstallLayout) -> BridgeResult<ResolvedInstall> {
             skill_target: layout.skill_target,
             identity_file: layout.identity_file,
             codex_executable,
+            quarantine_delete_failure: layout.quarantine_delete_failure,
         },
         identity,
     })
