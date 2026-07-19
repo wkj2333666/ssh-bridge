@@ -820,6 +820,7 @@ fn install_fixture(options: InstallFixtureOptions) -> InstallFixture {
             skill_target,
             identity_file,
             codex_executable: codex,
+            quarantine_delete_failure: None,
         },
         codex_state,
         log,
@@ -1037,6 +1038,35 @@ async fn task9_uninstall_requires_recorded_identity_and_exact_skill_target() {
 }
 
 #[tokio::test]
+async fn task9_uninstall_cleanup_failure_restores_local_objects_and_mcp() {
+    let mut fixture = install_fixture(InstallFixtureOptions::default());
+    install_user(fixture.layout.clone(), true).await.unwrap();
+    fixture.layout.quarantine_delete_failure = Some(2);
+
+    let error = uninstall_user(fixture.layout.clone(), true)
+        .await
+        .unwrap_err();
+    assert!(!error.message.contains("rollback was incomplete"));
+    assert!(fixture.codex_state.exists());
+    assert_eq!(
+        fs::canonicalize(&fixture.layout.skill_target).unwrap(),
+        fs::canonicalize(&fixture.layout.skill_source).unwrap()
+    );
+    assert!(fixture.layout.identity_file.exists());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.matches("mcp add").count() >= 2, "{log}");
+    assert!(
+        fs::read_dir(fixture.layout.skill_target.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("quarantine"))
+    );
+}
+
+#[tokio::test]
 async fn task9_apply_uses_one_private_cross_bundle_lock_and_rechecks_after_locking() {
     let fixture = install_fixture(InstallFixtureOptions {
         slow_add: true,
@@ -1176,11 +1206,36 @@ async fn task9_destination_ancestors_are_fully_preflighted_before_codex_add() {
 }
 
 #[tokio::test]
+async fn task9_unwritable_existing_destination_is_rejected_before_codex_is_called() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    let skill_parent = fixture.layout.skill_target.parent().unwrap();
+    fs::create_dir_all(skill_parent).unwrap();
+    fs::set_permissions(skill_parent, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = install_user(fixture.layout.clone(), true).await;
+    fs::set_permissions(skill_parent, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap_or_default()
+            .contains("mcp"),
+        "destination failure must precede every Codex CLI call"
+    );
+    assert!(!fixture.codex_state.exists());
+}
+
+#[tokio::test]
 async fn task9_partial_destination_directory_creation_is_rolled_back() {
     let mut fixture = install_fixture(InstallFixtureOptions::default());
     let state = fixture._private.path().join("user/new-state");
     fixture.layout.identity_file = state.join("x".repeat(300)).join("install.toml");
     assert!(install_user(fixture.layout.clone(), true).await.is_err());
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap_or_default()
+            .contains("mcp"),
+        "predictable ENAMETOOLONG must be detected before Codex CLI"
+    );
     assert!(
         !state.exists(),
         "partially created directory must be journaled"
