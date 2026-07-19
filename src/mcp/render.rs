@@ -59,6 +59,7 @@ pub fn maximum_compact_fallback_result_bytes() -> usize {
                     "version":"\\\"".repeat(128),
                     "fallback":true,
                 },
+                "status":"completed",
                 "exit_status":i32::MIN,
                 "elapsed_ms":u64::MAX,
                 "stdout_raw_bytes":u64::MAX,
@@ -412,6 +413,7 @@ pub async fn run(
             let metadata = with_context(
                 &result.context,
                 json!({
+                    "status":"completed",
                     "exit_status":result.exit_status,
                     "elapsed_ms":result.elapsed_ms,
                     "stdout_raw_bytes":result.stdout.raw_bytes,
@@ -569,12 +571,23 @@ fn render_error(error: BridgeError, budget: WireBudget) -> CallToolResult {
 }
 
 fn render_error_borrowed(error: &BridgeError, budget: WireBudget) -> CallToolResult {
+    render_error_borrowed_with_progress(error, budget, ErrorProgress::from_details(&error.details))
+}
+
+fn render_error_borrowed_with_progress(
+    error: &BridgeError,
+    budget: WireBudget,
+    progress: ErrorProgress,
+) -> CallToolResult {
     let details = &error.details;
     let (message, message_truncated) = safe_text(&error.message, SAFE_TEXT_BYTES);
-    let action = details
+    let (action, action_truncated) = details
         .suggested_action
         .as_deref()
-        .map(|action| safe_text(action, SAFE_TEXT_BYTES).0);
+        .map(|action| safe_text(action, SAFE_TEXT_BYTES))
+        .map_or((None, false), |(action, truncated)| {
+            (Some(action), truncated)
+        });
     let context = rendered_error_context(details);
     let warnings = context
         .as_ref()
@@ -582,7 +595,6 @@ fn render_error_borrowed(error: &BridgeError, budget: WireBudget) -> CallToolRes
         .filter(|shell| shell.kind == "sh")
         .map(|_| vec![crate::remote::POSIX_SH_WARNING.to_owned()])
         .unwrap_or_default();
-    let status = mutation_status(details);
     let core = RenderedErrorCore {
         code: error.code,
         message,
@@ -597,25 +609,27 @@ fn render_error_borrowed(error: &BridgeError, budget: WireBudget) -> CallToolRes
             bytes_seen: details.bytes_seen,
             mutation_may_have_applied: details.mutation_may_have_applied,
             failed_path: safe_optional(details.failed_path.as_deref()),
-            changed_count: details.changed_paths.as_ref().map(Vec::len),
-            not_changed_count: details.not_changed_paths.as_ref().map(Vec::len),
-            outcome_unknown_count: details.outcome_unknown_paths.as_ref().map(Vec::len),
+            changed_count: progress.changed_count,
+            not_changed_count: progress.not_changed_count,
+            outcome_unknown_count: progress.outcome_unknown_count,
         },
     };
     let document = RenderedErrorDocument {
         context: context.clone(),
-        status,
+        status: progress.status,
         error: &core,
         action: action.as_deref(),
+        action_truncated,
         warnings: &warnings,
         warnings_truncated: false,
     };
     let text = serde_json::to_string(&document).expect("error projection is serializable");
     let structured = RenderedErrorDocument {
         context,
-        status,
+        status: progress.status,
         error: &core,
         action: action.as_deref(),
+        action_truncated,
         warnings: &warnings,
         warnings_truncated: false,
     };
@@ -629,6 +643,25 @@ fn render_error_borrowed(error: &BridgeError, budget: WireBudget) -> CallToolRes
         result
     } else {
         budgeted_compact_result(result.structured_content, true, budget)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ErrorProgress {
+    status: Option<&'static str>,
+    changed_count: Option<usize>,
+    not_changed_count: Option<usize>,
+    outcome_unknown_count: Option<usize>,
+}
+
+impl ErrorProgress {
+    fn from_details(details: &ErrorDetails) -> Self {
+        Self {
+            status: mutation_status(details),
+            changed_count: details.changed_paths.as_ref().map(Vec::len),
+            not_changed_count: details.not_changed_paths.as_ref().map(Vec::len),
+            outcome_unknown_count: details.outcome_unknown_paths.as_ref().map(Vec::len),
+        }
     }
 }
 
@@ -662,9 +695,10 @@ async fn render_error_retained(
     budget: WireBudget,
     cancel: CancellationToken,
 ) -> CallToolResult {
-    if let Some(result) = render_full_error(&error, budget) {
+    if let Some(result) = render_full_error(&mut error, budget) {
         return result;
     }
+    let progress = ErrorProgress::from_details(&error.details);
     let changed_paths = error.details.changed_paths.take();
     let not_changed_paths = error.details.not_changed_paths.take();
     let outcome_unknown_paths = error.details.outcome_unknown_paths.take();
@@ -682,19 +716,7 @@ async fn render_error_retained(
         not_changed_paths,
         outcome_unknown_paths,
     };
-    error.details.changed_paths = detail
-        .changed_paths
-        .as_ref()
-        .map(|paths| vec![String::new(); paths.len()]);
-    error.details.not_changed_paths = detail
-        .not_changed_paths
-        .as_ref()
-        .map(|paths| vec![String::new(); paths.len()]);
-    error.details.outcome_unknown_paths = detail
-        .outcome_unknown_paths
-        .as_ref()
-        .map(|paths| vec![String::new(); paths.len()]);
-    let mut result = render_error(error, budget);
+    let mut result = render_error_borrowed_with_progress(&error, budget, progress);
     let retained = match provenance {
         Some(provenance) => bridge
             .retain_serialized_detail(provenance, detail, cancel)
@@ -719,13 +741,17 @@ async fn render_error_retained(
     result
 }
 
-fn render_full_error(error: &BridgeError, budget: WireBudget) -> Option<CallToolResult> {
+fn render_full_error(error: &mut BridgeError, budget: WireBudget) -> Option<CallToolResult> {
+    normalize_progress_controls(&mut error.details);
     let details = &error.details;
     let (message, message_truncated) = safe_text(&error.message, SAFE_TEXT_BYTES);
-    let action = details
+    let (action, action_truncated) = details
         .suggested_action
         .as_deref()
-        .map(|action| safe_text(action, SAFE_TEXT_BYTES).0);
+        .map(|action| safe_text(action, SAFE_TEXT_BYTES))
+        .map_or((None, false), |(action, truncated)| {
+            (Some(action), truncated)
+        });
     let context = rendered_error_context(details);
     let warnings = context
         .as_ref()
@@ -756,6 +782,7 @@ fn render_full_error(error: &BridgeError, budget: WireBudget) -> Option<CallTool
             },
         },
         action,
+        action_truncated,
         warnings,
         warnings_truncated: false,
     };
@@ -768,6 +795,23 @@ fn render_full_error(error: &BridgeError, budget: WireBudget) -> Option<CallTool
         is_error: true,
     };
     serialized_at_most(&result, maximum).then_some(result)
+}
+
+fn normalize_progress_controls(details: &mut ErrorDetails) {
+    for paths in [
+        &mut details.changed_paths,
+        &mut details.not_changed_paths,
+        &mut details.outcome_unknown_paths,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for path in paths {
+            if path.chars().any(char::is_control) {
+                *path = normalize_controls(path);
+            }
+        }
+    }
 }
 
 fn error_retention_provenance(details: &ErrorDetails) -> Option<RetentionProvenance> {
@@ -810,7 +854,7 @@ fn rendered_error_context(details: &ErrorDetails) -> Option<RenderedContext> {
     Some(RenderedContext {
         remote: true,
         host: host.clone(),
-        physical_root: details.physical_root.clone(),
+        physical_root: details.physical_root.as_deref().map(normalize_controls),
         shell: details.shell.as_ref().map(|shell| RenderedShell {
             kind: shell.kind.clone(),
             version: shell
@@ -1147,6 +1191,7 @@ struct RenderedErrorDocument<'a> {
     error: &'a RenderedErrorCore,
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<&'a str>,
+    action_truncated: bool,
     #[serde(skip_serializing_if = "slice_is_empty")]
     warnings: &'a [String],
     warnings_truncated: bool,
@@ -1175,6 +1220,7 @@ struct FullErrorDocument<'a> {
     error: FullErrorCore<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<String>,
+    action_truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     warnings_truncated: bool,
@@ -1312,7 +1358,7 @@ mod tests {
         error.details.outcome_unknown_paths = Some(vec!["d".to_owned()]);
         error.details.mutation_may_have_applied = Some(true);
         let rendered = result_value(
-            render_full_error(&error, roomy_budget()).expect("roomy error must render inline"),
+            render_full_error(&mut error, roomy_budget()).expect("roomy error must render inline"),
         );
         let text = text_value(&rendered);
         assert_eq!(text["error"]["details"]["changed_paths"], json!(["a"]));
@@ -1334,6 +1380,59 @@ mod tests {
             1
         );
         assert_eq!(rendered["structuredContent"]["status"], "unknown");
+    }
+
+    #[test]
+    fn task8_error_rendering_normalizes_context_and_progress_controls() {
+        let mut error = BridgeError::new(ErrorCode::WriteConflict, "patch failed", false);
+        error.details.host = Some("dev".to_owned());
+        error.details.physical_root = Some("/srv/\troot\n".to_owned());
+        error.details.changed_paths = Some(vec!["changed\tpath".to_owned()]);
+        error.details.not_changed_paths = Some(vec!["not\nchanged".to_owned()]);
+        error.details.outcome_unknown_paths = Some(vec!["unknown\rpath".to_owned()]);
+
+        let rendered = result_value(
+            render_full_error(&mut error, roomy_budget()).expect("roomy error must render inline"),
+        );
+        let text = text_value(&rendered);
+
+        assert_eq!(text["physical_root"], "/srv/?root?");
+        assert_eq!(
+            text["error"]["details"]["changed_paths"],
+            json!(["changed?path"])
+        );
+        assert_eq!(
+            text["error"]["details"]["not_changed_paths"],
+            json!(["not?changed"])
+        );
+        assert_eq!(
+            text["error"]["details"]["outcome_unknown_paths"],
+            json!(["unknown?path"])
+        );
+        assert_eq!(
+            rendered["structuredContent"]["physical_root"],
+            "/srv/?root?"
+        );
+    }
+
+    #[test]
+    fn task8_error_action_exact_limit_and_plus_one_report_truncation() {
+        for (length, truncated) in [(SAFE_TEXT_BYTES, false), (SAFE_TEXT_BYTES + 1, true)] {
+            let mut error = BridgeError::new(ErrorCode::InvalidArgument, "bad request", false);
+            error.details.suggested_action = Some("x".repeat(length));
+
+            let rendered = result_value(render_error(error, roomy_budget()));
+            let text = text_value(&rendered);
+            assert_eq!(
+                rendered["structuredContent"]["action"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                SAFE_TEXT_BYTES
+            );
+            assert_eq!(rendered["structuredContent"]["action_truncated"], truncated);
+            assert_eq!(text["action_truncated"], truncated);
+        }
     }
 
     #[test]
@@ -1583,6 +1682,7 @@ mod tests {
             .await,
         );
         assert_eq!(run_result["structuredContent"]["exit_status"], 0);
+        assert_eq!(run_result["structuredContent"]["status"], "completed");
         assert_eq!(
             run_result["structuredContent"]["aggregate_bytes"],
             bulk.len()
