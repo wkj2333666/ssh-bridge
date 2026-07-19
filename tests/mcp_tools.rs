@@ -1,6 +1,11 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader as StdBufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile};
 use codex_ssh_bridge::mcp::stdio::{exact_tools_list_response_bytes, required_mcp_frame_bytes};
@@ -13,6 +18,9 @@ use codex_ssh_bridge::output::OutputStore;
 use codex_ssh_bridge::remote::RemoteBridge;
 use codex_ssh_bridge::ssh::{RuntimePaths, SshRunner};
 use serde_json::{Value, json};
+use tokio::io::{
+    AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader, DuplexStream, ReadHalf, WriteHalf,
+};
 use tokio_util::sync::CancellationToken;
 
 mod support;
@@ -36,7 +44,7 @@ fn roomy_context() -> ToolCallContext {
         cancel: CancellationToken::new(),
         wire_budget: WireBudget {
             result_bytes: 2 * 1024 * 1024,
-            compact_fallback_bytes: 128 * 1024,
+            compact_fallback_bytes: codex_ssh_bridge::mcp::maximum_compact_fallback_result_bytes(),
         },
     }
 }
@@ -44,12 +52,24 @@ fn roomy_context() -> ToolCallContext {
 fn fake_remote_tools_fixture(
     root: &std::path::Path,
 ) -> (tempfile::TempDir, std::path::PathBuf, RemoteMcpTools) {
+    fake_remote_tools_with_options(root, false, &[])
+}
+
+fn fake_remote_tools_with_options(
+    root: &std::path::Path,
+    read_only: bool,
+    extra: &[(&str, OsString)],
+) -> (tempfile::TempDir, std::path::PathBuf, RemoteMcpTools) {
     let runtime_base = tempfile::TempDir::new().unwrap();
     let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
     let store = Arc::new(OutputStore::new(&runtime).unwrap());
-    let config = Arc::new(support::config_with_host("dev", root.to_str().unwrap()));
+    let mut config = support::config_with_host("dev", root.to_str().unwrap());
+    config.hosts.get_mut("dev").unwrap().read_only = read_only;
+    if read_only {
+        config.hosts.get_mut("dev").unwrap().description = Some("D".repeat(2 * 1024 * 1024));
+    }
     let log = runtime_base.path().join("ssh.log");
-    let environment = BTreeMap::from([
+    let mut environment = BTreeMap::from([
         (
             OsString::from("FAKE_SSH_MODE"),
             OsString::from("local-fixed"),
@@ -57,9 +77,12 @@ fn fake_remote_tools_fixture(
         (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
         (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
     ]);
+    for (key, value) in extra {
+        environment.insert(OsString::from(key), value.clone());
+    }
     let runner = Arc::new(
         SshRunner::with_executable(
-            config,
+            Arc::new(config),
             runtime,
             store,
             support::fake_ssh_path(),
@@ -90,6 +113,724 @@ fn command_calls(log: &std::path::Path) -> usize {
         .lines()
         .filter(|line| *line == "C")
         .count()
+}
+
+fn write_binary_config(directory: &std::path::Path, contents: &str) -> std::path::PathBuf {
+    let path = directory.join("config.toml");
+    std::fs::write(&path, contents).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
+fn binary_command(config: &std::path::Path, runtime: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-ssh-bridge"));
+    command
+        .env("CODEX_SSH_BRIDGE_CONFIG", config)
+        .env("XDG_RUNTIME_DIR", runtime);
+    command
+}
+
+fn wait_for_child_bounded(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> (std::process::Output, bool) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return (child.wait_with_output().unwrap(), false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return (child.wait_with_output().unwrap(), true);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn task8_binary_lifecycle_smoke_exposes_exact_surface_without_leaks() {
+    let private = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let host_root = "/srv/BINARY_HOST_PATH_SENTINEL";
+    let secret = "CONFIG_CONTENT_SENTINEL";
+    let config = write_binary_config(
+        private.path(),
+        &format!(
+            "[limits]\nmax_frame_bytes = 8388608\nglobal_concurrency = 3\nglobal_spool_quota_bytes = 67108864\nretention_serialization_jobs = 1\n[hosts.dev]\nroot = {host_root:?}\ndescription = {secret:?}\n"
+        ),
+    );
+    let caller_frame = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remote_hosts","arguments":{}}}
+"#;
+    let ssh_log = private.path().join("unexpected-ssh.log");
+    std::os::unix::fs::symlink(support::fake_ssh_path(), private.path().join("ssh")).unwrap();
+    let mut child = binary_command(&config, private.path())
+        .arg("mcp")
+        .env("PATH", private.path())
+        .env("FAKE_SSH_LOG", &ssh_log)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(caller_frame.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in StdBufReader::new(child_stdout).lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut response_lines = Vec::new();
+    for _ in 0..3 {
+        match receiver.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(line)) => response_lines.push(line),
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out or failed reading MCP response: {other:?}");
+            }
+        }
+    }
+    drop(stdin);
+    let (output, eof_timed_out) = wait_for_child_bounded(child, Duration::from_secs(5));
+    reader.join().unwrap();
+    for line in receiver.try_iter() {
+        response_lines.push(line.unwrap());
+    }
+    assert!(
+        !eof_timed_out,
+        "binary did not terminate after stdin EOF; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = response_lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "responses={lines:#?}");
+    assert_eq!(
+        lines.iter().map(|line| &line["id"]).collect::<Vec<_>>(),
+        [&json!(1), &json!(2), &json!(3)]
+    );
+    assert_eq!(lines[0]["result"]["protocolVersion"], "2025-11-25");
+    let names = lines[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|definition| definition["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        tool_definitions()
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(lines[2]["result"]["isError"], Value::Null);
+    assert_eq!(lines[2]["result"]["structuredContent"]["host_count"], 1);
+    assert_eq!(std::fs::read(&ssh_log).unwrap_or_default(), b"");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for forbidden in [
+        secret,
+        host_root,
+        config.to_str().unwrap(),
+        "ControlPath",
+        caller_frame.trim(),
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked {forbidden:?}: {stderr}"
+        );
+    }
+}
+
+struct ProtocolSession {
+    input: WriteHalf<DuplexStream>,
+    output: TokioBufReader<ReadHalf<DuplexStream>>,
+    server: tokio::task::JoinHandle<codex_ssh_bridge::BridgeResult<()>>,
+    next_id: u64,
+}
+
+impl ProtocolSession {
+    async fn start(tools: RemoteMcpTools) -> Self {
+        Self::start_with_frame(tools, codex_ssh_bridge::MAX_FRAME_BYTES).await
+    }
+
+    async fn start_with_frame(tools: RemoteMcpTools, max_frame_bytes: usize) -> Self {
+        let (client, server_io) = tokio::io::duplex(16 * 1024 * 1024);
+        let (client_output, client_input) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server_io);
+        let server = McpServer::new(Arc::new(tools), max_frame_bytes, 4).unwrap();
+        let server = tokio::spawn(server.serve(server_input, server_output));
+        let mut session = Self {
+            input: client_input,
+            output: TokioBufReader::new(client_output),
+            server,
+            next_id: 1,
+        };
+        let initialized = session
+            .request(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"initialize",
+                "params":{
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{},
+                    "clientInfo":{"name":"task8","version":"1"}
+                }
+            }))
+            .await;
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+        session
+            .send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        session
+    }
+
+    async fn send(&mut self, frame: Value) {
+        self.input
+            .write_all(format!("{}\n", serde_json::to_string(&frame).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        self.input.flush().await.unwrap();
+    }
+
+    async fn request(&mut self, frame: Value) -> Value {
+        self.send(frame).await;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), self.output.read_line(&mut line))
+            .await
+            .expect("MCP response timed out")
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn call(&mut self, name: &str, arguments: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        let response = self
+            .request(json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":"tools/call",
+                "params":{"name":name,"arguments":arguments}
+            }))
+            .await;
+        assert_eq!(response["id"], id);
+        response["result"].clone()
+    }
+
+    async fn close(mut self) {
+        self.input.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.server)
+            .await
+            .expect("MCP server close timed out")
+            .unwrap()
+            .unwrap();
+    }
+}
+
+fn assert_remote_context(result: &Value, root: &std::path::Path) {
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["remote"], true);
+    assert_eq!(structured["host"], "dev");
+    assert_eq!(structured["physical_root"], root.to_str().unwrap());
+    assert!(structured["shell"]["kind"].is_string());
+}
+
+#[tokio::test]
+async fn task8_complete_surface_all_nine_tools_are_real_json_rpc_calls() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        remote
+            .path()
+            .join("hostile $(touch SHOULD_NOT_EXIST)\nname.txt"),
+        b"hostile name marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        remote.path().join("utf8.txt"),
+        b"literal $(touch SHOULD_NOT_EXIST)\nUTF8_SURFACE\n",
+    )
+    .unwrap();
+    std::fs::write(remote.path().join("binary.bin"), [0xff, 0x00, 0x7f]).unwrap();
+    let (_runtime, _log, tools) = fake_remote_tools_fixture(remote.path());
+    let mut session = ProtocolSession::start(tools).await;
+
+    let hosts = session.call("remote_hosts", json!({})).await;
+    assert_eq!(hosts["structuredContent"]["remote"], true);
+    assert_eq!(hosts["structuredContent"]["host_count"], 1);
+
+    let listed = session
+        .call(
+            "remote_list",
+            json!({"host":"dev","path":".","max_entries":32}),
+        )
+        .await;
+    assert_remote_context(&listed, remote.path());
+    assert!(
+        text_json(&listed)
+            .to_string()
+            .contains("hostile $(touch SHOULD_NOT_EXIST)\\nname.txt")
+    );
+
+    let stated = session
+        .call(
+            "remote_stat",
+            json!({"host":"dev","paths":["binary.bin","missing.txt"]}),
+        )
+        .await;
+    assert_remote_context(&stated, remote.path());
+    let stat_text = text_json(&stated);
+    assert_eq!(stat_text["entries"].as_array().unwrap().len(), 2);
+    assert!(stat_text.to_string().contains("missing.txt"));
+
+    let searched = session
+        .call(
+            "remote_search",
+            json!({"host":"dev","query":"$(touch SHOULD_NOT_EXIST)","path":"."}),
+        )
+        .await;
+    assert_remote_context(&searched, remote.path());
+    assert!(
+        text_json(&searched)
+            .to_string()
+            .contains("$(touch SHOULD_NOT_EXIST)")
+    );
+
+    let read = session
+        .call(
+            "remote_read",
+            json!({"host":"dev","paths":["utf8.txt","binary.bin"],"max_bytes":4096}),
+        )
+        .await;
+    assert_remote_context(&read, remote.path());
+    let read_text = text_json(&read).to_string();
+    assert!(read_text.contains("UTF8_SURFACE"), "read={read_text}");
+    assert!(read_text.contains("/wB/"));
+
+    let run = session
+        .call(
+            "remote_run",
+            json!({"host":"dev","command":"printf RUN_SURFACE; dd if=/dev/zero bs=1024 count=300 2>/dev/null","shell":"sh"}),
+        )
+        .await;
+    assert_remote_context(&run, remote.path());
+    assert_eq!(run["structuredContent"]["exit_status"], 0);
+    let output_ref = run["structuredContent"]["output_ref"]
+        .as_str()
+        .expect("run must publish a pageable output reference")
+        .to_owned();
+
+    let output = session
+        .call(
+            "remote_output_read",
+            json!({"output_ref":output_ref,"stream":"stdout","offset":0,"max_bytes":11}),
+        )
+        .await;
+    assert_remote_context(&output, remote.path());
+    assert!(text_json(&output).to_string().contains("RUN_SURFACE"));
+
+    let written = session
+        .call(
+            "remote_write",
+            json!({
+                "host":"dev","path":"created.txt","content":"WRITE_SURFACE\n",
+                "encoding":"utf8","mode":{"kind":"create"}
+            }),
+        )
+        .await;
+    assert_remote_context(&written, remote.path());
+    assert_eq!(written["structuredContent"]["status"], "applied");
+
+    let patched = session
+        .call(
+            "remote_apply_patch",
+            json!({
+                "host":"dev",
+                "patch":"--- a/created.txt\n+++ b/created.txt\n@@ -1 +1 @@\n-WRITE_SURFACE\n+PATCH_SURFACE\n"
+            }),
+        )
+        .await;
+    assert_remote_context(&patched, remote.path());
+    assert_eq!(patched["structuredContent"]["status"], "applied");
+    assert_eq!(
+        std::fs::read(remote.path().join("created.txt")).unwrap(),
+        b"PATCH_SURFACE\n"
+    );
+    assert!(!remote.path().join("SHOULD_NOT_EXIST").exists());
+    assert!(!std::path::Path::new("SHOULD_NOT_EXIST").exists());
+    session.close().await;
+}
+
+#[tokio::test]
+async fn task8_shell_surface_reports_bash_auto_sh_and_fallback_exactly() {
+    let cases = [
+        (
+            "bash-auto",
+            vec![
+                ("FAKE_SSH_MODE", OsString::from("echo-command")),
+                ("FAKE_SSH_SHELL", OsString::from("bash")),
+                ("FAKE_SSH_BASH_VERSION", OsString::from("5.2.15")),
+            ],
+            "auto",
+            "bash",
+            Some("5.2.15"),
+            false,
+        ),
+        (
+            "auto-fallback",
+            vec![
+                ("FAKE_SSH_MODE", OsString::from("echo-command")),
+                ("FAKE_SSH_SHELL", OsString::from("sh")),
+            ],
+            "auto",
+            "sh",
+            None,
+            true,
+        ),
+        (
+            "explicit-sh",
+            vec![
+                ("FAKE_SSH_MODE", OsString::from("echo-command")),
+                ("FAKE_SSH_SHELL", OsString::from("bash")),
+                ("FAKE_SSH_BASH_VERSION", OsString::from("5.2.15")),
+            ],
+            "sh",
+            "sh",
+            None,
+            false,
+        ),
+    ];
+    for (name, environment, requested, kind, version, fallback) in cases {
+        let remote = tempfile::TempDir::new().unwrap();
+        let extra = environment
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect::<Vec<_>>();
+        let (_runtime, _log, tools) = fake_remote_tools_with_options(remote.path(), false, &extra);
+        let mut session = ProtocolSession::start(tools).await;
+        let run = session
+            .call(
+                "remote_run",
+                json!({"host":"dev","command":"printf safe","shell":requested}),
+            )
+            .await;
+        assert_eq!(run["isError"], Value::Null, "{name}: {run}");
+        assert_eq!(run["structuredContent"]["shell"]["kind"], kind, "{name}");
+        assert_eq!(
+            run["structuredContent"]["shell"]["version"],
+            version.map_or(Value::Null, |version| json!(version)),
+            "{name}"
+        );
+        assert_eq!(
+            run["structuredContent"]["shell"]["fallback"], fallback,
+            "{name}"
+        );
+        if kind == "sh" {
+            assert!(
+                run["structuredContent"]["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().unwrap().contains("POSIX sh")),
+                "{name}: {run}"
+            );
+        }
+        session.close().await;
+    }
+}
+
+#[tokio::test]
+async fn task8_shell_surface_missing_bash_rejects_before_command_child() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, log, tools) = fake_remote_tools_with_options(
+        remote.path(),
+        false,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("echo-command")),
+            ("FAKE_SSH_SHELL", OsString::from("sh")),
+        ],
+    );
+    let mut session = ProtocolSession::start(tools).await;
+    let run = session
+        .call(
+            "remote_run",
+            json!({"host":"dev","command":"printf must-not-run","shell":"bash"}),
+        )
+        .await;
+    assert_eq!(run["isError"], true);
+    assert_eq!(
+        run["structuredContent"]["error"]["code"],
+        "REMOTE_CAPABILITY_MISSING"
+    );
+    assert_eq!(command_calls(&log), 0);
+    session.close().await;
+}
+
+#[tokio::test]
+async fn task8_shell_surface_login_metadata_and_local_timeout_are_explicit() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _log, tools) = fake_remote_tools_with_options(
+        remote.path(),
+        false,
+        &[("FAKE_SSH_MODE", OsString::from("echo-command"))],
+    );
+    let mut session = ProtocolSession::start(tools).await;
+    let run = session
+        .call(
+            "remote_run",
+            json!({"host":"dev","command":"printf safe","shell":"login"}),
+        )
+        .await;
+    assert_eq!(
+        run["structuredContent"]["shell"],
+        json!({"kind":"login","fallback":false})
+    );
+    session.close().await;
+
+    let (_runtime, _log, tools) = fake_remote_tools_with_options(
+        remote.path(),
+        false,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("sleep")),
+            ("FAKE_SSH_SLEEP_SECONDS", OsString::from("5")),
+        ],
+    );
+    let mut session = ProtocolSession::start(tools).await;
+    let timed_out = session
+        .call(
+            "remote_run",
+            json!({"host":"dev","command":"printf never","shell":"login","timeout_ms":50}),
+        )
+        .await;
+    assert_eq!(timed_out["isError"], true);
+    assert_eq!(
+        timed_out["structuredContent"]["error"]["code"],
+        "COMMAND_TIMEOUT"
+    );
+    assert_eq!(
+        timed_out["structuredContent"]["shell"],
+        json!({"kind":"login","fallback":false})
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn task8_shell_surface_read_only_is_enforced_server_side_for_every_mutation() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("read.txt"), b"READ_ONLY_SENTINEL\n").unwrap();
+    let (_runtime, log, tools) = fake_remote_tools_with_options(remote.path(), true, &[]);
+    let id = RequestId::synthetic_max_wire();
+    let minimum_frame = required_mcp_frame_bytes(
+        tool_definitions(),
+        codex_ssh_bridge::mcp::maximum_compact_fallback_result_bytes(),
+        &id,
+    )
+    .unwrap();
+    let mut session = ProtocolSession::start_with_frame(tools, minimum_frame).await;
+    let retained = session.call("remote_hosts", json!({})).await;
+    assert_eq!(
+        retained["structuredContent"]["detail_retained"], true,
+        "{retained}"
+    );
+    let output_ref = retained["structuredContent"]["output_ref"]
+        .as_str()
+        .expect("read-only list detail must be retained")
+        .to_owned();
+
+    for (name, arguments) in [
+        (
+            "remote_list",
+            json!({"host":"dev","path":".","max_entries":1}),
+        ),
+        ("remote_stat", json!({"host":"dev","paths":["read.txt"]})),
+        (
+            "remote_search",
+            json!({"host":"dev","query":"READ_ONLY_SENTINEL","path":"."}),
+        ),
+        ("remote_read", json!({"host":"dev","paths":["read.txt"]})),
+    ] {
+        let result = session.call(name, arguments).await;
+        assert_ne!(result["isError"], true, "{name}: {result}");
+        assert_remote_context(&result, remote.path());
+    }
+    let output = session
+        .call(
+            "remote_output_read",
+            json!({"output_ref":output_ref,"stream":"stdout","offset":0,"max_bytes":1024}),
+        )
+        .await;
+    assert_ne!(output["isError"], true, "{output}");
+    assert_eq!(output["structuredContent"]["remote"], true);
+    assert_eq!(output["structuredContent"]["aggregate"], "hosts");
+
+    std::fs::write(&log, b"").unwrap();
+    for (name, arguments) in [
+        (
+            "remote_write",
+            json!({"host":"dev","path":"new.txt","content":"x","encoding":"utf8","mode":{"kind":"create"}}),
+        ),
+        (
+            "remote_apply_patch",
+            json!({"host":"dev","patch":"--- a/read.txt\n+++ b/read.txt\n@@ -1 +1 @@\n-READ_ONLY_SENTINEL\n+changed\n"}),
+        ),
+        (
+            "remote_run",
+            json!({"host":"dev","command":"printf must-not-run","shell":"sh"}),
+        ),
+    ] {
+        let result = session.call(name, arguments).await;
+        assert_eq!(result["isError"], true, "{name}: {result}");
+        assert_eq!(
+            result["structuredContent"]["error"]["code"], "READ_ONLY_HOST",
+            "{name}"
+        );
+    }
+    assert_eq!(
+        command_calls(&log),
+        0,
+        "read-only mutations must launch no command child"
+    );
+    assert!(!remote.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read(remote.path().join("read.txt")).unwrap(),
+        b"READ_ONLY_SENTINEL\n"
+    );
+    session.close().await;
+}
+
+#[test]
+fn task8_binary_unknown_and_missing_modes_have_fixed_usage_and_exit_two() {
+    let private = tempfile::TempDir::new().unwrap();
+    let config = private.path().join("absent-config-is-not-consulted");
+    let expected = "usage: codex-ssh-bridge mcp\n";
+    for arguments in [Vec::<&str>::new(), vec!["unknown"], vec!["mcp", "extra"]] {
+        let output = binary_command(&config, private.path())
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
+    }
+}
+
+#[test]
+fn task8_binary_fatal_error_is_only_fixed_prefix_and_stable_code() {
+    let private = tempfile::TempDir::new().unwrap();
+    let secret = "FATAL_CONFIG_SECRET";
+    let config = write_binary_config(private.path(), secret);
+    let output = binary_command(&config, private.path())
+        .arg("mcp")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "codex-ssh-bridge fatal: INVALID_CONFIG\n"
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes())
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(config.as_os_str().len())
+            .any(|window| window == config.as_os_str().as_encoded_bytes())
+    );
+}
+
+#[test]
+fn task8_binary_bootstrap_preserves_exact_limits_and_ownership_chain() {
+    let source = include_str!("../src/main.rs");
+    for required in [
+        "Config::load_default()",
+        "loaded.config.limits.max_frame_bytes",
+        "loaded.config.limits.global_concurrency",
+        "loaded.config.limits.global_spool_quota_bytes",
+        "loaded.config.limits.retention_serialization_jobs",
+        "OutputStore::with_limits(",
+        "global_spool_quota_bytes,",
+        "retention_serialization_jobs,",
+        "Arc::new(loaded.config)",
+        "SshRunner::new(Arc::clone(&config), runtime, output_store)",
+        "RemoteBridge::new(runner)",
+        "RemoteMcpTools::new(bridge)",
+        "McpServer::new(tools, max_frame_bytes, max_inflight)",
+    ] {
+        assert!(
+            source.contains(required),
+            "bootstrap lost required ownership/limit source: {required}"
+        );
+    }
+    assert!(!source.contains("OutputStore::new("));
+    assert!(
+        !source
+            .lines()
+            .any(|line| line.trim_start().starts_with("println!("))
+    );
+
+    for quota in [64_u64, 127, 255, 511].map(|mebibytes| mebibytes * 1024 * 1024) {
+        for jobs in 1..=4 {
+            let runtime_base = tempfile::TempDir::new().unwrap();
+            let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
+            OutputStore::with_limits(&runtime, quota, jobs).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn task8_binary_remote_tools_constructor_accepts_exact_minimum_only() {
+    let (_runtime, _bridge, tools) = remote_tools_fixture();
+    let id = RequestId::synthetic_max_wire();
+    let exact_tools = exact_tools_list_response_bytes(tool_definitions(), &id).unwrap();
+    let fallback = codex_ssh_bridge::mcp::maximum_compact_fallback_result_bytes();
+    let required = required_mcp_frame_bytes(tool_definitions(), fallback, &id).unwrap();
+    assert_eq!(required, 1_048_576.max(exact_tools));
+    assert!(McpServer::new(Arc::new(tools.clone()), required - 1, 1).is_err());
+
+    let mut session = ProtocolSession::start_with_frame(tools, required).await;
+    let maximum_id = "x".repeat(254);
+    let listed = session
+        .request(json!({
+            "jsonrpc":"2.0",
+            "id":maximum_id,
+            "method":"tools/list",
+            "params":{}
+        }))
+        .await;
+    assert_eq!(listed["id"], maximum_id);
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|definition| definition["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        tool_definitions()
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    session.close().await;
 }
 
 fn property<'a>(tool: &'a ToolDefinition, name: &str) -> &'a Value {
@@ -627,7 +1368,7 @@ async fn task8_retention_hosts_fallback_is_truthful_and_pageable() {
                 format!("host-{index}"),
                 HostProfile {
                     root: format!("/srv/remote/{index}"),
-                    description: Some(format!("DETAIL-{index}-{}", "x".repeat(32 * 1024))),
+                    description: Some(format!("DETAIL-{index}-{}", "x".repeat(256 * 1024))),
                     read_only: true,
                     limits: HostLimitOverrides::default(),
                 },
@@ -647,37 +1388,32 @@ async fn task8_retention_hosts_fallback_is_truthful_and_pageable() {
     );
     let bridge = Arc::new(RemoteBridge::new(runner));
     let tools = RemoteMcpTools::new(Arc::clone(&bridge));
-    let result = tools
-        .call(
-            "remote_hosts".to_owned(),
-            json!({}),
-            ToolCallContext {
-                cancel: CancellationToken::new(),
-                wire_budget: WireBudget {
-                    result_bytes: 0,
-                    compact_fallback_bytes: 16 * 1024,
-                },
-            },
-        )
-        .await;
-    let rendered = serde_json::to_value(result).unwrap();
+    let id = RequestId::synthetic_max_wire();
+    let minimum_frame = required_mcp_frame_bytes(
+        tool_definitions(),
+        codex_ssh_bridge::mcp::maximum_compact_fallback_result_bytes(),
+        &id,
+    )
+    .unwrap();
+    let mut session = ProtocolSession::start_with_frame(tools, minimum_frame).await;
+    let rendered = session.call("remote_hosts", json!({})).await;
     assert_eq!(rendered["structuredContent"]["host_count"], 7);
     assert_eq!(rendered["structuredContent"]["truncated"], true);
     assert_eq!(rendered["structuredContent"]["detail_retained"], true);
     let output_ref = rendered["structuredContent"]["output_ref"]
         .as_str()
         .unwrap();
-    let paged = call_json(
-        &tools,
-        "remote_output_read",
-        json!({
-            "output_ref":output_ref,
-            "stream":"stdout",
-            "offset":0,
-            "max_bytes":1024
-        }),
-    )
-    .await;
+    let paged = session
+        .call(
+            "remote_output_read",
+            json!({
+                "output_ref":output_ref,
+                "stream":"stdout",
+                "offset":0,
+                "max_bytes":1024
+            }),
+        )
+        .await;
     let paged_text = text_json(&paged);
     assert_eq!(paged_text["remote"], true);
     assert_eq!(paged_text["aggregate"], "hosts");
@@ -698,6 +1434,7 @@ async fn task8_retention_hosts_fallback_is_truthful_and_pageable() {
         .await
         .unwrap();
     assert!(page.data.value.contains("DETAIL-0"));
+    session.close().await;
 }
 
 #[test]
