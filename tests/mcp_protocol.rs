@@ -129,7 +129,7 @@ fn task7_strict_json_classifies_syntax_and_trailing_data_without_diagnostics() {
 }
 
 #[test]
-fn task7_strict_json_enforces_depth_boundary() {
+fn task7_adversarial_strict_json_enforces_depth_boundary() {
     assert!(parse_strict_json(&nested_arrays(64)).is_ok());
     assert_eq!(
         parse_strict_json(&nested_arrays(65)),
@@ -138,7 +138,7 @@ fn task7_strict_json_enforces_depth_boundary() {
 }
 
 #[test]
-fn task7_strict_json_enforces_node_boundary_for_wide_arrays() {
+fn task7_adversarial_strict_json_enforces_node_boundary_for_wide_arrays() {
     assert!(parse_strict_json(&wide_array(262_144)).is_ok());
     assert_eq!(
         parse_strict_json(&wide_array(262_145)),
@@ -147,7 +147,7 @@ fn task7_strict_json_enforces_node_boundary_for_wide_arrays() {
 }
 
 #[test]
-fn task7_strict_json_enforces_aggregate_member_boundary_for_wide_objects() {
+fn task7_adversarial_strict_json_enforces_aggregate_member_boundary_for_wide_objects() {
     assert!(parse_strict_json(&wide_object(131_072)).is_ok());
     assert_eq!(
         parse_strict_json(&wide_object(131_073)),
@@ -156,7 +156,7 @@ fn task7_strict_json_enforces_aggregate_member_boundary_for_wide_objects() {
 }
 
 #[test]
-fn task7_strict_json_member_budget_is_aggregate_across_distinct_nested_maps() {
+fn task7_adversarial_strict_json_member_budget_is_aggregate_across_distinct_nested_maps() {
     assert!(parse_strict_json(&nested_objects_with_members(131_072)).is_ok());
     assert_eq!(
         parse_strict_json(&nested_objects_with_members(131_073)),
@@ -165,7 +165,7 @@ fn task7_strict_json_member_budget_is_aggregate_across_distinct_nested_maps() {
 }
 
 #[test]
-fn task7_strict_json_enforces_aggregate_key_byte_boundary() {
+fn task7_adversarial_strict_json_enforces_aggregate_key_byte_boundary() {
     assert!(parse_strict_json(&object_with_key_bytes(1_048_576)).is_ok());
     assert_eq!(
         parse_strict_json(&object_with_key_bytes(1_048_577)),
@@ -174,7 +174,7 @@ fn task7_strict_json_enforces_aggregate_key_byte_boundary() {
 }
 
 #[test]
-fn task7_strict_json_key_byte_budget_is_aggregate_across_distinct_nested_maps() {
+fn task7_adversarial_strict_json_key_byte_budget_is_aggregate_across_distinct_nested_maps() {
     assert!(parse_strict_json(&nested_objects_with_key_bytes(1_048_576)).is_ok());
     assert_eq!(
         parse_strict_json(&nested_objects_with_key_bytes(1_048_577)),
@@ -203,14 +203,16 @@ fn task7_strict_json_builds_all_json_value_kinds() {
 }
 
 #[test]
-fn task7_strict_json_duplicate_detection_uses_destination_map_only() {
+fn task7_adversarial_strict_json_duplicate_detection_uses_destination_map_only() {
     let source = include_str!("../src/mcp/protocol.rs");
     assert!(source.contains("contains_key"));
     assert!(source.contains("next_key_seed"));
     assert!(source.contains("StrictKeySeed"));
     assert!(!source.contains("next_key::<String>"));
+    assert!(!source.contains("HashSet"));
     assert!(!source.contains("HashSet<String>"));
     assert!(!source.contains("HashSet::<String>"));
+    assert!(!source.contains("key.clone()"));
 }
 
 #[test]
@@ -3426,4 +3428,257 @@ fn task7_min_frame_wire_budget_reserves_envelope_id_and_fallback_only() {
         WireBudget::for_response(frame, &manually_constructed_oversized_id, fallback_bytes)
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn task7_adversarial_exact_eight_mib_and_plus_one_recovery() {
+    let exact_request =
+        serde_json::to_vec(&json!({"jsonrpc":"2.0","id":"exact","method":"ping","params":{}}))
+            .unwrap();
+    assert!(exact_request.len() < codex_ssh_bridge::MAX_FRAME_BYTES);
+
+    let mut input = Vec::with_capacity(codex_ssh_bridge::MAX_FRAME_BYTES * 2 + 512);
+    input.extend_from_slice(&exact_request);
+    input.resize(codex_ssh_bridge::MAX_FRAME_BYTES, b' ');
+    input.push(b'\n');
+    input.extend(std::iter::repeat_n(
+        b'x',
+        codex_ssh_bridge::MAX_FRAME_BYTES + 1,
+    ));
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"jsonrpc":"2.0","id":"after","method":"ping","params":{}}"#);
+    input.push(b'\n');
+
+    let service = Arc::new(NullService {
+        definitions: lifecycle_definitions(),
+    });
+    let server = McpServer::new(service, codex_ssh_bridge::MAX_FRAME_BYTES, 1).unwrap();
+    let (responses, result) = serve_raw(server, input).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        responses,
+        [
+            server_not_initialized_response(RequestId::String("exact".into())),
+            request_too_large_response(),
+            server_not_initialized_response(RequestId::String("after".into())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn task7_adversarial_nul_utf8_and_non_utf8_are_fixed_parse_errors() {
+    const ONE_MIB: usize = 1024 * 1024;
+    let nul_utf8 = vec![0_u8; ONE_MIB];
+    let non_utf8 = vec![0xff_u8; ONE_MIB];
+    assert!(std::str::from_utf8(&nul_utf8).is_ok());
+    assert!(std::str::from_utf8(&non_utf8).is_err());
+    assert_eq!(parse_strict_json(&nul_utf8), Err(StrictJsonError::Syntax));
+    assert_eq!(parse_strict_json(&non_utf8), Err(StrictJsonError::Syntax));
+
+    let mut input = Vec::with_capacity(2 * ONE_MIB + 128);
+    input.extend_from_slice(&nul_utf8);
+    input.push(b'\n');
+    input.extend_from_slice(&non_utf8);
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#);
+    input.push(b'\n');
+
+    let service = Arc::new(NullService {
+        definitions: lifecycle_definitions(),
+    });
+    let server = McpServer::new(service, codex_ssh_bridge::MAX_FRAME_BYTES, 1).unwrap();
+    let (responses, result) = serve_raw(server, input).await;
+    assert!(result.is_ok());
+    assert_eq!(
+        responses,
+        [
+            parse_error_response(),
+            parse_error_response(),
+            server_not_initialized_response(RequestId::Number(7_u64.into())),
+        ]
+    );
+}
+
+#[test]
+fn task7_adversarial_large_nested_arguments_reject_duplicate_key() {
+    const UNIQUE_ARGUMENTS: usize = 32 * 1024;
+    let mut input = Vec::with_capacity(768 * 1024);
+    input.extend_from_slice(br#"{"arguments":{"#);
+    for index in 0..UNIQUE_ARGUMENTS {
+        if index != 0 {
+            input.push(b',');
+        }
+        write!(input, "\"k{index}\":null").unwrap();
+    }
+    input.extend_from_slice(br#", "k0":null}}"#);
+
+    assert_eq!(
+        parse_strict_json(&input),
+        Err(StrictJsonError::DuplicateKey)
+    );
+}
+
+#[tokio::test]
+async fn task7_adversarial_json_rpc_like_output_is_one_line_one_copy_and_atomic() {
+    let payload = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"error\":{\"code\":-1}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\"}"
+    );
+    let response = result_response(
+        RequestId::String("hostile-output".into()),
+        serde_json::to_value(CallToolResult::text(payload)).unwrap(),
+    );
+    let exact = serde_json::to_vec(&response).unwrap().len();
+    let line = serialize_json_line(&response, exact).unwrap();
+
+    assert_eq!(line.iter().filter(|byte| **byte == b'\n').count(), 1);
+    assert_eq!(line.last(), Some(&b'\n'));
+    let parsed: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+    assert_eq!(count_exact_string(&parsed, payload), 1);
+
+    let (mut writer, written) = test_writer(false);
+    let error = write_json_line(&mut writer, &response, exact - 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "failed to serialize bounded JSON line");
+    assert!(written.lock().unwrap().is_empty());
+}
+
+#[test]
+fn task7_wide_json_rss_array_fresh_child() {
+    run_wide_json_rss_fresh_child(
+        "CODEX_SSH_BRIDGE_WIDE_ARRAY_RSS_CHILD",
+        "task7_wide_json_rss_array_fresh_child",
+        WideJsonShape::Array,
+    );
+}
+
+#[test]
+fn task7_wide_json_rss_object_fresh_child() {
+    run_wide_json_rss_fresh_child(
+        "CODEX_SSH_BRIDGE_WIDE_OBJECT_RSS_CHILD",
+        "task7_wide_json_rss_object_fresh_child",
+        WideJsonShape::Object,
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WideJsonShape {
+    Array,
+    Object,
+}
+
+fn run_wide_json_rss_fresh_child(child_environment: &str, test_name: &str, shape: WideJsonShape) {
+    if cfg!(debug_assertions) {
+        eprintln!("wide JSON RSS assertion is release-only for {shape:?}");
+        return;
+    }
+    if std::env::var_os(child_environment).is_some() {
+        wide_json_rss_child(shape);
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_environment, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprint!("{stdout}");
+    eprint!("{stderr}");
+    assert!(
+        output.status.success(),
+        "fresh {shape:?} wide-JSON RSS child failed: {stderr}"
+    );
+    let marker = format!("wide JSON {shape:?} release RSS:");
+    assert!(
+        stdout.contains(&marker) || stderr.contains(&marker),
+        "fresh {shape:?} wide-JSON RSS child did not run the requested test"
+    );
+}
+
+fn wide_json_rss_child(shape: WideJsonShape) {
+    use std::sync::Barrier;
+
+    const RSS_DELTA_CEILING_KIB: u64 = 48 * 1024;
+    const ROUNDS: usize = 4;
+
+    let input = Arc::new(match shape {
+        WideJsonShape::Array => wide_array(262_144),
+        WideJsonShape::Object => wide_object(131_072),
+    });
+    let touched = input
+        .iter()
+        .step_by(4096)
+        .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    std::hint::black_box(touched);
+    assert!(parse_strict_json(b"null").is_ok());
+
+    let start = Arc::new(Barrier::new(2));
+    let finish = Arc::new(Barrier::new(2));
+    let completed = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let input = Arc::clone(&input);
+        let start = Arc::clone(&start);
+        let finish = Arc::clone(&finish);
+        let completed = Arc::clone(&completed);
+        std::thread::spawn(move || {
+            start.wait();
+            for round in 0..ROUNDS {
+                let parsed = parse_strict_json(&input).unwrap();
+                match (&shape, &parsed) {
+                    (WideJsonShape::Array, Value::Array(values)) => {
+                        assert_eq!(values.len(), 262_143);
+                    }
+                    (WideJsonShape::Object, Value::Object(values)) => {
+                        assert_eq!(values.len(), 131_072);
+                    }
+                    _ => panic!("wide JSON shape changed"),
+                }
+                if round + 1 == ROUNDS {
+                    completed.store(true, Ordering::Release);
+                    finish.wait();
+                }
+                std::hint::black_box(&parsed);
+            }
+        })
+    };
+
+    let baseline = resident_kib_for_wide_json_rss();
+    let mut peak = baseline;
+    start.wait();
+    while !completed.load(Ordering::Acquire) {
+        peak = peak.max(resident_kib_for_wide_json_rss());
+        std::thread::sleep(Duration::from_micros(250));
+    }
+    for _ in 0..20 {
+        peak = peak.max(resident_kib_for_wide_json_rss());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    finish.wait();
+    worker.join().unwrap();
+
+    let delta = peak.saturating_sub(baseline);
+    eprintln!(
+        "wide JSON {shape:?} release RSS: baseline={baseline} KiB peak={peak} KiB delta={delta} KiB ceiling={RSS_DELTA_CEILING_KIB} KiB"
+    );
+    assert!(
+        delta < RSS_DELTA_CEILING_KIB,
+        "wide JSON {shape:?} RSS baseline={baseline} KiB peak={peak} KiB delta={delta} KiB"
+    );
+}
+
+fn resident_kib_for_wide_json_rss() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap()
 }
