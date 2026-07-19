@@ -37,6 +37,8 @@ const TOOL_NAMES: &[&str] = &[
 
 pub const CAPABILITY_PROBE_SCRIPT: &str = r#"
 set -u
+LC_ALL=C
+export LC_ALL
 
 requested_root=$1
 cd "$requested_root" || exit 1
@@ -52,6 +54,89 @@ case "$root_identity" in
 esac
 root_device=${root_identity%%:*}
 root_inode=${root_identity#*:}
+
+login_shell=
+uid_plus=$(id -u 2>/dev/null && printf x)
+uid_status=$?
+current_uid=
+if [ "$uid_status" -eq 0 ]; then
+    uid_with_delimiter=${uid_plus%x}
+    case "$uid_with_delimiter" in
+        *"$newline")
+            uid_record=${uid_with_delimiter%"$newline"}
+            case "$uid_record" in ''|*"$newline"*|*[!0-9]*) ;; *) current_uid=$uid_record ;; esac
+            ;;
+    esac
+fi
+passwd_record_matches_uid=0
+passwd_record_shell=
+parse_passwd_record() {
+    passwd_record_matches_uid=0
+    passwd_record_shell=
+    record=$1
+    case "$record" in *"$newline"*) return 1 ;; esac
+    rest=$record
+    passwd_name=${rest%%:*}; [ "$passwd_name" != "$rest" ] || return 1; rest=${rest#*:}
+    passwd_secret=${rest%%:*}; [ "$passwd_secret" != "$rest" ] || return 1; rest=${rest#*:}
+    passwd_uid=${rest%%:*}; [ "$passwd_uid" != "$rest" ] || return 1; rest=${rest#*:}
+    [ "$passwd_uid" = "$current_uid" ] || return 1
+    passwd_record_matches_uid=1
+    passwd_gid=${rest%%:*}; [ "$passwd_gid" != "$rest" ] || return 1; rest=${rest#*:}
+    passwd_gecos=${rest%%:*}; [ "$passwd_gecos" != "$rest" ] || return 1; rest=${rest#*:}
+    passwd_home=${rest%%:*}; [ "$passwd_home" != "$rest" ] || return 1; rest=${rest#*:}
+    candidate_shell=$rest
+    case "$candidate_shell" in *:*) return 1 ;; esac
+    if [ -z "$candidate_shell" ]; then candidate_shell=/bin/sh; fi
+    case "$candidate_shell" in /*) ;; *) return 1 ;; esac
+    [ "${#candidate_shell}" -le 4096 ] || return 1
+    [ -f "$candidate_shell" ] && [ -x "$candidate_shell" ] || return 1
+    passwd_record_shell=$candidate_shell
+}
+if [ -n "$current_uid" ]; then
+    getent_available=0
+    getent_status=127
+    if command -v getent >/dev/null 2>&1; then
+        getent_available=1
+        getent_plus=$(getent passwd "$current_uid" 2>/dev/null && printf x)
+        getent_status=$?
+        if [ "$getent_status" -eq 0 ]; then
+            getent_with_delimiter=${getent_plus%x}
+            case "$getent_with_delimiter" in
+                *"$newline")
+                    getent_record=${getent_with_delimiter%"$newline"}
+                    case "$getent_record" in
+                        ''|*"$newline"*) ;;
+                        *)
+                            if parse_passwd_record "$getent_record" &&
+                               [ "$passwd_record_matches_uid" -eq 1 ]; then
+                                login_shell=$passwd_record_shell
+                            fi
+                            ;;
+                    esac
+                    ;;
+            esac
+        fi
+    fi
+    if [ "$getent_available" -eq 0 ] && [ -f /etc/passwd ] && [ -r /etc/passwd ]; then
+        passwd_match_count=0
+        passwd_invalid_match=0
+        passwd_fallback_shell=
+        while IFS= read -r passwd_record || [ -n "$passwd_record" ]; do
+            if parse_passwd_record "$passwd_record"; then
+                if [ "$passwd_record_matches_uid" -eq 1 ]; then
+                    passwd_match_count=$((passwd_match_count + 1))
+                    passwd_fallback_shell=$passwd_record_shell
+                fi
+            elif [ "$passwd_record_matches_uid" -eq 1 ]; then
+                passwd_match_count=$((passwd_match_count + 1))
+                passwd_invalid_match=1
+            fi
+        done </etc/passwd
+        if [ "$passwd_match_count" -eq 1 ] && [ "$passwd_invalid_match" -eq 0 ]; then
+            login_shell=$passwd_fallback_shell
+        fi
+    fi
+fi
 
 emit_record() {
     printf '%s=%s\000' "$1" "$2"
@@ -607,6 +692,7 @@ emit_record ROOT_DEVICE "$root_device"
 emit_record ROOT_INODE "$root_inode"
 emit_record SHELL_KIND "$shell_kind"
 emit_record BASH_VERSION "$bash_version"
+emit_record LOGIN_SHELL "$login_shell"
 emit_record TOOL_mktemp "$tool_mktemp"
 emit_record TOOL_dd_nofollow "$tool_dd_nofollow"
 emit_record TOOL_sha256sum "$(has_tool sha256sum)"
@@ -642,10 +728,12 @@ pub struct Capability {
     pub root_inode: u64,
     pub shell: ShellKind,
     pub bash_version: Option<String>,
+    pub login_shell: Option<String>,
     pub tools: BTreeMap<String, bool>,
 }
 
 pub const MAX_SHELL_VERSION_BYTES: usize = 256;
+pub const MAX_LOGIN_SHELL_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellRequest {
@@ -691,10 +779,19 @@ pub fn select_shell(
             shell: ShellKind::PosixSh,
             fallback: false,
         }),
-        ShellRequest::Login => Ok(ShellSelection {
-            shell: ShellKind::Login,
-            fallback: false,
-        }),
+        ShellRequest::Login => {
+            if capability.login_shell.is_none() {
+                return Err(BridgeError::new(
+                    ErrorCode::RemoteCapabilityMissing,
+                    "remote account login shell could not be resolved safely",
+                    false,
+                ));
+            }
+            Ok(ShellSelection {
+                shell: ShellKind::Login,
+                fallback: false,
+            })
+        }
     }
 }
 
@@ -766,6 +863,18 @@ pub fn parse_probe_output(
         "sh" => return Err(protocol_error("sh capability has a Bash version")),
         _ => return Err(protocol_error("unknown shell capability")),
     };
+    let login_shell = match required(&records, "LOGIN_SHELL")? {
+        "" => None,
+        value => {
+            if value.len() > MAX_LOGIN_SHELL_BYTES
+                || value.bytes().any(|byte| byte.is_ascii_control())
+                || !value.starts_with('/')
+            {
+                return Err(protocol_error("login shell path is invalid"));
+            }
+            Some(value.to_owned())
+        }
+    };
 
     let tools = records
         .iter()
@@ -781,6 +890,7 @@ pub fn parse_probe_output(
         root_inode,
         shell,
         bash_version,
+        login_shell,
         tools,
     })
 }
@@ -788,7 +898,7 @@ pub fn parse_probe_output(
 fn validate_key_value(key: &str, value: &str) -> BridgeResult<()> {
     match key {
         "CODEX_SSH_PROBE" | "REQUESTED_ROOT" | "ROOT" | "ROOT_DEVICE" | "ROOT_INODE"
-        | "SHELL_KIND" | "BASH_VERSION" => Ok(()),
+        | "SHELL_KIND" | "BASH_VERSION" | "LOGIN_SHELL" => Ok(()),
         _ => match key.strip_prefix("TOOL_") {
             Some(name) if TOOL_NAMES.contains(&name) && matches!(value, "0" | "1") => Ok(()),
             Some(name) if !TOOL_NAMES.contains(&name) => {

@@ -127,7 +127,7 @@ case "$remote_command" in
 			run_fake_sleep "$FAKE_SSH_ROOT_OBSERVE_SLEEP_SECONDS"
 		fi
 		if [ "${FAKE_SSH_MODE:-echo-argv}" = local-fixed ]; then
-			/bin/sh -c "$remote_command"
+			"${FAKE_SSH_ACCOUNT_SHELL:-/bin/sh}" -c "$remote_command"
 			root_status=$?
 			if [ -n "${FAKE_SSH_ROOT_RETARGET_TRIGGER:-}" ] &&
 			   [ -e "$FAKE_SSH_ROOT_RETARGET_TRIGGER" ] &&
@@ -152,7 +152,7 @@ case "$remote_command" in
 	*CODEX_SSH_PROBE*)
 		log_call P "$@"
 		if [ "${FAKE_SSH_MODE:-echo-argv}" = local-fixed ]; then
-			exec /bin/sh -c "$remote_command"
+			exec "${FAKE_SSH_ACCOUNT_SHELL:-/bin/sh}" -c "$remote_command"
 		fi
 		if [ -n "${FAKE_SSH_PROBE_ERROR:-}" ]; then
             emit_fake_error "$FAKE_SSH_PROBE_ERROR"
@@ -175,6 +175,7 @@ case "$remote_command" in
         printf 'ROOT_INODE=%s\0' "${FAKE_SSH_ROOT_INODE:-1}"
         printf 'SHELL_KIND=%s\0' "$fake_shell"
         printf 'BASH_VERSION=%s\0' "$bash_version"
+        printf 'LOGIN_SHELL=%s\0' "${FAKE_SSH_LOGIN_SHELL-/bin/sh}"
         printf 'TOOL_mktemp=1\0'
         printf 'TOOL_dd_nofollow=1\0'
         printf 'TOOL_sha256sum=1\0'
@@ -304,20 +305,30 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
 		wait "$stderr_pid"
 		exit "${FAKE_SSH_EXIT_STATUS:-0}"
 		;;
-	large-candidates)
+	large-candidates|large-candidates-all-match)
 		case "$remote_command" in
 			*codex-sentinel-search-find*)
 				record_bytes=838
 				leaf_bytes=$((record_bytes - 10))
 				if [ "$leaf_bytes" -le 0 ]; then exit 2; fi
 				leaf=$(dd if=/dev/zero bs=1 count="$leaf_bytes" 2>/dev/null | tr '\000' x)
-				awk -v leaf="$leaf" 'BEGIN {
-					printf "./accept/%s%c", leaf, 0
-					for (i = 1; i < 10000; i++) printf "./reject/%s%c", leaf, 0
-				}'
+				if [ "${FAKE_SSH_MODE:-}" = large-candidates-all-match ]; then
+					awk -v leaf="$leaf" 'BEGIN {
+						for (i = 0; i < 10000; i++) printf "./accept/%s%c", leaf, 0
+					}'
+				else
+					awk -v leaf="$leaf" 'BEGIN {
+						printf "./accept/%s%c", leaf, 0
+						for (i = 1; i < 10000; i++) printf "./reject/%s%c", leaf, 0
+					}'
+				fi
 				lookahead_leaf_bytes=$((8608 - 10))
 				lookahead_leaf=$(dd if=/dev/zero bs=1 count="$lookahead_leaf_bytes" 2>/dev/null | tr '\000' y)
-				printf './reject/%s\000' "$lookahead_leaf"
+				if [ "${FAKE_SSH_MODE:-}" = large-candidates-all-match ]; then
+					printf './accept/%s\000' "$lookahead_leaf"
+				else
+					printf './reject/%s\000' "$lookahead_leaf"
+				fi
 				if [ -n "${FAKE_SSH_FIXED_SLEEP_SECONDS:-}" ]; then
 					run_fake_sleep "$FAKE_SSH_FIXED_SLEEP_SECONDS"
 				fi

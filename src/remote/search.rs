@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs, render_fixed_command};
+use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs};
 
 use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
 use super::{
@@ -381,9 +381,14 @@ pub(super) async fn search(
             &["grep_nul", "xargs_nul", "search_bound"],
         )
     };
-    let command_reserve = render_fixed_command(script, &args)
-        .map_err(&attach_candidates)?
-        .len();
+    let command_reserve = runner
+        .guarded_fixed_command_length(
+            &request.host,
+            &candidates_result.root_identity,
+            script,
+            &args,
+        )
+        .map_err(&attach_candidates)?;
     if command_reserve >= limits.max_frame_bytes {
         return Err(attach_candidates(BridgeError::new(
             ErrorCode::RequestTooLarge,

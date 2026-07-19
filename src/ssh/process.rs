@@ -83,21 +83,13 @@ s=$?
 exit "$s"
 "#;
 
-const LOGIN_ROOT_GUARD_SCRIPT: &str = r#"cd -P -- "$r" 2>/dev/null||exit 237
-x=$(pwd -P&&printf x)||exit 237
-x=${x%x};n='
-'
-x=${x%"$n"};[ "$x" = "$p" ]||exit 237
-x=$(stat -L -c %d:%i -- . 2>/dev/null)||x=$(stat -f %d:%i . 2>/dev/null)||exit 237
-[ "$x" = "$i" ]||exit 237
-(
+const LOGIN_OPERATION_SCRIPT: &str = r#"[ "$#" -eq 3 ]||exit 2
+cwd=$1
+login_shell=$2
+payload=$3
 CDPATH= cd -P -- "$cwd"||exit 126
-eval "$payload"
-)
-s=$?
-[ "$s" -ne 237 ]||exit 236
-exit "$s"
-"#;
+[ -f "$login_shell" ]&&[ -x "$login_shell" ]||exit 126
+exec "$login_shell" -c "$payload""#;
 
 const SSH_G_OPTIONS: &[&str] = &[
     "BatchMode=yes",
@@ -311,11 +303,18 @@ impl SshRunner {
                 .map_err(|_| BridgeError::invalid_argument("command timeout is too large"))?;
             let cwd = root_relative_one(&root, &request.cwd)?;
             let remote_command = if matches!(shell.shell, ShellKind::Login) {
-                render_login_root_guarded_command(
+                let login_shell = capability.login_shell.as_deref().ok_or_else(|| {
+                    BridgeError::new(
+                        ErrorCode::RemoteCapabilityMissing,
+                        "remote account login shell could not be resolved safely",
+                        false,
+                    )
+                })?;
+                render_guarded_fixed_command(
                     &root,
                     &observed_root,
-                    &cwd,
-                    &request.command,
+                    LOGIN_OPERATION_SCRIPT,
+                    &[cwd, login_shell.to_owned(), request.command.clone()],
                     limits.max_frame_bytes,
                 )?
             } else {
@@ -400,6 +399,17 @@ impl SshRunner {
 
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn guarded_fixed_command_length(
+        &self,
+        host: &str,
+        identity: &RootIdentity,
+        operation: &'static str,
+        args: &[String],
+    ) -> BridgeResult<usize> {
+        let root = &self.config.host(host)?.profile.root;
+        render_inlined_root_guard_length(root, identity, operation, args)
     }
 
     pub(crate) async fn prepare_host(
@@ -1629,48 +1639,6 @@ fn render_root_guarded_command(
     render_inlined_root_guard(requested_root, identity, operation, &[], maximum)
 }
 
-fn render_login_root_guarded_command(
-    requested_root: &str,
-    identity: &RootIdentity,
-    cwd: &str,
-    payload: &str,
-    maximum: usize,
-) -> BridgeResult<String> {
-    let inode = format!("{}:{}", identity.device, identity.inode);
-    let requested_root = PreparedShellWord::new(requested_root)?;
-    let physical_root = PreparedShellWord::new(&identity.physical_root)?;
-    let inode = PreparedShellWord::new(&inode)?;
-    let cwd = PreparedShellWord::new(cwd)?;
-    let payload = PreparedShellWord::new(payload)?;
-    const PREFIXES: [&str; 5] = ["r=", "\np=", "\ni=", "\ncwd=", "\npayload="];
-    let length = checked_rendered_length([
-        PREFIXES.iter().map(|prefix| prefix.len()).sum(),
-        requested_root.len(),
-        physical_root.len(),
-        inode.len(),
-        cwd.len(),
-        payload.len(),
-        1,
-        LOGIN_ROOT_GUARD_SCRIPT.len(),
-    ])?;
-    ensure_rendered_bound(length, maximum)?;
-    let mut rendered = String::with_capacity(length);
-    rendered.push_str(PREFIXES[0]);
-    requested_root.push_to(&mut rendered)?;
-    rendered.push_str(PREFIXES[1]);
-    physical_root.push_to(&mut rendered)?;
-    rendered.push_str(PREFIXES[2]);
-    inode.push_to(&mut rendered)?;
-    rendered.push_str(PREFIXES[3]);
-    cwd.push_to(&mut rendered)?;
-    rendered.push_str(PREFIXES[4]);
-    payload.push_to(&mut rendered)?;
-    rendered.push('\n');
-    rendered.push_str(LOGIN_ROOT_GUARD_SCRIPT);
-    debug_assert_eq!(rendered.len(), length);
-    Ok(rendered)
-}
-
 fn render_inlined_root_guard(
     requested_root: &str,
     identity: &RootIdentity,
@@ -1678,6 +1646,9 @@ fn render_inlined_root_guard(
     operation_args: &[String],
     maximum: usize,
 ) -> BridgeResult<String> {
+    let length =
+        render_inlined_root_guard_length(requested_root, identity, operation, operation_args)?;
+    ensure_rendered_bound(length, maximum)?;
     let device = identity.device.to_string();
     let inode = identity.inode.to_string();
     let script = PreparedShellWordParts::new([ROOT_GUARD_PREFIX, operation, ROOT_GUARD_SUFFIX])?;
@@ -1691,15 +1662,6 @@ fn render_inlined_root_guard(
         .iter()
         .map(|argument| PreparedShellWord::new(argument))
         .collect::<BridgeResult<Vec<_>>>()?;
-    let length = fixed_args.iter().chain(&operation_args).try_fold(
-        checked_rendered_length([
-            FIXED_COMMAND_PREFIX.len(),
-            script.len(),
-            FIXED_COMMAND_ARG0.len(),
-        ])?,
-        |length, argument| checked_rendered_length([length, 1, argument.len()]),
-    )?;
-    ensure_rendered_bound(length, maximum)?;
     let mut rendered = String::with_capacity(length);
     rendered.push_str(FIXED_COMMAND_PREFIX);
     script.push_to(&mut rendered)?;
@@ -1710,6 +1672,35 @@ fn render_inlined_root_guard(
     }
     debug_assert_eq!(rendered.len(), length);
     Ok(rendered)
+}
+
+fn render_inlined_root_guard_length(
+    requested_root: &str,
+    identity: &RootIdentity,
+    operation: &str,
+    operation_args: &[String],
+) -> BridgeResult<usize> {
+    let device = identity.device.to_string();
+    let inode = identity.inode.to_string();
+    let script = PreparedShellWordParts::new([ROOT_GUARD_PREFIX, operation, ROOT_GUARD_SUFFIX])?;
+    let fixed_args = [
+        PreparedShellWord::new(requested_root)?,
+        PreparedShellWord::new(&identity.physical_root)?,
+        PreparedShellWord::new(&device)?,
+        PreparedShellWord::new(&inode)?,
+    ];
+    let operation_args = operation_args
+        .iter()
+        .map(|argument| PreparedShellWord::new(argument))
+        .collect::<BridgeResult<Vec<_>>>()?;
+    fixed_args.iter().chain(&operation_args).try_fold(
+        checked_rendered_length([
+            FIXED_COMMAND_PREFIX.len(),
+            script.len(),
+            FIXED_COMMAND_ARG0.len(),
+        ])?,
+        |length, argument| checked_rendered_length([length, 1, argument.len()]),
+    )
 }
 
 fn parse_root_observation(output: &[u8]) -> BridgeResult<RootIdentity> {
