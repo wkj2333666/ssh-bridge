@@ -37,6 +37,28 @@ struct RealSshFixture {
     daemon_pid: u32,
 }
 
+fn fixture_or_skip<T>(setup: Result<T, String>, required: bool) -> Option<T> {
+    match setup {
+        Ok(fixture) => Some(fixture),
+        Err(reason) if required => {
+            panic!("required real SSH integration unavailable: {reason}")
+        }
+        Err(_) => None,
+    }
+}
+
+#[test]
+fn required_mode_skips_unavailable_setup_only_when_not_required() {
+    let reason = "fixture bind was denied";
+    assert_eq!(fixture_or_skip::<()>(Err(reason.to_owned()), false), None);
+}
+
+#[test]
+#[should_panic(expected = "required real SSH integration unavailable: fixture bind was denied")]
+fn required_mode_panics_with_original_setup_reason_when_required() {
+    let _ = fixture_or_skip::<()>(Err("fixture bind was denied".to_owned()), true);
+}
+
 impl RealSshFixture {
     fn start() -> Result<Self, String> {
         for executable in ["/usr/sbin/sshd", "/usr/bin/ssh", "/usr/bin/ssh-keygen"] {
@@ -422,12 +444,14 @@ impl Drop for RealSshFixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_localhost_sshd_covers_transport_shell_files_mutation_and_cancellation() {
-    let fixture = match RealSshFixture::start() {
-        Ok(fixture) => fixture,
-        Err(reason) => {
-            eprintln!("SKIP real SSH integration: {reason}");
-            return;
-        }
+    let required = std::env::var("CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH").as_deref() == Ok("1");
+    let setup = RealSshFixture::start();
+    if !required && let Err(reason) = &setup {
+        eprintln!("SKIP real SSH integration: {reason}");
+    }
+    let fixture = match fixture_or_skip(setup, required) {
+        Some(fixture) => fixture,
+        None => return,
     };
     let (runtime_base, runtime, runner, bridge) = fixture.bridge().expect("build real SSH bridge");
 

@@ -2047,10 +2047,12 @@ async fn task8_five_hosts_pipeline_in_parallel_with_exact_context_and_no_sixth_c
             "host output was interleaved or lost: {text}"
         );
     }
+    let mut call_kinds = transport_call_kinds(&log);
+    call_kinds.sort_unstable();
     assert_eq!(
-        transport_call_kinds(&log),
-        vec!["C"; 5],
-        "a sixth or non-command implicit SSH call occurred"
+        call_kinds,
+        [vec!["C"; 5], vec!["G"; 5]].concat(),
+        "each warm operation must perform exactly one identity revalidation and one command"
     );
     eprintln!("five-host MCP release sample: elapsed={elapsed:?}");
     session.close().await;

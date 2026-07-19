@@ -42,13 +42,16 @@ const HARDENED_OPTIONS: &[&str] = &[
     "RequestTTY=no",
     "ControlMaster=auto",
     "ControlPersist=300",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=3",
 ];
 const LONG_XDG_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_LONG_XDG_CHILD_EXPECTED";
 const RESTRICTIVE_UMASK_CHILD_SENTINEL: &str = "CODEX_SSH_BRIDGE_RESTRICTIVE_UMASK_BASE";
 
-fn option_is_distinct(argv: &[OsString], expected: &str) -> bool {
+fn distinct_option_count(argv: &[OsString], expected: &str) -> usize {
     argv.windows(2)
-        .any(|pair| pair[0] == OsStr::new("-o") && pair[1] == OsStr::new(expected))
+        .filter(|pair| pair[0] == OsStr::new("-o") && pair[1] == OsStr::new(expected))
+        .count()
 }
 
 fn policy(
@@ -130,9 +133,10 @@ fn argv_uses_hardened_distinct_options_and_a_private_hashed_control_path() {
     let argv = build_ssh_argv(&ssh_policy, "dev-box", "printf safe");
 
     for expected in HARDENED_OPTIONS {
-        assert!(
-            option_is_distinct(&argv, expected),
-            "missing distinct option {expected:?} in {argv:?}"
+        assert_eq!(
+            distinct_option_count(&argv, expected),
+            1,
+            "expected one distinct option {expected:?} in {argv:?}"
         );
     }
     let control_option = argv
@@ -1610,7 +1614,7 @@ fn force_kill_process(pid: u32) {
 }
 
 #[tokio::test]
-async fn runner_resolves_once_probes_once_and_uses_hardened_ssh_g() {
+async fn runner_revalidates_each_operation_probes_once_and_uses_hardened_ssh_g() {
     let log_dir = TempDir::new().unwrap();
     let log = log_dir.path().join("calls.log");
     let fixture = task3_runner(
@@ -1635,8 +1639,9 @@ async fn runner_resolves_once_probes_once_and_uses_hardened_ssh_g() {
     }
 
     let calls = fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 2);
     assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 2);
     assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
     for option in [
         "BatchMode=yes",
@@ -1647,13 +1652,86 @@ async fn runner_resolves_once_probes_once_and_uses_hardened_ssh_g() {
         "PermitLocalCommand=no",
         "RequestTTY=no",
         "ControlPersist=300",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=3",
     ] {
-        assert!(calls.contains(&format!("arg={option}")), "{calls}");
+        for call in calls.split("END\n").filter(|call| !call.is_empty()) {
+            assert_eq!(
+                call.lines()
+                    .filter(|line| *line == format!("arg={option}"))
+                    .count(),
+                1,
+                "option={option:?}, call={call:?}"
+            );
+        }
     }
     let config_call = calls.split("END\n").next().unwrap();
     assert!(!config_call.contains("ControlMaster="));
     assert!(!config_call.contains("ControlPath="));
     assert!(config_call.contains("arg=--\narg=dev\n"));
+}
+
+#[tokio::test]
+async fn resolved_identity_drift_is_rejected_before_remote_business_execution() {
+    let files = TempDir::new().unwrap();
+    let identity_file = files.path().join("resolved-identity");
+    let log = files.path().join("calls.log");
+    fs::write(
+        &identity_file,
+        b"hostname fake.internal\nuser fixture\nport 22\n",
+    )
+    .unwrap();
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+            (
+                "FAKE_SSH_G_IDENTITY_FILE",
+                identity_file.display().to_string(),
+            ),
+        ],
+    );
+
+    fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let before = fs::read_to_string(&log).unwrap();
+    assert_eq!(before.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(before.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(before.lines().filter(|line| *line == "R").count(), 1);
+    assert_eq!(before.lines().filter(|line| *line == "C").count(), 1);
+
+    fs::write(
+        &identity_file,
+        b"hostname replacement.internal\nuser fixture\nport 22\n",
+    )
+    .unwrap();
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+    assert!(!error.retryable);
+    assert!(error.message.contains("verify the alias"), "{error:?}");
+    assert!(error.message.contains("restart the bridge"), "{error:?}");
+
+    let after = fs::read_to_string(log).unwrap();
+    assert_eq!(after.lines().filter(|line| *line == "G").count(), 2);
+    assert_eq!(after.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(after.lines().filter(|line| *line == "R").count(), 1);
+    assert_eq!(after.lines().filter(|line| *line == "C").count(), 1);
 }
 
 #[tokio::test]
@@ -1704,7 +1782,7 @@ async fn cached_host_reconnect_command_still_carries_configured_connect_timeout(
     assert!(started.elapsed() < Duration::from_secs(1));
 
     let calls = fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 2);
     assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
     assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
     for call in calls.split("END\n").filter(|call| !call.is_empty()) {

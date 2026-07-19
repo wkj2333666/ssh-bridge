@@ -34,11 +34,15 @@ Every operational SSH call forces separate `-o` arguments for:
 | `RequestTTY=no` | Keep operations non-interactive |
 | `ControlMaster=auto` | Reuse a private connection when safe |
 | `ControlPersist=300` | Keep the private master for five minutes |
+| `ServerAliveInterval=15` | Detect a silent encrypted-transport failure every 15 seconds |
+| `ServerAliveCountMax=3` | Stop after three unanswered encrypted keepalives |
 | `ControlPath=<private hashed path>` | Avoid public/predictable sockets and cross-profile masters |
 
-Connection setup also applies the configured `ConnectTimeout`. SSHFS adds encrypted `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and `reconnect`. It inherits the same hardening, never enables `allow_other`, and forces `ro` for a read-only profile.
+Connection setup also applies the configured `ConnectTimeout`. Ordinary SSH and SSHFS both inherit the two server-alive options exactly once; SSHFS additionally applies `reconnect`, never enables `allow_other`, and forces `ro` for a read-only profile.
 
-The bridge first runs bounded `ssh -G` with the security-critical options to resolve one concrete connection identity. Pattern-only aliases are not added to the bridge config. Host aliases are passed after `--`, and the MCP surface accepts no arbitrary SSH option.
+Before every operation, the bridge runs bounded `ssh -G` with the security-critical options and hashes the resulting configuration. The first digest for an alias becomes immutable connection trust for that bridge process; every later digest must match before capability probing, root observation, or command execution. A mismatch is non-retryable `INVALID_CONFIG` and never replaces the pinned digest or ControlPath identity. Pattern-only aliases are not added to the bridge config. Host aliases are passed after `--`, and the MCP surface accepts no arbitrary SSH option.
+
+The local Unix user and that user's OpenSSH configuration remain trusted execution authority. A same-UID process can change configuration after the `ssh -G` comparison and before the following OpenSSH invocation; that exact post-check race is inside the same-UID trust boundary, not a claimed hostile-local isolation boundary. Restart the bridge only after reviewing an intentional alias change.
 
 ## Command and shell handling
 
@@ -103,7 +107,7 @@ cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --test cli
 cargo test --release --test performance_acceptance -- --nocapture
-cargo test --release --test real_ssh -- --nocapture
+CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
 
 Final acceptance also runs the predictable-temp symlink regression, 16 MiB stdout+stderr serialization case, oversized-frame recovery, SSHFS policy/race tests, CRLF OpenSSH diagnostic classification, and an isolated real-OpenSSH fixture. The recorded real fixture ran successfully without a skip.

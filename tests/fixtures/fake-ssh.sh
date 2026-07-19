@@ -99,6 +99,8 @@ if [ "$is_config" = 1 ]; then
     fi
     if [ -n "${FAKE_SSH_G_STDOUT_BYTES:-}" ]; then
         emit_bytes "$FAKE_SSH_G_STDOUT_BYTES" stdout
+    elif [ -n "${FAKE_SSH_G_IDENTITY_FILE:-}" ]; then
+        cat -- "$FAKE_SSH_G_IDENTITY_FILE"
     else
         if [ "${FAKE_SSH_G_NON_UTF8:-0}" = 1 ]; then
             printf '\377'

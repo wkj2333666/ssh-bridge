@@ -7360,7 +7360,7 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
         elapsed < Duration::from_secs(5),
         "five-host debug stress took {elapsed:?}"
     );
-    assert_eq!(ssh_call_count(&ssh_log, "G"), 5);
+    assert_eq!(ssh_call_count(&ssh_log, "G"), 10);
     assert_eq!(ssh_call_count(&ssh_log, "P"), 5);
     assert_eq!(ssh_call_count(&ssh_log, "R"), 10);
     assert_eq!(ssh_call_count(&ssh_log, "C"), 10);

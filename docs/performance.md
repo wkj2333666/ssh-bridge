@@ -20,7 +20,7 @@ cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture
 cargo test --release --test performance_acceptance -- --nocapture
-cargo test --release --test real_ssh -- --nocapture
+CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
 
 Latency tests warm the relevant path, collect at least 120 samples, sort raw durations, and enforce the compiled p95 thresholds. RSS tests run fresh child processes and report warmed baseline, observed peak, and delta from `/proc/self/status`.
@@ -29,17 +29,17 @@ Latency tests warm the relevant path, collect at least 120 samples, sort raw dur
 
 | Case | Samples / shape | Observed | Gate |
 |---|---:|---:|---:|
-| Bridge-only MCP dispatch | 200 | p50 5.018 µs, p95 5.074 µs, max 14.721 µs | p95 < 2 ms |
-| Complete fake-SSH MCP call | 120 | p50 2.410883 ms, p95 3.247292 ms, max 4.798381 ms | p95 < 10 ms |
-| Five hosts, one-second command each | 5 concurrent | 1.020937772 s wall time; resolve/probe/root-observe/command calls each exactly 5 | < 1.5 s |
-| Cancellation to whole process-group exit | one TERM-ignoring fixture | 51.378987 ms | < 250 ms |
-| 64 MiB output plus retained models | fresh child | baseline 3,952 KiB, peak 6,224 KiB, delta 2,272 KiB | < 16 MiB |
-| Maximum-budget wide JSON array | fresh child | RSS delta 8,592 KiB | < 48 MiB |
-| Maximum-budget wide JSON object | separate fresh child | RSS delta 17,280 KiB | < 48 MiB |
+| Bridge-only MCP dispatch | 200 | p50 5.185 µs, p95 7.037 µs, max 93.573 µs | p95 < 2 ms |
+| Complete fake-SSH MCP call | 120 | p50 4.221506 ms, p95 6.492056 ms, max 22.822008 ms | p95 < 10 ms |
+| Five hosts, one-second command each | 5 concurrent | 1.027630313 s wall time; resolve/probe/root-observe/command calls each exactly 5 | < 1.5 s |
+| Cancellation to whole process-group exit | one TERM-ignoring fixture | 51.621590 ms | < 250 ms |
+| 64 MiB output plus retained models | fresh child | baseline 3,968 KiB, peak 6,272 KiB, delta 2,304 KiB | < 16 MiB |
+| Maximum-budget wide JSON array | fresh child | RSS delta 8,528 KiB | < 48 MiB |
+| Maximum-budget wide JSON object | separate fresh child | RSS delta 17,216 KiB | < 48 MiB |
 | Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
 | Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 
-The fake-SSH p95 includes the per-operation root-observation process, command process, and complete bridge/MCP rendering path, but not a network round trip. The five-host test asserts one `G`, `P`, `R`, and `C` call per host, so omitting or duplicating root validation cannot make the timing gate pass silently. The result demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond the configured limits.
+The fake-SSH p95 includes per-operation `ssh -G` identity revalidation, the root-observation process, command process, and complete bridge/MCP rendering path, but not a network round trip. The five-host test asserts one `G`, `P`, `R`, and `C` call per host, so omitting or duplicating identity or root validation cannot make the timing gate pass silently. The result demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond the configured limits.
 
 ## Why memory stays bounded
 
@@ -65,4 +65,4 @@ The final `tests/performance_acceptance.rs` run repeated every gate above in rel
 
 `tests/real_ssh.rs` generated temporary Ed25519 host, client, and wrong-host keys; launched an unprivileged OpenSSH 10.0p2 `sshd` on a localhost high port; and completed in 2.80 seconds with one pass, zero failures, and no skip. It verified strict known-host rejection, public-key login, ControlMaster inode reuse, physical-root observations, trusted account-login-shell resolution, explicit Bash, explicit sh, visible auto-to-sh fallback, hostile quoting, list/stat/read/fixed-string search, guarded write/patch, timeout, cancellation uncertainty, and identity-checked cleanup of the master sockets, remote test processes, and daemon.
 
-The managed sandbox denies local `bind(2)`, so the final fixture was run with approved local-network execution. If a host genuinely lacks the required local facilities, the test prints one explicit skip reason; this recorded run did not skip.
+The managed sandbox denies local `bind(2)`, so the final fixture was run with approved local-network execution. Developer runs without `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1` retain one visible skip reason when facilities are unavailable. Release acceptance uses the required-mode command above: setup failure is fatal, so a required run cannot report a skip as a pass. The recorded real-SSH run completed without a skip.

@@ -19,7 +19,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{RuntimePaths, SshPolicy, build_ssh_argv, openssh_connect_timeout_option};
+use super::{
+    RuntimePaths, SshPolicy, build_ssh_argv, openssh_connect_timeout_option, server_alive_options,
+};
 use crate::capability::{
     CAPABILITY_PROBE_SCRIPT, Capability, CapabilityCache, ShellKind, ShellRequest, ShellSelection,
     parse_probe_output, select_shell,
@@ -739,18 +741,22 @@ impl SshRunner {
         connect_timeout_ms: u64,
         cancel: &CancellationToken,
     ) -> BridgeResult<(SshPolicy, Arc<Capability>, RootIdentity)> {
-        let cached_identity = self.identities.lock().await.get(host).cloned();
-        let identity = match cached_identity {
-            Some(identity) => identity,
-            None => {
-                let identity = self
-                    .resolve_identity_once(host, connect_timeout_ms, cancel)
-                    .await?;
-                self.identities
-                    .lock()
-                    .await
-                    .insert(host.to_owned(), identity.clone());
-                identity
+        let resolved_identity = self
+            .resolve_identity_once(host, connect_timeout_ms, cancel)
+            .await?;
+        let identity = {
+            let mut identities = self.identities.lock().await;
+            match identities.get(host) {
+                Some(identity) if identity != &resolved_identity => {
+                    return Err(BridgeError::invalid_config(
+                        "resolved SSH connection identity changed; verify the alias and restart the bridge",
+                    ));
+                }
+                Some(identity) => identity.clone(),
+                None => {
+                    identities.insert(host.to_owned(), resolved_identity.clone());
+                    resolved_identity
+                }
             }
         };
         let policy = SshPolicy::for_host(
@@ -792,6 +798,10 @@ impl SshRunner {
             argv.push(OsString::from("-o"));
             argv.push(OsString::from(option));
         }
+        for option in server_alive_options() {
+            argv.push(OsString::from("-o"));
+            argv.push(option);
+        }
         argv.push(OsString::from("-o"));
         argv.push(openssh_connect_timeout_option(connect_timeout_ms));
         argv.push(OsString::from("--"));
@@ -816,7 +826,9 @@ impl SshRunner {
             )
             .await
             .map_err(|error| {
-                if error.code == ErrorCode::OutputLimit {
+                if error.code == ErrorCode::OutputLimit
+                    && error.message == "command output exceeded the configured limit"
+                {
                     BridgeError::new(
                         ErrorCode::ProtocolError,
                         "resolved SSH configuration exceeded its output limit",
