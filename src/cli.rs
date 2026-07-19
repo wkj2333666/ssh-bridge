@@ -294,6 +294,22 @@ pub struct MountStatus {
 }
 
 pub fn parse_sshfs_mount_status(bytes: &[u8], mountpoint: &Path) -> BridgeResult<MountStatus> {
+    parse_sshfs_mount_status_matching(bytes, mountpoint, None)
+}
+
+fn parse_sshfs_mount_status_for_id(
+    bytes: &[u8],
+    mountpoint: &Path,
+    expected_mount_id: u64,
+) -> BridgeResult<MountStatus> {
+    parse_sshfs_mount_status_matching(bytes, mountpoint, Some(expected_mount_id))
+}
+
+fn parse_sshfs_mount_status_matching(
+    bytes: &[u8],
+    mountpoint: &Path,
+    expected_mount_id: Option<u64>,
+) -> BridgeResult<MountStatus> {
     if !mountpoint.is_absolute() {
         return Err(BridgeError::invalid_argument(
             "mount-status requires an absolute local path",
@@ -331,6 +347,9 @@ pub fn parse_sshfs_mount_status(bytes: &[u8], mountpoint: &Path) -> BridgeResult
             .map_err(|_| BridgeError::invalid_argument("mountinfo mount ID is not UTF-8"))?
             .parse::<u64>()
             .map_err(|_| BridgeError::invalid_argument("mountinfo mount ID is invalid"))?;
+        if expected_mount_id.is_some_and(|expected| mount_id != expected) {
+            continue;
+        }
         let filesystem = after
             .split(|byte| *byte == b' ')
             .next()
@@ -459,7 +478,7 @@ where
     let opened_mount_id = mountpoint.mount_id()?;
     let mountinfo = read_mountinfo()?;
     mountpoint.ensure_path_binding()?;
-    let status = parse_sshfs_mount_status(&mountinfo, mountpoint.path())?;
+    let status = parse_sshfs_mount_status_for_id(&mountinfo, mountpoint.path(), opened_mount_id)?;
     if !status.sshfs {
         return Err(BridgeError::invalid_argument(
             "refusing to unmount a path that is not currently an SSHFS mount",
@@ -1136,5 +1155,17 @@ mod sshfs_identity_tests {
 
         assert!(result.is_err());
         assert!(!helper_log.exists());
+    }
+
+    #[test]
+    fn stacked_mountinfo_selects_the_record_for_the_opened_mount_id() {
+        let mountpoint = Path::new("/mnt/stacked");
+        let bytes = b"40 25 0:31 / /mnt/stacked rw - fuse.other old rw\n\
+                      41 25 0:32 / /mnt/stacked rw - fuse.sshfs current rw\n";
+
+        let status = parse_sshfs_mount_status_for_id(bytes, mountpoint, 41).unwrap();
+
+        assert!(status.sshfs);
+        assert_eq!(status.mount_id, Some(41));
     }
 }
