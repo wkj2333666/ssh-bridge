@@ -702,7 +702,9 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
     .unwrap();
 
     for _ in 0..2 {
-        let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(2));
+        // The deliberately 65 KiB root exercises the protocol boundary and can
+        // take longer on a busy CI runner than the ordinary transport tests.
+        let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(10));
         run.cwd = root.clone();
         let result = runner.execute(run, CancellationToken::new()).await.unwrap();
         assert_eq!(result.physical_root, root);
@@ -1233,7 +1235,7 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
         (
             "safe_write",
             "chmod",
-            "case \" $* \" in *codex-probe-safe-write*chmod-link*) exit 64;; esac\nexec /usr/bin/chmod \"$@\"\n",
+            "case \" $* \" in */proc/self/fd/*) exit 64;; esac\nexec /usr/bin/chmod \"$@\"\n",
         ),
         (
             "guarded_delete",
