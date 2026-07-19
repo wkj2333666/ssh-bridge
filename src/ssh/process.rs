@@ -282,6 +282,30 @@ impl SshRunner {
         &self.config
     }
 
+    pub(crate) async fn prepare_host(
+        &self,
+        host: &str,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<(SshPolicy, Arc<Capability>)> {
+        let resolved = self.config.host(host)?;
+        let root = resolved.profile.root.clone();
+        let limits = resolved.limits;
+        let initializer = self.initializer(host).await;
+        let initialize_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(cancelled_error(false, 0)),
+            guard = initializer.lock() => guard,
+        };
+        let _reservation = self
+            .acquire_operation(host, limits.per_host_concurrency, cancel)
+            .await?;
+        let prepared = self
+            .initialize_host(host, &root, limits.connect_timeout_ms, cancel)
+            .await;
+        drop(initialize_guard);
+        prepared
+    }
+
     pub(crate) async fn cached_capability(&self, host: &str) -> Option<Arc<Capability>> {
         self.capabilities.get(host).await
     }
