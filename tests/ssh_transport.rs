@@ -670,30 +670,24 @@ fn task78_physical_root_byte_bound_bash_version_and_spoofed_values_are_enforced(
 
 #[tokio::test]
 async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() {
-    let root = format!("/{}a", "é".repeat(32_767));
+    // Keep the integration command below well under execve's aggregate argv
+    // limit on GitHub-hosted runners; the exact 64 KiB parser boundary is
+    // covered by the direct probe tests immediately above.
+    let root = format!("/{}a", "é".repeat(16_383));
     let version = format!("{}aa", "é".repeat(127));
-    assert_eq!(root.len(), 65_536);
+    assert_eq!(root.len(), 32_768);
     assert_eq!(version.len(), 256);
 
     let base = TempDir::new().unwrap();
     let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
     let store = Arc::new(OutputStore::new(&runtime).unwrap());
-    let root_file = base.path().join("remote-root");
-    fs::write(&root_file, &root).unwrap();
     let log = base.path().join("cache.log");
     let environment = BTreeMap::from([
         (
             OsString::from("FAKE_SSH_MODE"),
             OsString::from("echo-command"),
         ),
-        // Keep the huge boundary value out of the child environment. GitHub
-        // runners have a much larger inherited environment than local runs;
-        // passing the 64 KiB root inline can otherwise hit execve's aggregate
-        // environment limit before the fake SSH process starts.
-        (
-            OsString::from("FAKE_SSH_ROOT_FILE"),
-            root_file.as_os_str().to_owned(),
-        ),
+        (OsString::from("FAKE_SSH_ROOT"), OsString::from(&root)),
         (OsString::from("FAKE_SSH_SHELL"), OsString::from("bash")),
         (
             OsString::from("FAKE_SSH_BASH_VERSION"),
@@ -711,8 +705,6 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
     .unwrap();
 
     for _ in 0..2 {
-        // The deliberately 65 KiB root exercises the protocol boundary and can
-        // take longer on a busy CI runner than the ordinary transport tests.
         let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(10));
         run.cwd = root.clone();
         let result = runner
