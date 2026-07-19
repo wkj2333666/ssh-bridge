@@ -33,7 +33,7 @@ use crate::output::{
     OutputProvenance, OutputReference, OutputStore, StderrSignals, StoredProvenance, StreamKind,
 };
 use crate::path::RemotePath;
-use crate::quote::{PreparedShellWord, shell_word};
+use crate::quote::{PreparedShellWord, PreparedShellWordParts, shell_word};
 
 const DEFAULT_SSH_EXECUTABLE: &str = "/usr/bin/ssh";
 const RESOLVED_STDOUT_LIMIT: u64 = 1024 * 1024;
@@ -47,7 +47,7 @@ const ROOT_OBSERVE_PROTOCOL_RESERVE: u64 = 128;
 
 const ROOT_OBSERVE_SCRIPT: &str = r#"set -u
 [ "$#" -eq 1 ] || exit 2
-cd -- "$1" || exit 3
+cd -P -- "$1" || exit 3
 physical_plus=$(pwd -P && printf x) || exit 3
 physical_with_delimiter=${physical_plus%x}
 newline='
@@ -66,7 +66,7 @@ const ROOT_GUARD_PREFIX: &str = r#"set -u
 [ "$#" -ge 4 ] || exit 2
 r=$1;p=$2;i=$3:$4
 shift 4
-cd -- "$r" 2>/dev/null||exit 237
+cd -P -- "$r" 2>/dev/null||exit 237
 x=$(pwd -P&&printf x)||exit 237
 x=${x%x};n='
 '
@@ -77,6 +77,22 @@ x=$(stat -L -c %d:%i -- . 2>/dev/null)||x=$(stat -f %d:%i . 2>/dev/null)||exit 2
 "#;
 
 const ROOT_GUARD_SUFFIX: &str = r#"
+)
+s=$?
+[ "$s" -ne 237 ]||exit 236
+exit "$s"
+"#;
+
+const LOGIN_ROOT_GUARD_SCRIPT: &str = r#"cd -P -- "$r" 2>/dev/null||exit 237
+x=$(pwd -P&&printf x)||exit 237
+x=${x%x};n='
+'
+x=${x%"$n"};[ "$x" = "$p" ]||exit 237
+x=$(stat -L -c %d:%i -- . 2>/dev/null)||x=$(stat -f %d:%i . 2>/dev/null)||exit 237
+[ "$x" = "$i" ]||exit 237
+(
+CDPATH= cd -P -- "$cwd"||exit 126
+eval "$payload"
 )
 s=$?
 [ "$s" -ne 237 ]||exit 236
@@ -163,6 +179,7 @@ pub struct SshRunner {
     executable: PathBuf,
     environment: BTreeMap<OsString, OsString>,
     capabilities: CapabilityCache,
+    trusted_roots: Mutex<HashMap<String, RootIdentity>>,
     observed_roots: Mutex<HashMap<String, RootIdentity>>,
     identities: Mutex<HashMap<String, String>>,
     initializers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -214,6 +231,7 @@ impl SshRunner {
             executable,
             environment,
             capabilities: CapabilityCache::default(),
+            trusted_roots: Mutex::new(HashMap::new()),
             observed_roots: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
             initializers: Mutex::new(HashMap::new()),
@@ -246,7 +264,7 @@ impl SshRunner {
             return Err(cancelled_error(false, 0));
         }
 
-        let (policy, capability) = self
+        let (policy, capability, trusted_root) = self
             .initialize_host(&request.host, &root, limits.connect_timeout_ms, &cancel)
             .await?;
         drop(initialize_guard);
@@ -277,11 +295,6 @@ impl SshRunner {
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
-        let trusted_root = RootIdentity {
-            physical_root: capability.physical_root.clone(),
-            device: capability.root_device,
-            inode: capability.root_inode,
-        };
         if observed_root != trusted_root {
             return Err(attach_selected_context(
                 root_drift_error(FixedOperationKind::Mutation),
@@ -296,17 +309,31 @@ impl SshRunner {
             let remaining = remaining_timeout(operation_deadline)?;
             let timeout_ms = u64::try_from(remaining.as_millis())
                 .map_err(|_| BridgeError::invalid_argument("command timeout is too large"))?;
-            let remote_command = render_remote_command(
-                &request.command,
-                &reroot_one(&root, &observed_root.physical_root, &request.cwd)?,
-                &shell.shell,
-                remote_timeout,
-                timeout_ms,
-                limits.max_frame_bytes,
-            )?;
-            let remote_command =
-                render_root_guarded_command(&root, &observed_root, &remote_command)?;
-            ensure_rendered_bound(remote_command.len(), limits.max_frame_bytes)?;
+            let cwd = root_relative_one(&root, &request.cwd)?;
+            let remote_command = if matches!(shell.shell, ShellKind::Login) {
+                render_login_root_guarded_command(
+                    &root,
+                    &observed_root,
+                    &cwd,
+                    &request.command,
+                    limits.max_frame_bytes,
+                )?
+            } else {
+                let operation = render_remote_command(
+                    &request.command,
+                    &cwd,
+                    &shell.shell,
+                    remote_timeout,
+                    timeout_ms,
+                    limits.max_frame_bytes,
+                )?;
+                render_root_guarded_command(
+                    &root,
+                    &observed_root,
+                    &operation,
+                    limits.max_frame_bytes,
+                )?
+            };
             let local_deadline = if remote_timeout {
                 remaining
                     .checked_add(REMOTE_TIMEOUT_RETURN_GRACE)
@@ -394,7 +421,8 @@ impl SshRunner {
             .await?;
         let prepared = self
             .initialize_host(host, &root, limits.connect_timeout_ms, cancel)
-            .await;
+            .await
+            .map(|(policy, capability, _trusted_root)| (policy, capability));
         drop(initialize_guard);
         prepared
     }
@@ -464,9 +492,7 @@ impl SshRunner {
                 "fixed command timeout is outside the configured limit",
             ));
         }
-        let preliminary_command = render_fixed_command(request.script, &request.args)?;
-        let transport_bytes = preliminary_command
-            .len()
+        let transport_bytes = render_fixed_command_length(request.script, &request.args)?
             .checked_add(request.stdin.as_ref().map_or(0, Vec::len))
             .ok_or_else(|| {
                 BridgeError::new(
@@ -508,7 +534,7 @@ impl SshRunner {
         let _reservation = self
             .acquire_operation(&request.host, limits.per_host_concurrency, &cancel)
             .await?;
-        let (policy, capability) = self
+        let (policy, capability, trusted_root) = self
             .initialize_host(&request.host, &root, limits.connect_timeout_ms, &cancel)
             .await?;
         drop(initialize_guard);
@@ -545,19 +571,7 @@ impl SshRunner {
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
-        let trusted_root = RootIdentity {
-            physical_root: capability.physical_root.clone(),
-            device: capability.root_device,
-            inode: capability.root_inode,
-        };
-        let expected_root = request
-            .expected_root
-            .as_ref()
-            .unwrap_or(match request.kind {
-                FixedOperationKind::ReadOnly => &observed_root,
-                FixedOperationKind::Mutation => &trusted_root,
-            });
-        if &observed_root != expected_root {
+        if request.kind == FixedOperationKind::Mutation && observed_root != trusted_root {
             return Err(attach_selected_context(
                 root_drift_error(request.kind),
                 &request.host,
@@ -565,20 +579,36 @@ impl SshRunner {
                 &shell,
             ));
         }
-        reroot_fixed_inputs(
+        if request
+            .expected_root
+            .as_ref()
+            .is_some_and(|expected_root| &observed_root != expected_root)
+        {
+            return Err(attach_selected_context(
+                root_drift_error(request.kind),
+                &request.host,
+                &observed_root.physical_root,
+                &shell,
+            ));
+        }
+        pin_fixed_inputs(
             &root,
-            &observed_root.physical_root,
             &mut request.args,
             request.stdin.as_mut(),
             request.rooted_paths,
         )?;
-        let remote_command =
-            render_guarded_fixed_command(&root, &observed_root, request.script, &request.args)?;
-        let guarded_transport_bytes = remote_command
-            .len()
-            .checked_add(request.stdin.as_ref().map_or(0, Vec::len))
+        let stdin_bytes = request.stdin.as_ref().map_or(0, Vec::len);
+        let command_limit = limits
+            .max_frame_bytes
+            .checked_sub(stdin_bytes)
             .ok_or_else(rendered_too_large)?;
-        ensure_rendered_bound(guarded_transport_bytes, limits.max_frame_bytes)?;
+        let remote_command = render_guarded_fixed_command(
+            &root,
+            &observed_root,
+            request.script,
+            &request.args,
+            command_limit,
+        )?;
         let outcome = self
             .run_child(
                 ChildSpec {
@@ -698,7 +728,7 @@ impl SshRunner {
         root: &str,
         connect_timeout_ms: u64,
         cancel: &CancellationToken,
-    ) -> BridgeResult<(SshPolicy, Arc<Capability>)> {
+    ) -> BridgeResult<(SshPolicy, Arc<Capability>, RootIdentity)> {
         let cached_identity = self.identities.lock().await.get(host).cloned();
         let identity = match cached_identity {
             Some(identity) => identity,
@@ -726,7 +756,19 @@ impl SshRunner {
                     .await
             })
             .await?;
-        Ok((policy, capability))
+        let candidate_root = RootIdentity {
+            physical_root: capability.physical_root.clone(),
+            device: capability.root_device,
+            inode: capability.root_inode,
+        };
+        let trusted_root = self
+            .trusted_roots
+            .lock()
+            .await
+            .entry(host.to_owned())
+            .or_insert(candidate_root)
+            .clone();
+        Ok((policy, capability, trusted_root))
     }
 
     async fn resolve_identity_once(
@@ -1441,14 +1483,14 @@ fn render_remote_command(
     }
     const BASH_SCRIPT: &str = r#"set -u
 [ "$#" -eq 3 ] || exit 2
-cd -- "$1" || exit 126
+cd -P -- "$1" || exit 126
 if [ -n "$3" ]; then
     exec timeout --signal=TERM --kill-after=1s "$3" bash --noprofile --norc -c "$2"
 fi
 exec bash --noprofile --norc -c "$2""#;
     const SH_SCRIPT: &str = r#"set -u
 [ "$#" -eq 3 ] || exit 2
-cd -- "$1" || exit 126
+cd -P -- "$1" || exit 126
 if [ -n "$3" ]; then
     exec timeout --signal=TERM --kill-after=1s "$3" sh -c "$2"
 fi
@@ -1516,15 +1558,55 @@ fn rendered_too_large() -> BridgeError {
 }
 
 pub(crate) fn render_fixed_command(script: &'static str, args: &[String]) -> BridgeResult<String> {
-    render_fixed_command_text(script, args)
+    render_fixed_command_text(script, args, usize::MAX)
 }
 
-fn render_fixed_command_text(script: &str, args: &[String]) -> BridgeResult<String> {
-    let mut command = format!("exec sh -c {} codex-ssh-bridge-op", shell_word(script)?);
+fn render_fixed_command_length(script: &str, args: &[String]) -> BridgeResult<usize> {
+    let script = PreparedShellWord::new(script)?;
+    args.iter().try_fold(
+        checked_rendered_length([
+            FIXED_COMMAND_PREFIX.len(),
+            script.len(),
+            FIXED_COMMAND_ARG0.len(),
+        ])?,
+        |length, argument| {
+            let argument = PreparedShellWord::new(argument)?;
+            checked_rendered_length([length, 1, argument.len()])
+        },
+    )
+}
+
+const FIXED_COMMAND_PREFIX: &str = "exec sh -c ";
+const FIXED_COMMAND_ARG0: &str = " codex-ssh-bridge-op";
+
+fn render_fixed_command_text(
+    script: &str,
+    args: &[String],
+    maximum: usize,
+) -> BridgeResult<String> {
+    let script = PreparedShellWord::new(script)?;
+    let args = args
+        .iter()
+        .map(|argument| PreparedShellWord::new(argument))
+        .collect::<BridgeResult<Vec<_>>>()?;
+    let length = args.iter().try_fold(
+        checked_rendered_length([
+            FIXED_COMMAND_PREFIX.len(),
+            script.len(),
+            FIXED_COMMAND_ARG0.len(),
+        ])?,
+        |length, argument| checked_rendered_length([length, 1, argument.len()]),
+    )?;
+    ensure_rendered_bound(length, maximum)?;
+    let mut command = String::with_capacity(length);
+    command.push_str(FIXED_COMMAND_PREFIX);
+    script.push_to(&mut command)?;
+    command.push_str(FIXED_COMMAND_ARG0);
     for argument in args {
         command.push(' ');
-        command.push_str(&shell_word(argument)?);
+        argument.push_to(&mut command)?;
     }
+    debug_assert_eq!(command.len(), length);
     Ok(command)
 }
 
@@ -1533,16 +1615,60 @@ fn render_guarded_fixed_command(
     identity: &RootIdentity,
     operation: &'static str,
     args: &[String],
+    maximum: usize,
 ) -> BridgeResult<String> {
-    render_inlined_root_guard(requested_root, identity, operation, args)
+    render_inlined_root_guard(requested_root, identity, operation, args, maximum)
 }
 
 fn render_root_guarded_command(
     requested_root: &str,
     identity: &RootIdentity,
     operation: &str,
+    maximum: usize,
 ) -> BridgeResult<String> {
-    render_inlined_root_guard(requested_root, identity, operation, &[])
+    render_inlined_root_guard(requested_root, identity, operation, &[], maximum)
+}
+
+fn render_login_root_guarded_command(
+    requested_root: &str,
+    identity: &RootIdentity,
+    cwd: &str,
+    payload: &str,
+    maximum: usize,
+) -> BridgeResult<String> {
+    let inode = format!("{}:{}", identity.device, identity.inode);
+    let requested_root = PreparedShellWord::new(requested_root)?;
+    let physical_root = PreparedShellWord::new(&identity.physical_root)?;
+    let inode = PreparedShellWord::new(&inode)?;
+    let cwd = PreparedShellWord::new(cwd)?;
+    let payload = PreparedShellWord::new(payload)?;
+    const PREFIXES: [&str; 5] = ["r=", "\np=", "\ni=", "\ncwd=", "\npayload="];
+    let length = checked_rendered_length([
+        PREFIXES.iter().map(|prefix| prefix.len()).sum(),
+        requested_root.len(),
+        physical_root.len(),
+        inode.len(),
+        cwd.len(),
+        payload.len(),
+        1,
+        LOGIN_ROOT_GUARD_SCRIPT.len(),
+    ])?;
+    ensure_rendered_bound(length, maximum)?;
+    let mut rendered = String::with_capacity(length);
+    rendered.push_str(PREFIXES[0]);
+    requested_root.push_to(&mut rendered)?;
+    rendered.push_str(PREFIXES[1]);
+    physical_root.push_to(&mut rendered)?;
+    rendered.push_str(PREFIXES[2]);
+    inode.push_to(&mut rendered)?;
+    rendered.push_str(PREFIXES[3]);
+    cwd.push_to(&mut rendered)?;
+    rendered.push_str(PREFIXES[4]);
+    payload.push_to(&mut rendered)?;
+    rendered.push('\n');
+    rendered.push_str(LOGIN_ROOT_GUARD_SCRIPT);
+    debug_assert_eq!(rendered.len(), length);
+    Ok(rendered)
 }
 
 fn render_inlined_root_guard(
@@ -1550,25 +1676,40 @@ fn render_inlined_root_guard(
     identity: &RootIdentity,
     operation: &str,
     operation_args: &[String],
+    maximum: usize,
 ) -> BridgeResult<String> {
-    let mut guarded_args = vec![
-        requested_root.to_owned(),
-        identity.physical_root.clone(),
-        identity.device.to_string(),
-        identity.inode.to_string(),
+    let device = identity.device.to_string();
+    let inode = identity.inode.to_string();
+    let script = PreparedShellWordParts::new([ROOT_GUARD_PREFIX, operation, ROOT_GUARD_SUFFIX])?;
+    let fixed_args = [
+        PreparedShellWord::new(requested_root)?,
+        PreparedShellWord::new(&identity.physical_root)?,
+        PreparedShellWord::new(&device)?,
+        PreparedShellWord::new(&inode)?,
     ];
-    guarded_args.extend_from_slice(operation_args);
-    let script_length = ROOT_GUARD_PREFIX
-        .len()
-        .checked_add(operation.len())
-        .and_then(|length| length.checked_add(ROOT_GUARD_SUFFIX.len()))
-        .ok_or_else(rendered_too_large)?;
-    let mut script = String::with_capacity(script_length);
-    script.push_str(ROOT_GUARD_PREFIX);
-    script.push_str(operation);
-    script.push_str(ROOT_GUARD_SUFFIX);
-    debug_assert_eq!(script.len(), script_length);
-    render_fixed_command_text(&script, &guarded_args)
+    let operation_args = operation_args
+        .iter()
+        .map(|argument| PreparedShellWord::new(argument))
+        .collect::<BridgeResult<Vec<_>>>()?;
+    let length = fixed_args.iter().chain(&operation_args).try_fold(
+        checked_rendered_length([
+            FIXED_COMMAND_PREFIX.len(),
+            script.len(),
+            FIXED_COMMAND_ARG0.len(),
+        ])?,
+        |length, argument| checked_rendered_length([length, 1, argument.len()]),
+    )?;
+    ensure_rendered_bound(length, maximum)?;
+    let mut rendered = String::with_capacity(length);
+    rendered.push_str(FIXED_COMMAND_PREFIX);
+    script.push_to(&mut rendered)?;
+    rendered.push_str(FIXED_COMMAND_ARG0);
+    for argument in fixed_args.iter().chain(&operation_args) {
+        rendered.push(' ');
+        argument.push_to(&mut rendered)?;
+    }
+    debug_assert_eq!(rendered.len(), length);
+    Ok(rendered)
 }
 
 fn parse_root_observation(output: &[u8]) -> BridgeResult<RootIdentity> {
@@ -1619,9 +1760,8 @@ fn root_observation_error() -> BridgeError {
     )
 }
 
-fn reroot_fixed_inputs(
+fn pin_fixed_inputs(
     configured_root: &str,
-    physical_root: &str,
     args: &mut [String],
     stdin: Option<&mut Vec<u8>>,
     rooted: RootedPathInputs,
@@ -1635,7 +1775,7 @@ fn reroot_fixed_inputs(
                 false,
             )
         })?;
-        *argument = reroot_one(configured.absolute(), physical_root, argument)?;
+        *argument = root_relative_one(configured.absolute(), argument)?;
     }
     if rooted.stdin_nul_paths {
         let stdin = stdin.ok_or_else(|| {
@@ -1654,16 +1794,10 @@ fn reroot_fixed_inputs(
         }
         let mut rewritten = Vec::with_capacity(stdin.len());
         for field in stdin[..stdin.len() - 1].split(|byte| *byte == 0) {
-            let path = std::str::from_utf8(field).map_err(|_| {
-                BridgeError::new(
-                    ErrorCode::ProtocolError,
-                    "fixed rooted stdin path is not UTF-8",
-                    false,
-                )
-            })?;
-            rewritten.extend_from_slice(
-                reroot_one(configured.absolute(), physical_root, path)?.as_bytes(),
-            );
+            rewritten.extend_from_slice(&root_relative_bytes(
+                configured.absolute().as_bytes(),
+                field,
+            )?);
             rewritten.push(0);
         }
         *stdin = rewritten;
@@ -1671,22 +1805,31 @@ fn reroot_fixed_inputs(
     Ok(())
 }
 
-fn reroot_one(configured_root: &str, physical_root: &str, path: &str) -> BridgeResult<String> {
+fn root_relative_one(configured_root: &str, path: &str) -> BridgeResult<String> {
+    String::from_utf8(root_relative_bytes(
+        configured_root.as_bytes(),
+        path.as_bytes(),
+    )?)
+    .map_err(|_| rooted_path_error())
+}
+
+fn root_relative_bytes(configured_root: &[u8], path: &[u8]) -> BridgeResult<Vec<u8>> {
     let relative = if path == configured_root {
-        ""
-    } else if configured_root == "/" {
-        path.strip_prefix('/').ok_or_else(rooted_path_error)?
+        b"".as_slice()
+    } else if configured_root == b"/" {
+        path.strip_prefix(b"/").ok_or_else(rooted_path_error)?
     } else {
         path.strip_prefix(configured_root)
-            .and_then(|suffix| suffix.strip_prefix('/'))
+            .and_then(|suffix| suffix.strip_prefix(b"/"))
             .ok_or_else(rooted_path_error)?
     };
     if relative.is_empty() {
-        Ok(physical_root.to_owned())
-    } else if physical_root == "/" {
-        Ok(format!("/{relative}"))
+        Ok(b".".to_vec())
     } else {
-        Ok(format!("{physical_root}/{relative}"))
+        let mut pinned = Vec::with_capacity(relative.len() + 2);
+        pinned.extend_from_slice(b"./");
+        pinned.extend_from_slice(relative);
+        Ok(pinned)
     }
 }
 
@@ -1873,8 +2016,8 @@ fn elapsed_ms(duration: Duration) -> u64 {
 mod tests {
     use super::{
         ChildSpec, FixedOperationKind, Phase, RootIdentity, SshRunner, capability_probe_command,
-        ensure_rendered_bound, mutation_unknown, render_fixed_command,
-        render_guarded_fixed_command, render_remote_command,
+        mutation_unknown, render_fixed_command, render_guarded_fixed_command,
+        render_remote_command, render_root_guarded_command,
     };
 
     #[test]
@@ -1889,14 +2032,25 @@ mod tests {
             },
             "printf %s \"$1\"",
             &["x".repeat(512)],
+            usize::MAX,
         )
         .unwrap();
         let maximum = guarded.len() - 1;
         assert!(original.len() <= maximum);
         assert_eq!(
-            ensure_rendered_bound(guarded.len(), maximum)
-                .unwrap_err()
-                .code,
+            render_guarded_fixed_command(
+                "/r",
+                &RootIdentity {
+                    physical_root: "/physical/root".to_owned(),
+                    device: 1,
+                    inode: 2,
+                },
+                "printf %s \"$1\"",
+                &["x".repeat(512)],
+                maximum,
+            )
+            .unwrap_err()
+            .code,
             ErrorCode::RequestTooLarge
         );
     }
@@ -2107,12 +2261,14 @@ mod tests {
                 start.wait();
                 let mut last_error = None;
                 for _ in 0..ROUNDS {
-                    let error = render_remote_command(
-                        &command,
+                    let error = render_root_guarded_command(
                         "/srv/project",
-                        &ShellKind::PosixSh,
-                        false,
-                        1_000,
+                        &RootIdentity {
+                            physical_root: "/srv/project".to_owned(),
+                            device: 1,
+                            inode: 2,
+                        },
+                        &command,
                         crate::MAX_FRAME_BYTES,
                     )
                     .unwrap_err();

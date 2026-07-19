@@ -1110,10 +1110,7 @@ async fn task78_search_engine_malicious_exit_zero_cursor_error_keeps_context() {
     let shim = tempfile::TempDir::new().unwrap();
     write_executable(
         &shim.path().join("grep"),
-        format!(
-            "#!/bin/sh\nlast=\nfor last do :; done\ncase \" $* \" in *\" -- needle \"*) if [ \"$last\" = {} ]; then printf 'BROKEN\\n'; exit 0; fi;; esac\nexec /usr/bin/grep \"$@\"\n",
-            codex_ssh_bridge::quote::shell_word(target.to_str().unwrap()).unwrap(),
-        ),
+        "#!/bin/sh\nlast=\nfor last do :; done\ncase \" $* \" in *\" -- needle \"*) if [ \"$last\" = ./entry ]; then printf 'BROKEN\\n'; exit 0; fi;; esac\nexec /usr/bin/grep \"$@\"\n",
     );
     let path = OsString::from(format!(
         "{}:/usr/local/bin:/usr/bin:/bin",
@@ -1315,9 +1312,7 @@ async fn task78_search_engine_cancellation_keeps_candidate_context() {
     write_executable(
         &shim.path().join("grep"),
         format!(
-            "#!/bin/sh\nlast=\nfor last do :; done\nif [ \"$last\" = {} ]; then : >{}; /usr/bin/sleep 10; fi\nexec /usr/bin/grep \"$@\"\n",
-            codex_ssh_bridge::quote::shell_word(remote.path().join("entry").to_str().unwrap())
-                .unwrap(),
+            "#!/bin/sh\nlast=\nfor last do :; done\nif [ \"$last\" = ./entry ]; then : >{}; /usr/bin/sleep 10; fi\nexec /usr/bin/grep \"$@\"\n",
             codex_ssh_bridge::quote::shell_word(engine_started.to_str().unwrap()).unwrap(),
         ),
     );
@@ -1679,6 +1674,258 @@ async fn cached_root_retarget_blocks_remote_run_before_its_command_can_have_side
         1,
         "run root checks reuse tool cache"
     );
+}
+
+#[tokio::test]
+async fn patch_stage_root_cannot_replace_the_original_mutation_trust() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first = container.path().join("first");
+    let second = container.path().join("second");
+    let active = container.path().join("active");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(first.join("target"), b"old\n").unwrap();
+    std::fs::write(second.join("target"), b"old\n").unwrap();
+    symlink(&first, &active).unwrap();
+    let (_runtime, _runner, bridge) = fixture(&active, false);
+    bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["target".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(&active).unwrap();
+    symlink(&second, &active).unwrap();
+
+    let error = bridge
+        .apply_patch(
+            ApplyPatchRequest {
+                host: "dev".to_owned(),
+                patch: "--- a/target\n+++ b/target\n@@ -1 +1 @@\n-old\n+new\n".to_owned(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+    assert_eq!(std::fs::read(first.join("target")).unwrap(), b"old\n");
+    assert_eq!(std::fs::read(second.join("target")).unwrap(), b"old\n");
+}
+
+#[tokio::test]
+async fn tool_capability_refresh_cannot_reauthorize_a_retargeted_root() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::TempDir::new().unwrap();
+    let first = container.path().join("first");
+    let second = container.path().join("second");
+    let active = container.path().join("active");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(first.join("value"), b"first\n").unwrap();
+    std::fs::write(second.join("value"), b"second\n").unwrap();
+    symlink(&first, &active).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let mismatch = controls.path().join("mismatch-used");
+    let log = controls.path().join("ssh.log");
+    std::fs::write(&mismatch, b"armed-later").unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        &active,
+        false,
+        None,
+        &[
+            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
+            ("FAKE_SSH_MISMATCH_FILE", mismatch.as_os_str().to_owned()),
+            ("FAKE_SSH_MISMATCH_KEY", OsString::from("read_slice")),
+        ],
+    );
+    bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(&active).unwrap();
+    symlink(&second, &active).unwrap();
+    std::fs::remove_file(&mismatch).unwrap();
+    let refreshed = bridge
+        .read(
+            ReadRequest {
+                host: "dev".to_owned(),
+                paths: vec!["value".to_owned()],
+                start_line: None,
+                max_lines: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.context.physical_root, second.to_str().unwrap());
+    assert_eq!(ssh_call_count(&log, "P"), 2);
+
+    let error = bridge
+        .write(
+            WriteRequest {
+                host: "dev".to_owned(),
+                path: "blocked".to_owned(),
+                content: "payload".to_owned(),
+                encoding: WriteEncoding::Utf8,
+                mode: WriteMode::Create,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
+    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+    assert!(!first.join("blocked").exists());
+    assert!(!second.join("blocked").exists());
+}
+
+async fn assert_guard_pins_replaced_root(raw: bool) {
+    let container = tempfile::TempDir::new().unwrap();
+    let root = container.path().join("root");
+    let pinned = container.path().join("pinned-root");
+    std::fs::create_dir(&root).unwrap();
+    let controls = tempfile::TempDir::new().unwrap();
+    let marker = controls.path().join("root-replaced");
+    let shim = tempfile::TempDir::new().unwrap();
+    write_executable(
+        &shim.path().join("stat"),
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" -L -c %d:%i -- . \"*) if [ ! -e {} ]; then out=$(/usr/bin/stat \"$@\")||exit; /usr/bin/mv -- {} {}||exit; /usr/bin/mkdir -- {}||exit; : >{}; printf %s \"$out\"; exit 0; fi;; esac\nexec /usr/bin/stat \"$@\"\n",
+            codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(root.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(pinned.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(root.to_str().unwrap()).unwrap(),
+            codex_ssh_bridge::quote::shell_word(marker.to_str().unwrap()).unwrap(),
+        ),
+    );
+    let path = OsString::from(format!(
+        "{}:/usr/local/bin:/usr/bin:/bin",
+        shim.path().display()
+    ));
+    let (_runtime, _runner, bridge) = fixture_with_options(&root, false, None, &[("PATH", path)]);
+    if raw {
+        bridge
+            .run(
+                RemoteRunRequest {
+                    host: "dev".to_owned(),
+                    command: "printf raw > payload".to_owned(),
+                    cwd: None,
+                    shell: RunShell::Sh,
+                    timeout_ms: None,
+                    stdin: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    } else {
+        bridge
+            .write(
+                WriteRequest {
+                    host: "dev".to_owned(),
+                    path: "payload".to_owned(),
+                    content: "fixed".to_owned(),
+                    encoding: WriteEncoding::Utf8,
+                    mode: WriteMode::Create,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(marker.exists(), "guard hook did not replace the root");
+    let expected = if raw {
+        b"raw".as_slice()
+    } else {
+        b"fixed".as_slice()
+    };
+    assert_eq!(std::fs::read(pinned.join("payload")).unwrap(), expected);
+    assert!(!root.join("payload").exists());
+}
+
+#[tokio::test]
+async fn fixed_guard_uses_the_verified_root_inode_after_its_path_is_replaced() {
+    assert_guard_pins_replaced_root(false).await;
+}
+
+#[tokio::test]
+async fn raw_guard_uses_the_verified_root_inode_after_its_path_is_replaced() {
+    assert_guard_pins_replaced_root(true).await;
+}
+
+#[tokio::test]
+async fn login_run_is_interpreted_by_the_account_shell_after_root_guarding() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_ACCOUNT_SHELL", OsString::from("/bin/bash"))],
+    );
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "[[ -n $BASH_VERSION ]] && printf login-bash".to_owned(),
+                cwd: None,
+                shell: RunShell::Login,
+                timeout_ms: None,
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout.head.value, "login-bash");
+}
+
+#[tokio::test]
+async fn login_guard_does_not_enable_nounset_for_the_user_payload() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _runner, bridge) = fixture_with_options(
+        remote.path(),
+        false,
+        None,
+        &[("FAKE_SSH_ACCOUNT_SHELL", OsString::from("/bin/bash"))],
+    );
+    let result = bridge
+        .run(
+            RemoteRunRequest {
+                host: "dev".to_owned(),
+                command: "printf '<%s>' \"$CODEX_SSH_BRIDGE_UNSET\"".to_owned(),
+                cwd: None,
+                shell: RunShell::Login,
+                timeout_ms: None,
+                stdin: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout.head.value, "<>");
 }
 
 #[tokio::test]
@@ -2505,8 +2752,7 @@ async fn task6_snapshot_parent_classification_is_bounded_to_thirty_two_ancestors
     write_executable(
         &shim.path().join("stat"),
         format!(
-            "#!/bin/sh\nlast=\nfor last do :; done\ncase \"$last\" in {}/*) case \" $* \" in *\" -L \"*) ;; *) marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); printf %s \"$count\" >\"$marker\";; esac;; esac\nexec /usr/bin/stat \"$@\"\n",
-            codex_ssh_bridge::quote::shell_word(remote.path().to_str().unwrap()).unwrap(),
+            "#!/bin/sh\nlast=\nfor last do :; done\ncase \"$last\" in ./missing-*) case \" $* \" in *\" -L \"*) ;; *) marker={}; count=$(/usr/bin/cat \"$marker\" 2>/dev/null || printf 0); count=$((count + 1)); printf %s \"$count\" >\"$marker\";; esac;; esac\nexec /usr/bin/stat \"$@\"\n",
             codex_ssh_bridge::quote::shell_word(count.to_str().unwrap()).unwrap()
         ),
     );
@@ -4565,8 +4811,7 @@ async fn task5_parent_identity_race_fails_before_staging() {
     std::fs::write(
         &stat,
         format!(
-            "#!/bin/sh\ncase \" $* \" in *\" -L \"*{}*) /usr/bin/stat \"$@\"; status=$?; /usr/bin/rm -f -- {}; /usr/bin/ln -s -- {} {}; exit \"$status\";; esac\nexec /usr/bin/stat \"$@\"\n",
-            parent_link.display(),
+            "#!/bin/sh\ncase \" $* \" in *\" -L \"*\" ./parent-link \"*) /usr/bin/stat \"$@\"; status=$?; /usr/bin/rm -f -- {}; /usr/bin/ln -s -- {} {}; exit \"$status\";; esac\nexec /usr/bin/stat \"$@\"\n",
             codex_ssh_bridge::quote::shell_word(parent_link.to_str().unwrap()).unwrap(),
             codex_ssh_bridge::quote::shell_word(new_parent.to_str().unwrap()).unwrap(),
             codex_ssh_bridge::quote::shell_word(parent_link.to_str().unwrap()).unwrap(),
@@ -6867,6 +7112,7 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
     let remote = tempfile::TempDir::new().unwrap();
     std::fs::write(remote.path().join("a"), b"x").unwrap();
     let runtime_base = tempfile::TempDir::new().unwrap();
+    let ssh_log = runtime_base.path().join("ssh.log");
     let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
     let runtime_directory = runtime.directory().to_owned();
     let store = Arc::new(OutputStore::new(&runtime).unwrap());
@@ -6889,6 +7135,10 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
         (
             OsString::from("FAKE_SSH_FIXED_SLEEP_SECONDS"),
             OsString::from("0.3"),
+        ),
+        (
+            OsString::from("FAKE_SSH_LOG"),
+            ssh_log.as_os_str().to_owned(),
         ),
     ]);
     let runner = Arc::new(
@@ -6974,7 +7224,17 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
         peak_rss.saturating_sub(baseline_rss)
     );
     assert_eq!(completed, 5);
-    assert!(started.elapsed() < Duration::from_millis(2_400));
+    let elapsed = started.elapsed();
+    // This debug stress test includes two mandatory physical-root observations per host.
+    // Release performance_acceptance remains the authoritative latency gate.
+    assert!(
+        elapsed < Duration::from_millis(3_200),
+        "five-host debug stress took {elapsed:?}"
+    );
+    assert_eq!(ssh_call_count(&ssh_log, "G"), 5);
+    assert_eq!(ssh_call_count(&ssh_log, "P"), 5);
+    assert_eq!(ssh_call_count(&ssh_log, "R"), 10);
+    assert_eq!(ssh_call_count(&ssh_log, "C"), 10);
     assert_eq!(spool_file_count(&runtime_directory), 0);
 }
 

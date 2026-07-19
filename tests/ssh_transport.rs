@@ -1412,7 +1412,7 @@ async fn task78_run_rejects_quote_expansion_over_frame_before_command_child() {
     let log_dir = TempDir::new().unwrap();
     let log = log_dir.path().join("calls.log");
     let limits = Limits {
-        max_frame_bytes: 512,
+        max_frame_bytes: 4_096,
         ..Limits::default()
     };
     let fixture = task3_runner(
@@ -1424,15 +1424,17 @@ async fn task78_run_rejects_quote_expansion_over_frame_before_command_child() {
             ("FAKE_SSH_LOG", log.display().to_string()),
         ],
     );
-    let mut run = request("dev", ShellRequest::Sh, Duration::from_secs(2));
-    run.command = "'".repeat(200);
-    assert!(run.command.len() < 512);
-    let error = fixture
-        .runner
-        .execute(run, CancellationToken::new())
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::RequestTooLarge);
+    for shell in [ShellRequest::Sh, ShellRequest::Login] {
+        let mut run = request("dev", shell, Duration::from_secs(2));
+        run.command = "'".repeat(800);
+        assert!(run.command.len() < 4_096);
+        let error = fixture
+            .runner
+            .execute(run, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RequestTooLarge);
+    }
     assert_eq!(
         fs::read_to_string(log)
             .unwrap_or_default()
@@ -1770,9 +1772,10 @@ async fn login_shell_is_raw_and_never_remote_timeout_wrapped() {
         .unwrap();
     assert_eq!(result.shell.shell, ShellKind::Login);
     let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
-    assert!(rendered.contains("i=$3:$4"));
-    assert!(rendered.contains("cd -- '"));
-    assert!(rendered.contains("printf safe"));
+    assert!(rendered.contains("i='1:1'"));
+    assert!(rendered.contains("cwd='.'"));
+    assert!(rendered.contains("payload='printf safe'"));
+    assert!(rendered.contains("eval \"$payload\""));
     assert!(!rendered.contains("timeout --signal"));
 }
 

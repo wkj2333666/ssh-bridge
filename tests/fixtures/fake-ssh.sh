@@ -277,7 +277,7 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
                 fi
                 ;;
         esac
-        exec /bin/sh -c "$remote_command"
+        exec "${FAKE_SSH_ACCOUNT_SHELL:-/bin/sh}" -c "$remote_command"
         ;;
     echo-argv)
         for argument do
@@ -305,20 +305,27 @@ case "${FAKE_SSH_MODE:-echo-argv}" in
 		exit "${FAKE_SSH_EXIT_STATUS:-0}"
 		;;
 	large-candidates)
-		fake_root=${FAKE_SSH_ROOT:-/srv/project}
-		record_bytes=838
-		leaf_bytes=$((record_bytes - ${#fake_root} - 2))
-		if [ "$leaf_bytes" -le 0 ]; then exit 2; fi
-		leaf=$(dd if=/dev/zero bs=1 count="$leaf_bytes" 2>/dev/null | tr '\000' x)
-		awk -v root="$fake_root" -v leaf="$leaf" 'BEGIN {
-			for (i = 0; i < 10000; i++) printf "%s/%s%c", root, leaf, 0
-		}'
-		lookahead_leaf_bytes=$((8608 - ${#fake_root} - 2))
-		lookahead_leaf=$(dd if=/dev/zero bs=1 count="$lookahead_leaf_bytes" 2>/dev/null | tr '\000' y)
-		printf '%s/%s\000' "$fake_root" "$lookahead_leaf"
-		if [ -n "${FAKE_SSH_FIXED_SLEEP_SECONDS:-}" ]; then
-			run_fake_sleep "$FAKE_SSH_FIXED_SLEEP_SECONDS"
-		fi
+		case "$remote_command" in
+			*codex-sentinel-search-find*)
+				record_bytes=838
+				leaf_bytes=$((record_bytes - 10))
+				if [ "$leaf_bytes" -le 0 ]; then exit 2; fi
+				leaf=$(dd if=/dev/zero bs=1 count="$leaf_bytes" 2>/dev/null | tr '\000' x)
+				awk -v leaf="$leaf" 'BEGIN {
+					printf "./accept/%s%c", leaf, 0
+					for (i = 1; i < 10000; i++) printf "./reject/%s%c", leaf, 0
+				}'
+				lookahead_leaf_bytes=$((8608 - 10))
+				lookahead_leaf=$(dd if=/dev/zero bs=1 count="$lookahead_leaf_bytes" 2>/dev/null | tr '\000' y)
+				printf './reject/%s\000' "$lookahead_leaf"
+				if [ -n "${FAKE_SSH_FIXED_SLEEP_SECONDS:-}" ]; then
+					run_fake_sleep "$FAKE_SSH_FIXED_SLEEP_SECONDS"
+				fi
+				;;
+			*)
+				cat >/dev/null
+				;;
+		esac
 		;;
 	sleep)
         run_fake_sleep "${FAKE_SSH_SLEEP_SECONDS:-1}"

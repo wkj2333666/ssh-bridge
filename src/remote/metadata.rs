@@ -49,7 +49,7 @@ case $s in 0);;11)printf 'CODE=CAPABILITY_MISMATCH\000CAPABILITY=search_bound\00
 if [ ! -e "$R" ]&&[ ! -L "$R" ];then printf 'NOT_FOUND\000' >&2;exit 0;fi
 if [ ! -d "$R" ];then printf 'NOT_DIRECTORY\000' >&2;exit 0;fi
 if [ ! -r "$R" ];then printf 'PERMISSION_DENIED\000' >&2;exit 0;fi
-cd -- "$R" 2>/dev/null||{ printf 'PERMISSION_DENIED\000' >&2;exit 0;}
+cd -P -- "$R" 2>/dev/null||{ printf 'PERMISSION_DENIED\000' >&2;exit 0;}
 umask 077
 t=$(mktemp -d /tmp/codex-ssh-list.XXXXXX)||exit 2
 cleanup(){ rm -rf -- "$t"; }
@@ -350,10 +350,7 @@ pub(super) async fn stat(
             .map_err(&attach)?
             .ok_or_else(|| protocol_error("stat response is incomplete"))
             .map_err(&attach)?;
-        let observed_actual = join_raw(
-            result.capability.physical_root.as_bytes(),
-            requested.relative().as_bytes(),
-        );
+        let observed_actual = pinned_path(requested.relative().as_bytes());
         if actual != observed_actual {
             return Err(attach(protocol_error("stat response order is invalid")));
         }
@@ -431,6 +428,16 @@ fn join_raw(base: &[u8], relative: &[u8]) -> Vec<u8> {
     }
     joined.extend_from_slice(relative);
     joined
+}
+
+fn pinned_path(relative: &[u8]) -> Vec<u8> {
+    if relative.is_empty() {
+        return b".".to_vec();
+    }
+    let mut pinned = Vec::with_capacity(relative.len() + 2);
+    pinned.extend_from_slice(b"./");
+    pinned.extend_from_slice(relative);
+    pinned
 }
 
 fn decoded_sort_key(value: &super::EncodedValue) -> Vec<u8> {

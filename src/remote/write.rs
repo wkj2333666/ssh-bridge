@@ -381,9 +381,9 @@ codex_classify_unreachable_parent() {
         9) ;;
         *) return 1 ;;
         esac
-        [ "$codex_parent_candidate" = / ] && return 1
+        [ "$codex_parent_candidate" = . ] && return 1
         codex_parent_candidate=${codex_parent_candidate%/*}
-        [ -n "$codex_parent_candidate" ] || codex_parent_candidate=/
+        [ -n "$codex_parent_candidate" ] || codex_parent_candidate=.
         codex_parent_unresolved=$((codex_parent_unresolved + 1))
     done
 }
@@ -397,7 +397,7 @@ case "$CODEX_STAT_TYPE" in 4???) ;; *) emit_one NOT_DIRECTORY ;; esac
 parent_device=$CODEX_STAT_DEVICE
 parent_inode=$CODEX_STAT_INODE
 
-if ! cd "$parent" 2>/dev/null; then
+if ! CDPATH= cd -P -- "$parent" 2>/dev/null; then
     if codex_mutation_parent_stat_follow_valid "$parent" &&
        [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$parent_device:$parent_inode" ]; then
         case "$CODEX_STAT_TYPE" in 4???) emit_one PERMISSION_DENIED ;; esac
@@ -809,9 +809,9 @@ codex_classify_unreachable_parent() {
         9) ;;
         *) return 1 ;;
         esac
-        [ "$codex_parent_candidate" = / ] && return 1
+        [ "$codex_parent_candidate" = . ] && return 1
         codex_parent_candidate=${codex_parent_candidate%/*}
-        [ -n "$codex_parent_candidate" ] || codex_parent_candidate=/
+        [ -n "$codex_parent_candidate" ] || codex_parent_candidate=.
         codex_parent_unresolved=$((codex_parent_unresolved + 1))
     done
 }
@@ -825,7 +825,7 @@ case "$CODEX_STAT_TYPE" in 4???) ;; *) emit_one NOT_DIRECTORY ;; esac
 parent_device=$CODEX_STAT_DEVICE
 parent_inode=$CODEX_STAT_INODE
 
-if ! cd "$parent" 2>/dev/null; then
+if ! CDPATH= cd -P -- "$parent" 2>/dev/null; then
     if codex_mutation_parent_stat_follow_valid "$parent" &&
        [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$parent_device:$parent_inode" ]; then
         case "$CODEX_STAT_TYPE" in 4???) emit_one PERMISSION_DENIED ;; esac

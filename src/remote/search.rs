@@ -322,22 +322,22 @@ pub(super) async fn search(
                 .await
                 .map_err(&attach_candidates)?
         };
-        let Some(path) = path else { break };
-        if path.is_empty() {
+        let Some(pinned_path) = path else { break };
+        if pinned_path.is_empty() {
             return Err(attach_candidates(protocol_error(
                 "search candidate path is empty",
             )));
         }
+        let relative = pinned_relative(&pinned_path).map_err(&attach_candidates)?;
         candidate_count = candidate_count
             .checked_add(1)
             .ok_or_else(|| protocol_error("search candidate count overflowed"))
             .map_err(&attach_candidates)?;
-        let relative = relative(configured_root, &path).map_err(&attach_candidates)?;
         if candidates.len() < 10_001
             && (request.globs.is_empty()
                 || globs.is_match(Path::new(&OsString::from_vec(relative.to_vec()))))
         {
-            candidates.push(path);
+            candidates.push(pinned_path);
         }
     }
     if candidate_capped && cursor.discarded_incomplete() && candidate_count == 0 {
@@ -345,11 +345,7 @@ pub(super) async fn search(
             "search candidate record is oversized",
         )));
     }
-    candidates.sort_by(|left, right| {
-        relative(configured_root, left)
-            .unwrap_or(left)
-            .cmp(relative(configured_root, right).unwrap_or(right))
-    });
+    candidates.sort();
     let mut truncated = candidate_capped || candidate_count > 10_000 || candidates.len() > 10_000;
     candidates.truncate(10_000);
     let rg = candidates_result.capability.tools.get("rg_json") == Some(&true);
@@ -430,7 +426,10 @@ pub(super) async fn search(
                 script,
                 args,
                 stdin: Some(stdin),
-                rooted_paths: RootedPathInputs::default(),
+                rooted_paths: RootedPathInputs {
+                    argument_indices: &[],
+                    stdin_nul_paths: false,
+                },
                 expected_root: Some(candidates_result.root_identity.clone()),
                 required_capabilities: required,
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
@@ -534,10 +533,11 @@ async fn parse_rg(
         let data = value
             .get("data")
             .ok_or_else(|| protocol_error("rg match has no data"))?;
-        let actual = json_bytes(
+        let pinned_path = json_bytes(
             data.get("path")
                 .ok_or_else(|| protocol_error("rg match has no path"))?,
         )?;
+        let actual = logical_from_pinned(root, &pinned_path)?;
         let relative = relative(root, &actual)?;
         let mut content = json_bytes(
             data.get("lines")
@@ -605,7 +605,8 @@ async fn parse_grep(
         } else {
             cursor.next_field(record_limit).await?
         };
-        let Some(actual) = actual else { break };
+        let Some(pinned_path) = actual else { break };
+        let actual = logical_from_pinned(root, &pinned_path)?;
         let record = if capped {
             cursor.next_line_capped(record_limit).await?
         } else {
@@ -672,4 +673,35 @@ fn relative<'a>(root: &[u8], actual: &'a [u8]) -> BridgeResult<&'a [u8]> {
         }
     });
     relative.ok_or_else(|| protocol_error("search path escaped the configured root"))
+}
+
+fn logical_from_pinned(root: &[u8], pinned: &[u8]) -> BridgeResult<Vec<u8>> {
+    if pinned == b"." {
+        return Ok(root.to_vec());
+    }
+    let relative = pinned_relative(pinned)?;
+    let needs_separator = !root.ends_with(b"/");
+    let mut actual = Vec::with_capacity(root.len() + usize::from(needs_separator) + relative.len());
+    actual.extend_from_slice(root);
+    if needs_separator {
+        actual.push(b'/');
+    }
+    actual.extend_from_slice(relative);
+    Ok(actual)
+}
+
+fn pinned_relative(pinned: &[u8]) -> BridgeResult<&[u8]> {
+    let relative = pinned
+        .strip_prefix(b"./")
+        .filter(|relative| !relative.is_empty())
+        .ok_or_else(|| protocol_error("search path is not relative to the pinned root"))?;
+    if relative
+        .split(|byte| *byte == b'/')
+        .any(|component| component.is_empty() || matches!(component, b"." | b".."))
+    {
+        return Err(protocol_error(
+            "search path is not normalized beneath the pinned root",
+        ));
+    }
+    Ok(relative)
 }
