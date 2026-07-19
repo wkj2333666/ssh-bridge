@@ -26,6 +26,9 @@ use crate::quote::shell_word;
 use crate::remote::{RemoteBridge, RemoteRunRequest, RemoteRunResult, RunShell, StatRequest};
 use crate::ssh::{RuntimePaths, SshRunner, build_sshfs_argv, validate_sshfs_mountpoint};
 
+mod install;
+pub use install::{InstallLayout, InstallReport, install_user, uninstall_user};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "codex-ssh-bridge",
@@ -175,9 +178,8 @@ pub async fn run(cli: Cli) -> BridgeResult<()> {
         Command::Mount(arguments) => run_mount(config_path()?, arguments).await,
         Command::Unmount(arguments) => run_unmount(arguments).await,
         Command::MountStatus(arguments) => run_mount_status(arguments),
-        Command::Install(_) | Command::Uninstall(_) => Err(BridgeError::invalid_argument(
-            "this human command is not implemented yet",
-        )),
+        Command::Install(arguments) => run_install(arguments).await,
+        Command::Uninstall(arguments) => run_uninstall_installation(arguments).await,
     }
 }
 
@@ -804,6 +806,22 @@ fn read_bounded_local_file(path: &Path, maximum: u64) -> BridgeResult<Vec<u8>> {
     Ok(bytes)
 }
 
+async fn run_install(arguments: InstallArgs) -> BridgeResult<()> {
+    debug_assert!(arguments.user, "Clap requires --user");
+    let report = install_user(InstallLayout::discover()?, arguments.apply).await?;
+    let value = serde_json::to_value(report)
+        .map_err(|error| BridgeError::io(format!("cannot render install plan: {error}")))?;
+    print_json(&value)
+}
+
+async fn run_uninstall_installation(arguments: InstallArgs) -> BridgeResult<()> {
+    debug_assert!(arguments.user, "Clap requires --user");
+    let report = uninstall_user(InstallLayout::discover()?, arguments.apply).await?;
+    let value = serde_json::to_value(report)
+        .map_err(|error| BridgeError::io(format!("cannot render uninstall plan: {error}")))?;
+    print_json(&value)
+}
+
 fn config_path() -> BridgeResult<PathBuf> {
     if let Some(path) = std::env::var_os("CODEX_SSH_BRIDGE_CONFIG") {
         if path.is_empty() {
@@ -898,7 +916,7 @@ fn ensure_config_parent(path: &Path) -> BridgeResult<()> {
 }
 
 #[cfg(unix)]
-fn ensure_secure_absolute_directory(path: &Path) -> BridgeResult<()> {
+pub(super) fn ensure_secure_absolute_directory(path: &Path) -> BridgeResult<Vec<PathBuf>> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::Component;
 
@@ -906,6 +924,7 @@ fn ensure_secure_absolute_directory(path: &Path) -> BridgeResult<()> {
     let current_uid = unsafe { libc::geteuid() };
     let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
     let mut resolved = PathBuf::from("/");
+    let mut created = Vec::new();
     for component in path.components() {
         match component {
             Component::RootDir => continue,
@@ -922,10 +941,11 @@ fn ensure_secure_absolute_directory(path: &Path) -> BridgeResult<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut builder = fs::DirBuilder::new();
                 builder.mode(0o700);
-                if let Err(create_error) = builder.create(&resolved)
-                    && create_error.kind() != std::io::ErrorKind::AlreadyExists
-                {
-                    return Err(BridgeError::io(create_error));
+                match builder.create(&resolved) {
+                    Ok(()) => created.push(resolved.clone()),
+                    Err(create_error)
+                        if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_error) => return Err(BridgeError::io(create_error)),
                 }
                 fs::symlink_metadata(&resolved).map_err(BridgeError::io)?
             }
@@ -951,7 +971,7 @@ fn ensure_secure_absolute_directory(path: &Path) -> BridgeResult<()> {
             ));
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 fn host_json(alias: &str, profile: &HostProfile) -> serde_json::Value {
