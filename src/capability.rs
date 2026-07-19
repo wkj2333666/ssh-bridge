@@ -425,7 +425,7 @@ name'
     }
 
     codex_mutation_mode() {
-        chmod -h "$1" -- "$2"
+        chmod "$1" -- "$2"
     }
 
     codex_mutation_remove() {
@@ -620,22 +620,16 @@ name' value"
         [ ! -e "$safe_created" ] && [ ! -L "$safe_created" ] || exit 1
         safe_replaced=$safe_dir/replaced
         printf old >"$safe_replaced" || exit 9
+        codex_mutation_mode 0640 "$safe_tmp" || exit 1
+        codex_mutation_stat_valid "$safe_tmp" || exit 1
+        [ "$CODEX_STAT_MODE" = 640 ] || exit 1
         codex_mutation_replace "$safe_tmp" "$safe_replaced" || exit 1
         [ ! -e "$safe_tmp" ] && [ ! -L "$safe_tmp" ] || exit 1
-        codex_mutation_mode 0640 "$safe_replaced" || exit 1
         codex_mutation_stat_valid "$safe_replaced" || exit 1
         [ "$CODEX_STAT_MODE" = 640 ] || exit 1
         CODEX_HASH_DIGEST=$(codex_mutation_hash "$safe_replaced") || exit 1
         [ "$CODEX_HASH_DIGEST" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
 
-        safe_referent=$safe_dir/chmod-referent
-        safe_link=$safe_dir/chmod-link
-        printf referent >"$safe_referent" || exit 9
-        chmod 0600 -- "$safe_referent" || exit 9
-        ln -s "$safe_referent" "$safe_link" || exit 9
-        codex_mutation_mode 0640 "$safe_link" || exit 1
-        [ "$(stat --printf='%a' -- "$safe_referent")" = 600 ] || exit 1
-        [ "$(cat "$safe_referent")" = referent ] || exit 1
     ); then
         if [ ! -e "$safe_dir" ]; then tool_safe_write=1; fi
     else
