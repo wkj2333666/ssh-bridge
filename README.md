@@ -34,7 +34,7 @@ SSHFS is intentionally absent from the MCP tool list. This prevents an Agent fro
 - Local Linux host with the packaged `codex-ssh-bridge` binary.
 - Local OpenSSH client at `/usr/bin/ssh`.
 - Key-based or local-agent authentication and verified host keys.
-- Remote `sshd`, a POSIX sh, and the ordinary utilities checked by `doctor`; Bash is optional.
+- Remote `sshd`, a POSIX sh, a GNU- or BSD-compatible `stat`, and the ordinary utilities checked by `doctor`; Bash is optional. `shell=login` additionally needs an account shell that can be resolved through `getent passwd` or, when `getent` is absent, one unique readable `/etc/passwd` record.
 - Optional local `sshfs` and `fusermount3` for the human mount commands.
 - Rust 1.91.1 or newer only when rebuilding.
 
@@ -75,7 +75,9 @@ ssh devbox
 
 Add future servers with another concrete alias and `hosts add`; there is no five-host ceiling. Use `--read-only` for inspection-only profiles. The default local config is `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml) documents limits. It contains aliases, roots, descriptions, and limits—never credentials.
 
-`doctor devbox --verbose-ssh` runs a bounded local OpenSSH diagnostic and redacts identity paths, agent sockets, commands, and credential-like fields.
+`doctor` probes the configured root's physical path and device/inode identity as well as shell and utility capabilities. Every later operation revalidates that identity through the reused SSH connection and pins the checked directory as its working directory before the business script. Reads may follow a newly observed physical root and report it; writes, patches, and `remote_run` compare against the bridge process's immutable first trust and fail closed if it changed. Refreshing tool capabilities never refreshes root trust: intentionally accepting a replacement root requires a bridge restart and fresh probe.
+
+`doctor devbox --verbose-ssh` also runs a bounded local OpenSSH diagnostic and redacts identity paths, agent sockets, commands, and credential-like fields.
 
 ## Install for local Codex
 
@@ -108,6 +110,8 @@ Uninstall follows the same rule:
 
 Start a new Codex task after installing or updating so the Skill and MCP surface are reloaded. The user running the bridge is the local installation trust boundary: another process running as that same Unix user can bypass the bridge and edit Codex configuration directly because the Codex CLI does not expose compare-and-swap removal.
 
+Keep an installed bundle at a durable, versioned, private path such as `~/.local/share/codex-ssh-bridge/0.1.0`; the MCP entry and Skill symlink intentionally point back to that reviewed bundle. For an update, do not overwrite the active bundle in place: run its recorded `uninstall --user --apply`, stage the new version in a new directory, review the new dry run, then apply it. The content-hashed identity deliberately rejects an overwritten or unrelated bundle instead of guessing that it is a safe upgrade.
+
 For a direct MCP entry, Codex can prompt only for tools not marked read-only:
 
 ```toml
@@ -132,7 +136,7 @@ The nine MCP tools are:
 
 The default flow is bounded search/read → unified patch → remote verification. Calls are synchronous. Oversized detail is retained under an opaque `output_ref` and paged with `remote_output_read`, so the Agent never needs to reconstruct transport logic.
 
-`remote_run` accepts one command string plus `shell: auto|bash|sh|login`. Prefer POSIX syntax. `auto` may fall back to sh; request Bash explicitly for Bash-only syntax. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
+`remote_run` accepts one command string plus `shell: auto|bash|sh|login`. Prefer POSIX syntax. `auto` may fall back to sh; request Bash explicitly for Bash-only syntax. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
 
 ## Human direct CLI
 
