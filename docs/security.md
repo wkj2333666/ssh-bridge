@@ -15,7 +15,7 @@ Untrusted inputs:
 - MCP arguments until closed-schema and size validation succeeds;
 - verbose SSH diagnostics until bounded redaction succeeds.
 
-The configured remote root is a routing boundary, not a security sandbox. Remote reads can follow remote symlinks. Safe writes and patches use no-follow identity checks, snapshots, hashes, and guarded commits, but the remote Unix account, permissions, container, forced command, or service policy remains the hard boundary.
+The configured remote root is a routing boundary, not a security sandbox. Remote reads can follow remote symlinks. The capability probe records its physical path and device/inode identity using a GNU- or BSD-compatible `stat`; the first identity is immutable for that bridge process even if tool capabilities are invalidated and reprobed. Each operation observes the root again, and a same-shell guard repeats the comparison immediately before the business script. The guard keeps the verified directory as its physical working directory, and bridge-generated operands use `.` or normalized `./relative` paths so renaming and replacing the pathname after validation does not redirect the operation. Reads report the currently observed physical root. Writes, patches, and `remote_run` fail before their business script if that identity differs from the originally trusted probe; a multi-stage operation must also match its stage anchor. Restarting the bridge performs the only implicit fresh trust probe. Safe writes and patches additionally use no-follow path identity checks, snapshots, hashes, and guarded commits, but the remote Unix account, permissions, container, forced command, or service policy remains the hard boundary.
 
 No Codex credential, binary, plugin, MCP server, or persistent helper is placed on a server. All SSH authentication occurs in the local OpenSSH client.
 
@@ -44,7 +44,9 @@ The bridge first runs bounded `ssh -G` with the security-critical options to res
 
 MCP paths, queries, globs, patch bodies, file content, stdin, and configured roots are transported as data. Fixed remote programs use static scripts plus positional parameters. The direct human CLI converts each argv word with the bridge's bounded shell encoder.
 
-`remote_run` intentionally accepts a shell command string. The bridge safely binds the whole string into the selected remote shell, but syntax inside it still has that shell's meaning. `auto` records Bash or a visible POSIX-sh fallback; explicit Bash fails closed if unavailable. Results and errors preserve the actual shell metadata.
+`remote_run` intentionally accepts a shell command string. The bridge safely binds the whole string into the selected remote shell, but syntax inside it still has that shell's meaning. `auto` records Bash or a visible POSIX-sh fallback; explicit Bash fails closed if unavailable. Explicit `login` obtains the account shell from a strict, unique `getent passwd UID` record, or from one unique `/etc/passwd` record only when `getent` is absent. It rejects malformed, relative, oversized, non-regular, or non-executable paths, treats an empty passwd shell as `/bin/sh` like OpenSSH, and never trusts `$SHELL`. A fixed POSIX guard pins the root before it executes that resolved shell with the payload as data. Results and errors preserve the actual shell metadata.
+
+Local `LC_ALL=C` is forced only for bridge protocol and SSH-diagnostic phases. Raw `remote_run` does not add that override, so the bridge does not itself cause an `LC_*` `SendEnv` rule to change the user's command locale.
 
 All command tools are treated as mutating. A local timeout sends TERM and then KILL to the entire local SSH process group. A detached or ambiguous remote child can survive, so results expose process-continuation and mutation uncertainty instead of claiming rollback.
 
@@ -79,6 +81,8 @@ Install and uninstall are dry-run unless `--apply` is present. Apply mode:
 - removes only content matching the recorded installation identity.
 
 The lock serializes this bridge's transactions. The local Unix user remains trusted: a separate process running as that same user can ignore the lock and directly edit Codex configuration, and the current Codex CLI has no compare-and-swap remove operation. Final rechecks detect many such races, but this is not a hostile-same-UID isolation mechanism.
+
+The identity is content-hashed, so overwriting an active bundle in place is rejected rather than treated as an implicit upgrade. Preserve the old version long enough to run its identity-matching uninstall, then install the reviewed new version from a different durable directory.
 
 Source validation remains component-by-component and no-follow. A real current-user-owned `0700` ancestor establishes a sealed boundary: below it, current-user-owned directories may retain group/other mode bits because other UIDs cannot traverse the seal and the same UID is already trusted. Sticky `/tmp` does not establish that boundary; foreign owners, writable root-owned descendants, package symlinks, and unsafe canonical Codex executable targets remain rejected. This accommodates the local Codex release layout under a private home without weakening a shared directory tree.
 
