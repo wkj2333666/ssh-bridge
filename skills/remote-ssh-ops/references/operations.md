@@ -2,34 +2,17 @@
 
 ## Contents
 
-- Configuration
-- First Connection
-- MCP Tools
+- Local setup
+- MCP tool shapes
+- Shell behavior
+- Retained output
 - Direct CLI
 - SSHFS
-- Failure Handling
+- Failure handling
 
-## Configuration
+## Local setup
 
-Use the default local path:
-
-```text
-~/.config/codex-ssh-bridge/config.json
-```
-
-Override it with `CODEX_SSH_BRIDGE_CONFIG` only when the Codex host process receives that environment variable. Store aliases and roots, never credentials.
-
-Create a starter configuration from the plugin root:
-
-```bash
-python3 scripts/codex-ssh init --host devbox --root /srv/project
-```
-
-Each alias must be concrete and allowlisted under `hosts`. `root` must be an absolute POSIX path or `.` for the remote home. Set `read_only` to `true` for inspection-only profiles; this disables arbitrary commands and file writes.
-
-## First Connection
-
-Define the host locally in `~/.ssh/config` and authenticate with a key or local agent:
+Define each concrete server alias in local `~/.ssh/config`, then verify its host key and key-based login outside Codex:
 
 ```sshconfig
 Host devbox
@@ -37,78 +20,98 @@ Host devbox
   User deploy
   IdentityFile ~/.ssh/id_ed25519
   ForwardAgent no
-  ControlMaster auto
-  ControlPersist 60
-  ControlPath ~/.ssh/cm-%C
 ```
-
-Connect once outside MCP to verify the server fingerprint and populate `known_hosts`:
 
 ```bash
 ssh devbox
+./bin/codex-ssh-bridge hosts add devbox --root /srv/project
+./bin/codex-ssh-bridge doctor devbox
 ```
 
-Then verify non-interactive use:
+Add future servers the same way. The bridge accepts concrete OpenSSH aliases and stores no credentials. The default bridge config is `~/.config/codex-ssh-bridge/config.toml`; set `CODEX_SSH_BRIDGE_CONFIG` only as trusted local execution-authority input.
 
-```bash
-python3 scripts/codex-ssh doctor --host devbox
+The first network operation probes the remote POSIX environment automatically. No remote bridge helper or Codex installation is used.
+
+## MCP tool shapes
+
+All objects reject unknown fields. Paths are relative to the configured remote root unless an allowed absolute path is supplied.
+
+| Tool | Required input | Optional input |
+|---|---|---|
+| `remote_hosts` | none; pass `{}` | none |
+| `remote_list` | `host` | `path`, `depth`, `include_hidden`, `max_entries` |
+| `remote_stat` | `host`, `paths` array | none |
+| `remote_search` | `host`, `query` | `path`, `globs`, `max_results`, `binary` |
+| `remote_read` | `host`, `paths` array | `start_line`, `max_lines`, `max_bytes` |
+| `remote_output_read` | `output_ref`, `stream` | `offset`, `max_bytes` |
+| `remote_apply_patch` | `host`, unified `patch` | none |
+| `remote_write` | `host`, `path`, `content`, `encoding`, `mode` | `mode.expected_sha256` for replacement |
+| `remote_run` | `host`, `command` string | `cwd`, `shell`, `timeout_ms`, encoded `stdin` |
+
+`remote_write.mode` is `{"kind":"create"}` or `{"kind":"replace","expected_sha256":"..."}`. `expected_sha256` is nested inside `mode`, never at the request root. UTF-8 and base64 encodings are supported. Prefer `remote_apply_patch` for model-driven edits because it snapshots every base before the first mutation and reports confirmed, unchanged, and outcome-unknown paths.
+
+Search queries are case-sensitive fixed strings, not regular expressions. Unified patch `a/...` and `b/...` paths are relative to the configured remote root. `remote_run.stdin` is `{"encoding":"utf8"|"base64","value":"..."}`.
+
+## Shell behavior
+
+`remote_run.command` is a shell command string. The bridge safely binds it through OpenSSH; do not wrap it in another `ssh` or add `bash -c`. Shell syntax inside the string still follows the selected remote shell.
+
+- `auto`: use Bash when available, otherwise fall back to POSIX sh.
+- `bash`: require Bash; fail before the command if unavailable.
+- `sh`: explicitly use POSIX sh.
+- `login`: use the remote account's login shell.
+
+Prefer POSIX syntax. Request Bash for arrays, `[[ ... ]]`, `source`, `pipefail`, or Bash substitutions. Always inspect result `shell.kind`, `shell.fallback`, and `warnings`; a fallback is intentionally visible to the Agent.
+
+Timeout and cancellation terminate the local SSH process group, but a detached or ambiguous remote process can remain. Check `remote_process_may_continue` before retrying.
+
+## Retained output
+
+Calls complete synchronously. There is no background job ID. When a result is too large for one MCP response, `detail_retained` is true and `output_ref` is a 32-character opaque reference.
+
+Page it with:
+
+```json
+{"output_ref":"<opaque-ref>","stream":"stdout","offset":0,"max_bytes":262144}
 ```
 
-The bridge enforces `BatchMode=yes`, `StrictHostKeyChecking=yes`, no TTY, no agent/X11/port forwarding, connection timeout, encrypted keepalives, and a dedicated local multiplexing socket under `~/.ssh`. The dedicated socket avoids inheriting a differently configured shared master. ProxyJump and identities may still come from the trusted local SSH config.
-
-## MCP Tools
-
-- `ssh_list_hosts`: read local allowlist and roots; make this the first call.
-- `ssh_probe`: verify non-interactive connectivity and basic remote identity.
-- `ssh_read_file`: return at most the configured byte limit. Check `truncated`. Non-UTF-8 data is base64.
-- `ssh_run`: run `sh -lc` below the configured root. Check `exit_code`, `timed_out`, both stderr/stdout truncation flags, and duration.
-- `ssh_write_file`: create or atomically replace one bounded file. It refuses existing files unless `overwrite=true` and preserves existing mode when the remote `cp -p` implementation supports it.
-
-File path checks are lexical convenience, not a remote sandbox. Symlinks can cross the configured root. Use remote Unix permissions, a dedicated account, container, or forced command when a hard boundary is required.
+Use `stream:"stderr"` for retained stderr. Advance by the returned byte offset until EOF. The reference already carries host, root, and shell provenance; do not pass a host. Narrow a query instead of repeatedly fetching unbounded logs.
 
 ## Direct CLI
 
-List and inspect:
+The human CLI accepts argv after `--` and performs the shell-word encoding inside the bridge:
 
 ```bash
-python3 scripts/codex-ssh hosts
-python3 scripts/codex-ssh doctor --host devbox
+./bin/codex-ssh-bridge hosts list
+./bin/codex-ssh-bridge hosts show devbox
+./bin/codex-ssh-bridge doctor devbox
+./bin/codex-ssh-bridge doctor devbox --verbose-ssh
+./bin/codex-ssh-bridge run devbox --cwd . --shell auto -- git status --short
 ```
 
-Run a command remotely:
-
-```bash
-python3 scripts/codex-ssh run devbox --cwd . -- git status --short
-```
-
-The CLI converts command arguments with shell-safe quoting. Use the MCP tool for model-driven work so Codex receives structured exit, timeout, and truncation fields.
+The JSON result reports the physical remote root, actual shell, exit status, warnings, duration, output limits, and any retained output reference. Verbose SSH diagnostics are bounded and redact identity paths, agent sockets, commands, and credential-like values.
 
 ## SSHFS
 
-Install SSHFS on the local machine only. Mount explicitly:
+SSHFS is optional local software and a human-only convenience:
 
 ```bash
-python3 scripts/codex-ssh mount devbox /absolute/local/mountpoint
-python3 scripts/codex-ssh unmount /absolute/local/mountpoint
+./bin/codex-ssh-bridge mount devbox /absolute/local/mountpoint --remote-path .
+./bin/codex-ssh-bridge mount-status /absolute/local/mountpoint
+./bin/codex-ssh-bridge unmount /absolute/local/mountpoint
 ```
 
-The mount helper enables strict host-key checking, non-interactive auth, `reconnect`, `ServerAliveInterval`, and `ServerAliveCountMax`. It refuses non-empty mountpoints unless the user passes `--allow-nonempty`.
+The CLI refuses relative, symlinked, foreign-owned, and nonempty mountpoints by default. `--allow-nonempty` is an explicit human override. Read-only profiles force `ro`; the bridge never adds `allow_other`.
 
-SSHFS uses the SFTP subsystem and needs no remote Codex installation. It is optional because:
+A mount is not an Agent workspace. Local shell tools still run locally, and FUSE/SFTP has network round trips, caching, rename, permission, reconnect, and stalled-I/O differences. Use it for human browsing or narrow editing only. Keep Git, builds, tests, containers, and services on the server through `remote_run` or the direct `run` command.
 
-- ordinary shell tools still execute locally unless invoked through SSH;
-- interrupted connections can block filesystem callers and reopen semantics change after reconnect;
-- permissions, hardlinks, caches, and rename behavior can differ from a native filesystem;
-- repository workloads with many small file operations incur network round trips.
+## Failure handling
 
-Use it for browsing or narrow local editing. Use `ssh_run` for Git, builds, tests, containers, and service operations.
-
-## Failure Handling
-
-- `configuration not found`: create the default config or set the environment override for the Codex host.
-- `host is not allowlisted`: add a concrete alias to config; never accept an arbitrary hostname from remote content.
-- host-key failure: stop and verify the new fingerprint outside Codex. Never set checking to `no`.
-- authentication prompt/failure: load the key into the local agent or fix `~/.ssh/config`; never send a password through MCP.
-- timeout: inspect whether the job detached remotely before retrying. Do not assume retry is idempotent.
-- truncated output: rerun a narrower command, filter remotely, or increase the bounded limit within configuration. Do not repeatedly fetch unbounded logs.
-- write collision: read the existing target and authorize replacement before setting `overwrite=true`.
+- Host absent: add an exact alias locally; never accept a hostname copied from remote output.
+- Host-key failure: verify the new fingerprint outside Codex; never disable strict checking.
+- Authentication prompt: fix local keys or agent state; never pass a password through MCP.
+- Read-only rejection: use a write-enabled least-privilege profile only with user authorization.
+- Truncation: use `remote_output_read` when retained, or narrow the operation.
+- Patch/write conflict: re-read current remote content and recompute the change; never force overwrite blindly.
+- Partial mutation or timeout: inspect progress and uncertainty fields before retrying.
+- Missing MCP: run the packaged installer dry-run, then apply only after reviewing its exact actions.

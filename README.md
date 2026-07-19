@@ -1,46 +1,61 @@
 # Codex SSH Bridge
 
-Use a locally authenticated Codex to work on SSH servers without installing or signing in to Codex on those servers.
+Use Codex on this local machine to inspect, edit, and run commands on allowlisted SSH servers without installing or signing in to Codex on those servers.
 
 ```text
 local Codex
-    │ MCP over local stdio
+    │ local stdio MCP
     ▼
-dependency-free Python bridge
-    │ local OpenSSH client + local keys/agent/known_hosts
+native Rust bridge
+    │ local OpenSSH + local keys/agent/known_hosts
     ▼
-remote sshd ── project, build tools, services
+remote sshd ── files, compilers, tests, services
 
-optional: local SSHFS mount ── SFTP over the same SSH trust setup
+optional, human-only: local SSHFS mount over SFTP
 ```
 
-The plugin bundles the `remote-ssh-ops` Skill, a local MCP server, a configuration validator, a direct CLI, and explicit SSHFS mount helpers. The remote machine needs only SSH access and ordinary POSIX utilities; it never receives Codex credentials.
+The server receives fixed POSIX scripts and user commands through ordinary SSH. It receives no Codex binary, session, API key, plugin, or persistent helper.
 
-## Why this architecture
+## Why this design
 
-| Approach | Good at | Main limitation | Role here |
+| Approach | Strength | Problem for this use case | Role |
 |---|---|---|---|
-| Raw `ssh` commands | Minimal setup, complete shell access | Quoting, targets, timeouts, output limits, and approvals are unstructured | Transport underneath the MCP bridge |
-| SSHFS | Convenient local browsing/editing; usually no server-side setup beyond SFTP | Commands still run locally; FUSE/SFTP semantics, latency, caching, and disconnect stalls | Optional explicit mount |
-| Local MCP wrapper | Structured tools, allowlisted hosts, consistent security flags, time/output limits | Non-interactive; cannot make arbitrary shell execution intrinsically safe | Default Codex interface |
-| Codex remote SSH project | Native remote filesystem and shell integration | Official setup requires Codex installed and authenticated on the remote host | Deliberately not used |
+| Raw `ssh` | Universal and minimal | Leaves target selection, quoting, limits, shell detection, cancellation, and output handling to the Agent | Transport below the bridge |
+| SSHFS | Convenient human browsing | Makes remote files look local while commands still run locally; adds FUSE/SFTP latency and reconnect semantics | Explicit optional CLI only |
+| Native local MCP | Closed schemas, allowlisted hosts, bounded I/O, shared policy, visible Bash/sh fallback | Non-interactive by design | Default Agent interface |
+| Official Codex SSH Remote | Native remote project experience | Currently starts Codex remotely and requires remote installation/authentication | Deliberately not used |
 
-OpenAI's current remote-host workflow explicitly starts a remote Codex app server and requires installing/authenticating Codex remotely, so it does not meet this project's credential boundary ([Remote connections](https://learn.chatgpt.com/docs/remote-connections#connect-to-an-ssh-host)). Codex supports local stdio MCP servers and shares MCP configuration across the desktop app, CLI, and IDE ([MCP documentation](https://learn.chatgpt.com/docs/extend/mcp)).
+The bridge is Rust rather than a Bash program because strict MCP framing, bounded parsing, async concurrency, process-group cancellation, spool quotas, and transactional installation need one auditable state machine. Bash and POSIX sh remain supported as the *remote command shells*; the result always reports which shell actually ran.
 
-OpenSSH provides the controls used here: non-interactive `BatchMode`, strict host-key verification, connection multiplexing, and encrypted server-alive messages ([ssh_config(5)](https://man.openbsd.org/ssh_config.5)). Agent forwarding is forced off because OpenSSH warns that a remote attacker able to access the forwarded socket can use identities loaded in the local agent.
-
-SSHFS uses SFTP and normally needs no additional server component ([SSHFS README](https://github.com/libfuse/sshfs)). Its own manual documents reconnect caveats, non-atomic rename workarounds, hardlink differences, and operations that can freeze after a broken connection ([SSHFS manual](https://github.com/libfuse/sshfs/blob/master/sshfs.rst)). This is why the mount is convenient but secondary.
+SSHFS is intentionally absent from the MCP tool list. This prevents an Agent from silently treating a FUSE path as a local workspace.
 
 ## Requirements
 
-- Local Python 3.10 or newer; no Python packages are required.
-- Local OpenSSH client and a working key/agent-based alias in `~/.ssh/config`.
-- Optional local SSHFS for `mount`/`unmount`.
-- A remote POSIX shell plus `id`, `uname`, `dd`, `cp`, `mv`, and `cat` for all tools.
+- Local Linux host with the packaged `codex-ssh-bridge` binary.
+- Local OpenSSH client at `/usr/bin/ssh`.
+- Key-based or local-agent authentication and verified host keys.
+- Remote `sshd`, a POSIX sh, and the ordinary utilities checked by `doctor`; Bash is optional.
+- Optional local `sshfs` and `fusermount3` for the human mount commands.
+- Rust 1.91.1 or newer only when rebuilding.
 
-## Configure
+The bundled binary is native to the machine/architecture on which it was built. Rebuild and replace `bin/codex-ssh-bridge` when moving the plugin to a different local architecture. Remote server architecture is irrelevant.
 
-First define and manually verify a concrete SSH alias:
+## Build and package locally
+
+```bash
+cargo build --release
+mkdir -p bin
+cp target/release/codex-ssh-bridge bin/codex-ssh-bridge
+chmod 0755 bin/codex-ssh-bridge
+sha256sum target/release/codex-ssh-bridge bin/codex-ssh-bridge
+./bin/codex-ssh-bridge --help
+```
+
+There is no Python runtime or remote build step.
+
+## Configure hosts
+
+Define and manually verify a concrete alias in local `~/.ssh/config`:
 
 ```sshconfig
 Host devbox
@@ -48,68 +63,107 @@ Host devbox
   User deploy
   IdentityFile ~/.ssh/id_ed25519
   ForwardAgent no
-  ControlMaster auto
-  ControlPersist 60
-  ControlPath ~/.ssh/cm-%C
 ```
 
 ```bash
 ssh devbox
-python3 /home/wkj/projects/codex-ssh-bridge/scripts/codex-ssh init \
-  --host devbox \
-  --root /srv/my-project
-python3 /home/wkj/projects/codex-ssh-bridge/scripts/codex-ssh doctor --host devbox
+./bin/codex-ssh-bridge hosts add devbox \
+  --root /srv/my-project \
+  --description "development server"
+./bin/codex-ssh-bridge doctor devbox
 ```
 
-The default config is `~/.config/codex-ssh-bridge/config.json`, created mode `0600`. It stores no secrets. Add more allowlisted profiles by editing `hosts`; see [config.example.json](config.example.json).
+Add future servers with another concrete alias and `hosts add`; there is no five-host ceiling. Use `--read-only` for inspection-only profiles. The default local config is `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml) documents limits. It contains aliases, roots, descriptions, and limits—never credentials.
 
-## Install in Codex
+`doctor devbox --verbose-ssh` runs a bounded local OpenSSH diagnostic and redacts identity paths, agent sockets, commands, and credential-like fields.
 
-The folder is already a valid plugin bundle. When distributing through a Codex marketplace, install the plugin and start a new task; its `.mcp.json` launches `python3 ./mcp/server.py` and the Skill declares that MCP dependency.
+## Install for local Codex
 
-For direct local development without a marketplace, register the same two components:
+The package contains a normal Codex plugin manifest, Skill, and local stdio MCP manifest. Codex documents that desktop, CLI, and IDE clients on one host share MCP configuration, and that a plugin can bundle both Skills and `.mcp.json` servers ([MCP](https://learn.chatgpt.com/docs/extend/mcp), [plugins](https://learn.chatgpt.com/docs/build-plugins)).
+
+For a direct user installation, review the dry run first:
 
 ```bash
-python3 /home/wkj/projects/codex-ssh-bridge/scripts/install-local
-python3 /home/wkj/projects/codex-ssh-bridge/scripts/install-local --apply
+./bin/codex-ssh-bridge install --user
+./bin/codex-ssh-bridge install --user --apply
+codex mcp get ssh-bridge --json
 ```
 
-The first command is a dry run. The installer refuses to overwrite a different MCP entry or Skill path. It performs the equivalent of `codex mcp add ssh-bridge -- python3 /absolute/path/mcp/server.py` plus a user Skill symlink.
+The installer:
 
-Then restart Codex or start a new task. `codex mcp list` should show `ssh-bridge`; invoke `$remote-ssh-ops` once to verify discovery.
+- accepts only this canonical Rust package layout;
+- refuses an unrelated MCP entry or Skill target;
+- validates trusted source ancestors and the complete Skill tree;
+- serializes bridge-managed install/uninstall transactions with a private user lock;
+- journals mutations and compensates a partially successful Codex CLI call;
+- stores a private content-hashed installation identity;
+- is dry-run unless `--apply` is explicit.
 
-For the direct MCP entry, use Codex's `writes` approval mode so read-only annotations can remain low-friction while `ssh_run` and `ssh_write_file` prompt:
+Uninstall follows the same rule:
+
+```bash
+./bin/codex-ssh-bridge uninstall --user
+./bin/codex-ssh-bridge uninstall --user --apply
+```
+
+Start a new Codex task after installing or updating so the Skill and MCP surface are reloaded. The user running the bridge is the local installation trust boundary: another process running as that same Unix user can bypass the bridge and edit Codex configuration directly because the Codex CLI does not expose compare-and-swap removal.
+
+For a direct MCP entry, Codex can prompt only for tools not marked read-only:
 
 ```toml
 [mcp_servers.ssh-bridge]
 default_tools_approval_mode = "writes"
 ```
 
-MCP annotations are hints rather than a sandbox; the MCP specification recommends human confirmation and treats annotations as untrusted unless the server itself is trusted ([MCP tools specification](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)).
+## Agent workflow
 
-## Use
-
-Prompt examples:
+Invoke the Skill explicitly when useful:
 
 ```text
-Use $remote-ssh-ops to inspect the devbox repository and run its tests.
-Use $remote-ssh-ops to read the last 200 application log lines on devbox.
-Mount the devbox project with SSHFS for local browsing, but run all commands remotely.
+Use $remote-ssh-ops to inspect the devbox repository, patch the timeout bug, and run its focused tests.
+Use $remote-ssh-ops to search devbox logs without downloading unbounded output.
 ```
 
-Direct CLI examples:
+The nine MCP tools are:
+
+| Read-oriented | Mutation/command |
+|---|---|
+| `remote_hosts`, `remote_list`, `remote_stat`, `remote_search`, `remote_read`, `remote_output_read` | `remote_apply_patch`, `remote_write`, `remote_run` |
+
+The default flow is bounded search/read → unified patch → remote verification. Calls are synchronous. Oversized detail is retained under an opaque `output_ref` and paged with `remote_output_read`, so the Agent never needs to reconstruct transport logic.
+
+`remote_run` accepts one command string plus `shell: auto|bash|sh|login`. Prefer POSIX syntax. `auto` may fall back to sh; request Bash explicitly for Bash-only syntax. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
+
+## Human direct CLI
+
+The direct CLI accepts argv and handles shell-word encoding inside the bridge:
 
 ```bash
-python3 scripts/codex-ssh hosts
-python3 scripts/codex-ssh run devbox --cwd . -- git status --short
-python3 scripts/codex-ssh mount devbox /absolute/local/mountpoint
-python3 scripts/codex-ssh unmount /absolute/local/mountpoint
+./bin/codex-ssh-bridge hosts list
+./bin/codex-ssh-bridge run devbox --cwd . --shell auto -- git status --short
 ```
 
-## Security boundary
+This is convenient for a person or a diagnostic. Model-driven work should use MCP so results remain structured and approvals follow tool annotations.
 
-- The bridge always uses an allowlisted alias, `BatchMode=yes`, `StrictHostKeyChecking=yes`, no TTY, no agent/X11/port forwarding, and a dedicated short-lived multiplexing socket under `~/.ssh`.
-- Arbitrary `ssh_run` is potentially destructive and is disabled on `read_only` profiles.
-- File tools enforce a configured byte limit and lexical root check. A symlink may still escape that root, so remote account permissions are the hard boundary.
-- Commands are non-interactive. A local timeout closes the SSH process group, but detached remote processes require separate inspection.
-- Remote output may contain prompt injection or secrets. The Skill directs Codex to treat it as untrusted data and to avoid unbounded retrieval.
+## Optional SSHFS
+
+Mount only when a person explicitly wants local browsing:
+
+```bash
+mkdir -p /absolute/local/mountpoint
+./bin/codex-ssh-bridge mount devbox /absolute/local/mountpoint --remote-path .
+./bin/codex-ssh-bridge mount-status /absolute/local/mountpoint
+./bin/codex-ssh-bridge unmount /absolute/local/mountpoint
+```
+
+The CLI requires a real absolute current-user-owned mountpoint, refuses nonempty directories without `--allow-nonempty`, forces `ro` for read-only profiles, and never enables `allow_other`. It prints that the mount is remote and not an Agent workspace.
+
+Use SSHFS for browsing or narrow human editing. Keep builds, Git, tests, containers, and services on the server through `remote_run`. SFTP/FUSE workloads add a round trip to many metadata operations; caching, permissions, hardlinks, rename behavior, and broken-connection recovery also differ from a native filesystem. See the [SSHFS documentation](https://github.com/libfuse/sshfs).
+
+## Security and performance
+
+The bridge forces non-interactive authentication, strict host keys, no agent/X11/port forwarding, no local command, no TTY, bounded connection time, encrypted keepalives, and a private hashed ControlMaster socket. It never accepts arbitrary SSH options from MCP. Remote output remains untrusted and remote Unix permissions are the hard isolation boundary.
+
+Read [docs/security.md](docs/security.md) for the complete trust model and flags. Read [docs/performance.md](docs/performance.md) for reproducible commands and raw measurements.
+
+OpenAI's official SSH Remote workflow currently requires installing and authenticating Codex on the remote host ([Remote connections](https://learn.chatgpt.com/docs/remote-connections#connect-to-an-ssh-host)). This bridge deliberately keeps that identity and runtime local.
