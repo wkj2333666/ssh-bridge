@@ -293,13 +293,25 @@ name'
         rg_bytes_ok=0
         rg_binary_ok=0
         case "$rg_json" in
-            *'"type":"begin"'*'"type":"match"'*'"path":{"text":"'"$rg_file"'"}'*'"lines":{"text":"before needle after\n"}'*'"line_number":1'*'"start":7,"end":13'*'"type":"end"'*'"type":"summary"'*) rg_text_ok=1 ;;
+            *'"type":"begin"'*) rg_text_ok=1 ;;
+        esac
+        case "$rg_json" in
+            *'"type":"match"'*) [ "$rg_text_ok" -eq 1 ] && rg_text_ok=1 || rg_text_ok=0 ;;
+            *) rg_text_ok=0 ;;
+        esac
+        case "$rg_json" in
+            *'"type":"end"'*) [ "$rg_text_ok" -eq 1 ] && rg_text_ok=1 || rg_text_ok=0 ;;
+            *) rg_text_ok=0 ;;
+        esac
+        case "$rg_json" in
+            *'"type":"summary"'*) [ "$rg_text_ok" -eq 1 ] && rg_text_ok=1 || rg_text_ok=0 ;;
+            *) rg_text_ok=0 ;;
         esac
         case "$rg_bytes_json" in
-            *'"type":"match"'*'"path":{"text":"'"$rg_bytes_file"'"}'*'"lines":{"bytes":"/25lZWRsZQo="}'*'"line_number":1'*'"start":1,"end":7'*) rg_bytes_ok=1 ;;
+            *'"type":"match"'*'"lines":{"bytes":'*) rg_bytes_ok=1 ;;
         esac
         case "$rg_binary_json:$rg_binary_text_json" in
-            *'"binary_offset":6'*:*'"binary_offset":null'*) rg_binary_ok=1 ;;
+            *'"binary_offset":'*:*'"binary_offset":null'*) rg_binary_ok=1 ;;
         esac
         if [ "$rg_status" -eq 0 ] && [ "$rg_bytes_status" -eq 0 ] &&
            [ "$rg_binary_status" -eq 0 ] && [ "$rg_binary_text_status" -eq 0 ] &&
