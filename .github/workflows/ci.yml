@@ -33,6 +33,11 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup component add rustfmt clippy --toolchain "$RUST_TOOLCHAIN"
 
+      - name: Install command-line test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+
       - name: Check formatting
         run: cargo +"$RUST_TOOLCHAIN" fmt --all -- --check
 
