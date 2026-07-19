@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, ResolvedHost};
 use crate::error::{BridgeError, BridgeResult};
 
+pub(crate) use argv::ValidatedMountpoint;
 pub use argv::{build_ssh_argv, build_sshfs_argv, validate_sshfs_mountpoint};
 pub(crate) use process::{
     FixedOperationKind, FixedRunRequest, FixedRunResult, render_fixed_command,

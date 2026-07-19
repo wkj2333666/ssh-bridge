@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use codex_ssh_bridge::cli::{
     InstallLayout, LocalCommandSpec, RunArgs, ShellArg, doctor_host, install_user,
     mount_sshfs_with_executable, parse_sshfs_mount_status, redact_ssh_diagnostics,
-    run_local_command, run_remote_argv, uninstall_user, unmount_sshfs_with_executable,
+    run_local_command, run_remote_argv, uninstall_user,
 };
 use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile};
 use codex_ssh_bridge::output::OutputStore;
@@ -611,6 +611,7 @@ fn task9_mount_status_parser_decodes_mountinfo_and_distinguishes_other_fuse() {
         parse_sshfs_mount_status(sshfs, std::path::Path::new("/mnt/remote project")).unwrap();
     assert!(status.mounted);
     assert!(status.sshfs);
+    assert_eq!(status.mount_id, Some(36));
     assert_eq!(status.filesystem_type.as_deref(), Some("fuse.sshfs"));
 
     let other = b"36 25 0:32 / /mnt/remote\\040project rw,nosuid - fuse.other x rw\n";
@@ -661,39 +662,7 @@ async fn task9_mount_executes_hardened_sshfs_and_forces_profile_read_only() {
     ] {
         assert!(logged.lines().any(|line| line == option), "{logged}");
     }
-    assert!(logged.contains(mountpoint.to_str().unwrap()));
-}
-
-#[tokio::test]
-async fn task9_unmount_executes_only_for_identity_checked_sshfs_mount() {
-    let private = tempfile::TempDir::new().unwrap();
-    let mountpoint = private.path().join("mountpoint");
-    let log = private.path().join("unmount.log");
-    fs::create_dir(&mountpoint).unwrap();
-    let source = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >'{}'\n", log.display());
-    let helper = executable_script(private.path(), "fusermount3", &source);
-    let mountinfo = format!(
-        "36 25 0:32 / {} rw,nosuid - fuse.sshfs dev:/srv rw\n",
-        mountpoint.display()
-    );
-    let result = unmount_sshfs_with_executable(helper.clone(), &mountpoint, mountinfo.as_bytes())
-        .await
-        .unwrap();
-    assert_eq!(result["unmounted"], mountpoint.to_str().unwrap());
-    let logged = fs::read_to_string(&log).unwrap();
-    assert_eq!(
-        logged.lines().collect::<Vec<_>>(),
-        ["-u", mountpoint.to_str().unwrap()]
-    );
-
-    fs::remove_file(&log).unwrap();
-    let other = mountinfo.replace("fuse.sshfs", "fuse.other");
-    assert!(
-        unmount_sshfs_with_executable(helper, &mountpoint, other.as_bytes())
-            .await
-            .is_err()
-    );
-    assert!(!log.exists());
+    assert_eq!(logged.lines().nth(1), mountpoint.to_str());
 }
 
 struct InstallFixture {

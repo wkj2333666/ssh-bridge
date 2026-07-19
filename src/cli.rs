@@ -24,7 +24,7 @@ use crate::output::OutputStore;
 use crate::path::RemotePath;
 use crate::quote::shell_word;
 use crate::remote::{RemoteBridge, RemoteRunRequest, RemoteRunResult, RunShell, StatRequest};
-use crate::ssh::{RuntimePaths, SshRunner, build_sshfs_argv, validate_sshfs_mountpoint};
+use crate::ssh::{RuntimePaths, SshRunner, ValidatedMountpoint, build_sshfs_argv};
 
 mod install;
 pub use install::{InstallLayout, InstallReport, install_user, uninstall_user};
@@ -289,6 +289,7 @@ pub struct MountStatus {
     pub mountpoint: PathBuf,
     pub mounted: bool,
     pub sshfs: bool,
+    pub mount_id: Option<u64>,
     pub filesystem_type: Option<String>,
 }
 
@@ -322,6 +323,14 @@ pub fn parse_sshfs_mount_status(bytes: &[u8], mountpoint: &Path) -> BridgeResult
         if decode_mountinfo_field(encoded_mountpoint)? != expected {
             continue;
         }
+        let mount_id = before
+            .split(|byte| *byte == b' ')
+            .next()
+            .ok_or_else(|| BridgeError::invalid_argument("mountinfo mount ID is missing"))?;
+        let mount_id = std::str::from_utf8(mount_id)
+            .map_err(|_| BridgeError::invalid_argument("mountinfo mount ID is not UTF-8"))?
+            .parse::<u64>()
+            .map_err(|_| BridgeError::invalid_argument("mountinfo mount ID is invalid"))?;
         let filesystem = after
             .split(|byte| *byte == b' ')
             .next()
@@ -334,6 +343,7 @@ pub fn parse_sshfs_mount_status(bytes: &[u8], mountpoint: &Path) -> BridgeResult
             mountpoint: mountpoint.to_owned(),
             mounted: true,
             sshfs: filesystem == "fuse.sshfs",
+            mount_id: Some(mount_id),
             filesystem_type: Some(filesystem),
         });
     }
@@ -341,6 +351,7 @@ pub fn parse_sshfs_mount_status(bytes: &[u8], mountpoint: &Path) -> BridgeResult
         mountpoint: mountpoint.to_owned(),
         mounted: false,
         sshfs: false,
+        mount_id: None,
         filesystem_type: None,
     })
 }
@@ -376,21 +387,29 @@ pub async fn mount_sshfs_with_executable(
 ) -> BridgeResult<serde_json::Value> {
     let host = runner.config().host(&arguments.host)?;
     let remote = RemotePath::resolve(&host.profile.root, &arguments.remote_path)?;
-    let mountpoint = validate_sshfs_mountpoint(&arguments.mountpoint, arguments.allow_nonempty)?;
+    let mountpoint = ValidatedMountpoint::open(&arguments.mountpoint, arguments.allow_nonempty)?;
     let timeout_ms = host.limits.connect_timeout_ms;
     let cancel = CancellationToken::new();
     let (policy, capability) = runner.prepare_host(host.alias, &cancel).await?;
     let host = runner.config().host(&arguments.host)?;
+    // Keep the helper operand as the real path. libfuse resolves only its
+    // parent before applying final-component checks, and fusermount3 uses
+    // UMOUNT_NOFOLLOW. A reproducible compatibility probe is:
+    // `exec 9<"$mountpoint"; fusermount3 -u /proc/self/fd/9`.
+    // Thus a procfd is useful for our own checks but is not a portable helper
+    // operand; the retained fd plus this last-moment rebind check is the
+    // strongest compatible boundary.
     let argv = build_sshfs_argv(
         &policy,
         host,
         remote.absolute(),
-        &mountpoint,
+        mountpoint.path(),
         arguments.allow_nonempty,
     )?;
     let timeout = Duration::from_millis(timeout_ms)
         .checked_add(Duration::from_secs(5))
         .ok_or_else(|| BridgeError::invalid_argument("SSHFS timeout is too large"))?;
+    mountpoint.ensure_path_binding()?;
     let output = run_local_command(LocalCommandSpec {
         executable,
         arguments: argv,
@@ -410,7 +429,7 @@ pub async fn mount_sshfs_with_executable(
         "host": arguments.host,
         "configured_remote_path": remote.absolute(),
         "physical_root": capability.physical_root,
-        "mountpoint": mountpoint,
+        "mountpoint": mountpoint.path(),
         "read_only": host.profile.read_only,
         "warning": "Files remain remote; this FUSE mount is not an Agent workspace. Run builds, tests, Git, and services through remote_run or this CLI run command.",
     }))
@@ -419,18 +438,48 @@ pub async fn mount_sshfs_with_executable(
 pub async fn unmount_sshfs_with_executable(
     executable: PathBuf,
     mountpoint: &Path,
-    mountinfo: &[u8],
 ) -> BridgeResult<serde_json::Value> {
-    let mountpoint = validate_sshfs_mountpoint(mountpoint, true)?;
-    let status = parse_sshfs_mount_status(mountinfo, &mountpoint)?;
+    unmount_sshfs_with_mountinfo_reader(executable, mountpoint, || {
+        read_bounded_local_file(Path::new("/proc/self/mountinfo"), 1024 * 1024)
+    })
+    .await
+}
+
+// Test seam for supplying mountinfo. Kept private so production callers cannot
+// bypass the fresh /proc/self/mountinfo read in unmount_sshfs_with_executable.
+async fn unmount_sshfs_with_mountinfo_reader<F>(
+    executable: PathBuf,
+    mountpoint: &Path,
+    read_mountinfo: F,
+) -> BridgeResult<serde_json::Value>
+where
+    F: FnOnce() -> BridgeResult<Vec<u8>>,
+{
+    let mountpoint = ValidatedMountpoint::open(mountpoint, true)?;
+    let opened_mount_id = mountpoint.mount_id()?;
+    let mountinfo = read_mountinfo()?;
+    mountpoint.ensure_path_binding()?;
+    let status = parse_sshfs_mount_status(&mountinfo, mountpoint.path())?;
     if !status.sshfs {
         return Err(BridgeError::invalid_argument(
             "refusing to unmount a path that is not currently an SSHFS mount",
         ));
     }
+    if status.mount_id != Some(opened_mount_id) {
+        return Err(BridgeError::invalid_argument(
+            "refusing to unmount because mount identity changed during validation",
+        ));
+    }
+    // A same-UID process can still race after this check, but it can also call
+    // fusermount3 directly. The bridge's local trust boundary is the UID; the
+    // retained fd, mount ID, and rebind check prevent accidental/stale targets.
+    mountpoint.ensure_path_binding()?;
     let output = run_local_command(LocalCommandSpec {
         executable,
-        arguments: vec![OsString::from("-u"), mountpoint.as_os_str().to_owned()],
+        arguments: vec![
+            OsString::from("-u"),
+            mountpoint.path().as_os_str().to_owned(),
+        ],
         timeout: Duration::from_secs(30),
         max_output_bytes: 64 * 1024,
     })
@@ -442,7 +491,7 @@ pub async fn unmount_sshfs_with_executable(
             false,
         ));
     }
-    Ok(json!({ "unmounted": mountpoint }))
+    Ok(json!({ "unmounted": mountpoint.path() }))
 }
 
 #[derive(Debug)]
@@ -780,13 +829,9 @@ fn run_mount_status(arguments: MountpointArgs) -> BridgeResult<()> {
 }
 
 async fn run_unmount(arguments: MountpointArgs) -> BridgeResult<()> {
-    let bytes = read_bounded_local_file(Path::new("/proc/self/mountinfo"), 1024 * 1024)?;
-    let value = unmount_sshfs_with_executable(
-        PathBuf::from("/usr/bin/fusermount3"),
-        &arguments.mountpoint,
-        &bytes,
-    )
-    .await?;
+    let value =
+        unmount_sshfs_with_executable(PathBuf::from("/usr/bin/fusermount3"), &arguments.mountpoint)
+            .await?;
     print_json(&value)
 }
 
@@ -990,4 +1035,106 @@ fn print_json(value: &serde_json::Value) -> BridgeResult<()> {
         .map_err(|error| BridgeError::io(format!("cannot render CLI output: {error}")))?;
     println!("{rendered}");
     Ok(())
+}
+
+#[cfg(test)]
+mod sshfs_identity_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn executable_script(directory: &Path, name: &str, source: &str) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, source).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn mountinfo(mountpoint: &Path, mount_id: u64, filesystem: &str) -> Vec<u8> {
+        format!(
+            "{mount_id} 25 0:32 / {} rw,nosuid - {filesystem} dev:/srv rw\n",
+            mountpoint.display()
+        )
+        .into_bytes()
+    }
+
+    fn mount_id(mountpoint: &Path) -> u64 {
+        ValidatedMountpoint::open(mountpoint, true)
+            .unwrap()
+            .mount_id()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unmount_uses_fresh_mountinfo_and_the_revalidated_real_path() {
+        let private = tempfile::TempDir::new().unwrap();
+        let mountpoint = private.path().join("mountpoint");
+        let log = private.path().join("unmount.log");
+        fs::create_dir(&mountpoint).unwrap();
+        let source = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >'{}'\n", log.display());
+        let helper = executable_script(private.path(), "fusermount3", &source);
+        let current_mount_id = mount_id(&mountpoint);
+        let bytes = mountinfo(&mountpoint, current_mount_id, "fuse.sshfs");
+
+        let result = unmount_sshfs_with_mountinfo_reader(helper.clone(), &mountpoint, || Ok(bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(result["unmounted"], mountpoint.to_str().unwrap());
+        let logged = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            logged.lines().collect::<Vec<_>>(),
+            ["-u", mountpoint.to_str().unwrap()]
+        );
+
+        fs::remove_file(&log).unwrap();
+        let other = mountinfo(&mountpoint, current_mount_id, "fuse.other");
+        assert!(
+            unmount_sshfs_with_mountinfo_reader(helper, &mountpoint, || Ok(other))
+                .await
+                .is_err()
+        );
+        assert!(!log.exists());
+    }
+
+    #[tokio::test]
+    async fn unmount_rejects_a_path_replaced_while_fresh_mountinfo_is_read() {
+        let private = tempfile::TempDir::new().unwrap();
+        let mountpoint = private.path().join("mountpoint");
+        let moved = private.path().join("validated-directory");
+        let helper_log = private.path().join("helper.log");
+        fs::create_dir(&mountpoint).unwrap();
+        let current_mount_id = mount_id(&mountpoint);
+        let bytes = mountinfo(&mountpoint, current_mount_id, "fuse.sshfs");
+        let source = format!("#!/bin/sh\nprintf called >'{}'\n", helper_log.display());
+        let helper = executable_script(private.path(), "fusermount3-swap", &source);
+
+        let result = unmount_sshfs_with_mountinfo_reader(helper, &mountpoint, || {
+            fs::rename(&mountpoint, &moved).unwrap();
+            fs::create_dir(&mountpoint).unwrap();
+            Ok(bytes)
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!helper_log.exists());
+    }
+
+    #[tokio::test]
+    async fn unmount_rejects_mountinfo_for_a_different_mount_id() {
+        let private = tempfile::TempDir::new().unwrap();
+        let mountpoint = private.path().join("mountpoint");
+        let helper_log = private.path().join("helper.log");
+        fs::create_dir(&mountpoint).unwrap();
+        let different_mount_id = mount_id(&mountpoint).checked_add(1).unwrap();
+        let bytes = mountinfo(&mountpoint, different_mount_id, "fuse.sshfs");
+        let source = format!("#!/bin/sh\nprintf called >'{}'\n", helper_log.display());
+        let helper = executable_script(private.path(), "fusermount3-wrong-mount", &source);
+
+        let result = unmount_sshfs_with_mountinfo_reader(helper, &mountpoint, || Ok(bytes)).await;
+
+        assert!(result.is_err());
+        assert!(!helper_log.exists());
+    }
 }
