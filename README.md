@@ -47,6 +47,32 @@ cargo build --release
 
 There is no Python runtime or remote build step.
 
+## CI and release builds
+
+GitHub Actions runs formatting, Clippy, the full test suite, a release build,
+and source-package checks for pull requests and pushes to `main`.
+
+Release builds are created only from version tags. The tag must match the
+version in `Cargo.toml`; for example:
+
+```bash
+git tag v0.2.1
+git push origin v0.2.1
+```
+
+The release workflow publishes Linux binaries and SHA-256 files for:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `armv7-unknown-linux-gnueabihf`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+
+Download the archive matching the local Codex host, extract the binary to a
+private path, and put that absolute path in `.mcp.json.example` before
+registering the MCP server. Windows and macOS assets are not produced because
+the bridge currently requires Linux OpenSSH and Linux SSHFS tooling.
+
 ## Configure hosts
 
 Define and manually verify a concrete alias in local `~/.ssh/config`:
