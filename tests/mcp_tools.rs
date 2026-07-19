@@ -15,7 +15,7 @@ use codex_ssh_bridge::mcp::{
     WireBudget,
 };
 use codex_ssh_bridge::output::OutputStore;
-use codex_ssh_bridge::remote::RemoteBridge;
+use codex_ssh_bridge::remote::{RemoteBridge, RemoteRunRequest, RunShell};
 use codex_ssh_bridge::ssh::{RuntimePaths, SshRunner};
 use serde_json::{Value, json};
 use tokio::io::{
@@ -108,11 +108,19 @@ fn text_json(result: &Value) -> Value {
 }
 
 fn command_calls(log: &std::path::Path) -> usize {
+    transport_call_kinds(log)
+        .into_iter()
+        .filter(|kind| *kind == "C")
+        .count()
+}
+
+fn transport_call_kinds(log: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
-        .filter(|line| *line == "C")
-        .count()
+        .filter(|kind| matches!(*kind, "G" | "P" | "C"))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn write_binary_config(directory: &std::path::Path, contents: &str) -> std::path::PathBuf {
@@ -269,10 +277,18 @@ impl ProtocolSession {
     }
 
     async fn start_with_frame(tools: RemoteMcpTools, max_frame_bytes: usize) -> Self {
+        Self::start_with_limits(tools, max_frame_bytes, 4).await
+    }
+
+    async fn start_with_limits(
+        tools: RemoteMcpTools,
+        max_frame_bytes: usize,
+        concurrency: usize,
+    ) -> Self {
         let (client, server_io) = tokio::io::duplex(16 * 1024 * 1024);
         let (client_output, client_input) = tokio::io::split(client);
         let (server_input, server_output) = tokio::io::split(server_io);
-        let server = McpServer::new(Arc::new(tools), max_frame_bytes, 4).unwrap();
+        let server = McpServer::new(Arc::new(tools), max_frame_bytes, concurrency).unwrap();
         let server = tokio::spawn(server.serve(server_input, server_output));
         let mut session = Self {
             input: client_input,
@@ -309,11 +325,16 @@ impl ProtocolSession {
 
     async fn request(&mut self, frame: Value) -> Value {
         self.send(frame).await;
+        self.read_response(Duration::from_secs(5)).await
+    }
+
+    async fn read_response(&mut self, timeout: Duration) -> Value {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), self.output.read_line(&mut line))
+        tokio::time::timeout(timeout, self.output.read_line(&mut line))
             .await
             .expect("MCP response timed out")
             .unwrap();
+        assert!(!line.is_empty(), "MCP output reached EOF before a response");
         serde_json::from_str(&line).unwrap()
     }
 
@@ -1322,7 +1343,7 @@ async fn task8_dispatch_pre_cancelled_call_launches_no_ssh_process() {
         .await;
     let rendered = serde_json::to_value(result).unwrap();
     assert_eq!(rendered["structuredContent"]["error"]["code"], "CANCELLED");
-    assert_eq!(command_calls(&log), 0);
+    assert!(transport_call_kinds(&log).is_empty());
 }
 
 #[tokio::test]
@@ -1445,4 +1466,1028 @@ fn task8_error_rendering_real_compact_fallback_is_nonzero_and_fits_minimum() {
     let required = required_mcp_frame_bytes(tool_definitions(), fallback, &id).unwrap();
     assert!(fallback <= required);
     assert!(required <= codex_ssh_bridge::MAX_FRAME_BYTES);
+}
+
+fn task8_hostile_values(include_nul: bool) -> Vec<&'static str> {
+    let mut values = vec![
+        "spaces value",
+        "'",
+        "\"",
+        "line\nbreak",
+        "-leading-hyphen",
+        "*",
+        "$HOME",
+        "$(touch SHOULD_NOT_EXIST)",
+        "`touch SHOULD_NOT_EXIST`",
+        "Unicode-雪",
+    ];
+    if include_nul {
+        values.push("nul\0value");
+    }
+    values
+}
+
+fn command_records(log: &std::path::Path) -> Vec<(String, String)> {
+    let contents = std::fs::read_to_string(log).unwrap();
+    let records = contents
+        .split("END\n")
+        .filter(|record| record.starts_with("C\n"))
+        .collect::<Vec<_>>();
+    records
+        .into_iter()
+        .map(|record| {
+            let (argv_prefix, command) = record
+                .rsplit_once("\narg=")
+                .expect("command record has a final remote-command argument");
+            (
+                argv_prefix.to_owned(),
+                command.trim_end_matches('\n').to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn only_command_record(log: &std::path::Path) -> (String, String) {
+    let records = command_records(log);
+    assert_eq!(records.len(), 1, "unexpected fake SSH command count");
+    records.into_iter().next().unwrap()
+}
+
+fn fixed_command_shapes(log: &std::path::Path) -> Vec<(String, String)> {
+    command_records(log)
+        .into_iter()
+        .map(|(argv, command)| (argv, fixed_script_prefix(&command, " codex-ssh-bridge-op ")))
+        .collect()
+}
+
+fn fixed_script_prefix(command: &str, marker: &str) -> String {
+    command
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("remote command lacks {marker:?}: {command}"))
+        .0
+        .to_owned()
+}
+
+fn assert_hostile_marker_absent(remote: &std::path::Path) {
+    assert!(!remote.join("SHOULD_NOT_EXIST").exists());
+    assert!(!std::path::Path::new("SHOULD_NOT_EXIST").exists());
+}
+
+fn json_contains_exact_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_exact_string(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_exact_string(value, expected)),
+        _ => false,
+    }
+}
+
+fn json_contains_exact_encoded_bytes(value: &Value, expected: &[u8]) -> bool {
+    if let Value::Object(object) = value
+        && let (Some(encoding), Some(encoded)) = (
+            object.get("encoding").and_then(Value::as_str),
+            object.get("value").and_then(Value::as_str),
+        )
+    {
+        let matches = match encoding {
+            "utf8" => encoded.as_bytes() == expected,
+            "base64" => base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                encoded.as_bytes(),
+            )
+            .is_ok_and(|decoded| decoded == expected),
+            _ => false,
+        };
+        if matches {
+            return true;
+        }
+    }
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_exact_encoded_bytes(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_exact_encoded_bytes(value, expected)),
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn task8_hostile_path_and_cwd_are_data_only_and_nul_is_prelaunch() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, log, tools) = fake_remote_tools_fixture(remote.path());
+
+    call_json(
+        &tools,
+        "remote_list",
+        json!({"host":"dev","path":".","max_entries":1}),
+    )
+    .await;
+    let mut list_shape = None;
+    for value in task8_hostile_values(true) {
+        std::fs::write(&log, b"").unwrap();
+        let result = call_json(
+            &tools,
+            "remote_list",
+            json!({"host":"dev","path":value,"max_entries":1}),
+        )
+        .await;
+        if value.contains('\0') {
+            assert_eq!(result["isError"], true, "value={value:?}: {result}");
+            assert!(
+                transport_call_kinds(&log).is_empty(),
+                "rejected value launched transport: {value:?}"
+            );
+        } else {
+            let (argv, command) = only_command_record(&log);
+            let shape = (argv, fixed_script_prefix(&command, " codex-ssh-bridge-op "));
+            if let Some(expected) = &list_shape {
+                assert_eq!(&shape, expected, "path altered argv/script: {value:?}");
+            } else {
+                list_shape = Some(shape);
+            }
+        }
+        assert_hostile_marker_absent(remote.path());
+    }
+
+    call_json(
+        &tools,
+        "remote_run",
+        json!({"host":"dev","command":"printf safe","cwd":".","shell":"sh"}),
+    )
+    .await;
+    let mut run_shape = None;
+    for value in task8_hostile_values(true) {
+        std::fs::write(&log, b"").unwrap();
+        let result = call_json(
+            &tools,
+            "remote_run",
+            json!({"host":"dev","command":"printf safe","cwd":value,"shell":"sh"}),
+        )
+        .await;
+        if value.contains('\0') {
+            assert_eq!(result["isError"], true, "value={value:?}: {result}");
+            assert!(
+                transport_call_kinds(&log).is_empty(),
+                "rejected value launched transport: {value:?}"
+            );
+        } else {
+            let (argv, command) = only_command_record(&log);
+            let shape = (
+                argv,
+                fixed_script_prefix(&command, " codex-ssh-bridge-run "),
+            );
+            if let Some(expected) = &run_shape {
+                assert_eq!(&shape, expected, "cwd altered argv/wrapper: {value:?}");
+            } else {
+                run_shape = Some(shape);
+            }
+        }
+        assert_hostile_marker_absent(remote.path());
+    }
+}
+
+#[tokio::test]
+async fn task8_hostile_query_and_glob_are_data_only_with_closed_rejections() {
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::write(remote.path().join("needle.txt"), b"needle\n").unwrap();
+    let (_runtime, log, tools) = fake_remote_tools_fixture(remote.path());
+    call_json(
+        &tools,
+        "remote_search",
+        json!({"host":"dev","query":"needle","path":"."}),
+    )
+    .await;
+
+    let mut query_shape = None;
+    for value in task8_hostile_values(true) {
+        std::fs::write(&log, b"").unwrap();
+        let result = call_json(
+            &tools,
+            "remote_search",
+            json!({"host":"dev","query":value,"path":"."}),
+        )
+        .await;
+        if value.contains(['\0', '\n']) {
+            assert_eq!(result["isError"], true, "value={value:?}: {result}");
+            assert!(
+                transport_call_kinds(&log).is_empty(),
+                "rejected value launched transport: {value:?}"
+            );
+        } else {
+            let shape = fixed_command_shapes(&log);
+            assert_eq!(shape.len(), 2, "query must use the closed two-step search");
+            if let Some(expected) = &query_shape {
+                assert_eq!(&shape, expected, "query altered argv/script: {value:?}");
+            } else {
+                query_shape = Some(shape);
+            }
+        }
+        assert_hostile_marker_absent(remote.path());
+    }
+
+    let allowed_search_shapes = query_shape.expect("at least one valid query");
+    for value in task8_hostile_values(true) {
+        std::fs::write(&log, b"").unwrap();
+        let result = call_json(
+            &tools,
+            "remote_search",
+            json!({"host":"dev","query":"needle","path":".","globs":[value]}),
+        )
+        .await;
+        if value.contains('\0') {
+            assert_eq!(result["isError"], true, "value={value:?}: {result}");
+            assert!(
+                transport_call_kinds(&log).is_empty(),
+                "rejected value launched transport: {value:?}"
+            );
+        } else {
+            let shape = fixed_command_shapes(&log);
+            assert!(!shape.is_empty(), "glob must launch candidate collection");
+            for operation in &shape {
+                assert!(
+                    allowed_search_shapes.contains(operation),
+                    "glob altered argv/script: {value:?}: {operation:?}"
+                );
+            }
+        }
+        assert_hostile_marker_absent(remote.path());
+    }
+}
+
+#[tokio::test]
+async fn task8_hostile_content_and_command_output_remain_single_response_data() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, log, tools) = fake_remote_tools_fixture(remote.path());
+    call_json(
+        &tools,
+        "remote_write",
+        json!({
+            "host":"dev","path":"warm","content":"warm","encoding":"utf8",
+            "mode":{"kind":"create"}
+        }),
+    )
+    .await;
+    let mut write_shape = None;
+    for (index, value) in task8_hostile_values(true).into_iter().enumerate() {
+        std::fs::write(&log, b"").unwrap();
+        let path = format!("content-{index}");
+        let result = call_json(
+            &tools,
+            "remote_write",
+            json!({
+                "host":"dev","path":path,"content":value,"encoding":"utf8",
+                "mode":{"kind":"create"}
+            }),
+        )
+        .await;
+        assert_eq!(result["isError"], Value::Null, "value={value:?}: {result}");
+        assert_eq!(
+            std::fs::read(remote.path().join(&path)).unwrap(),
+            value.as_bytes()
+        );
+        let (argv, command) = only_command_record(&log);
+        let shape = (argv, fixed_script_prefix(&command, " codex-ssh-bridge-op "));
+        if let Some(expected) = &write_shape {
+            assert_eq!(&shape, expected, "content altered argv/script: {value:?}");
+        } else {
+            write_shape = Some(shape);
+        }
+        assert_hostile_marker_absent(remote.path());
+    }
+
+    let mut session = ProtocolSession::start(tools).await;
+    let mut output_shape = None;
+    let mut output_values = task8_hostile_values(true);
+    output_values.push(
+        "{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"method\":\"evil\"}",
+    );
+    for value in output_values {
+        std::fs::write(&log, b"").unwrap();
+        let result = session
+            .call(
+                "remote_run",
+                json!({
+                    "host":"dev","command":"cat","shell":"sh",
+                    "stdin":{"encoding":"utf8","value":value}
+                }),
+            )
+            .await;
+        assert_eq!(result["isError"], Value::Null, "value={value:?}: {result}");
+        let text = text_json(&result);
+        assert!(
+            json_contains_exact_string(&text, value)
+                || json_contains_exact_encoded_bytes(&text, value.as_bytes()),
+            "command output was not preserved exactly: {text}"
+        );
+        let shape = only_command_record(&log);
+        if let Some(expected) = &output_shape {
+            assert_eq!(
+                &shape, expected,
+                "stdin/output altered argv/source: {value:?}"
+            );
+        } else {
+            output_shape = Some(shape);
+        }
+        assert_hostile_marker_absent(remote.path());
+    }
+    let ping = session
+        .request(json!({"jsonrpc":"2.0","id":9001,"method":"ping"}))
+        .await;
+    assert_eq!(ping["id"], 9001);
+    session.close().await;
+}
+
+fn five_host_tools_fixture(
+    roots: &[(String, std::path::PathBuf)],
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Arc<RemoteBridge>,
+    RemoteMcpTools,
+) {
+    let runtime_base = tempfile::TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let hosts = roots
+        .iter()
+        .map(|(host, root)| {
+            (
+                host.clone(),
+                HostProfile {
+                    root: root.to_string_lossy().into_owned(),
+                    description: None,
+                    read_only: false,
+                    limits: HostLimitOverrides::default(),
+                },
+            )
+        })
+        .collect();
+    let config = Config {
+        limits: codex_ssh_bridge::config::Limits {
+            global_concurrency: 8,
+            per_host_concurrency: 2,
+            ..codex_ssh_bridge::config::Limits::default()
+        },
+        hosts,
+        ..Config::default()
+    };
+    let log = runtime_base.path().join("ssh.log");
+    let environment = BTreeMap::from([
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("local-fixed"),
+        ),
+        (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
+    ]);
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config),
+            runtime,
+            store,
+            support::fake_ssh_path(),
+            environment,
+        )
+        .unwrap(),
+    );
+    let bridge = Arc::new(RemoteBridge::new(runner));
+    let tools = RemoteMcpTools::new(Arc::clone(&bridge));
+    (runtime_base, log, bridge, tools)
+}
+
+#[tokio::test]
+async fn task8_five_hosts_pipeline_in_parallel_with_exact_context_and_no_sixth_call() {
+    let roots = (0..5)
+        .map(|index| {
+            let root = tempfile::TempDir::new().unwrap();
+            (format!("host-{index}"), root)
+        })
+        .collect::<Vec<_>>();
+    let root_paths = roots
+        .iter()
+        .map(|(host, root)| (host.clone(), root.path().to_owned()))
+        .collect::<Vec<_>>();
+    let (_runtime, log, _bridge, tools) = five_host_tools_fixture(&root_paths);
+
+    for (host, _) in &root_paths {
+        let warm = call_json(
+            &tools,
+            "remote_run",
+            json!({"host":host,"command":":","shell":"sh"}),
+        )
+        .await;
+        assert_eq!(warm["isError"], Value::Null, "warm host={host}: {warm}");
+    }
+    std::fs::write(&log, b"").unwrap();
+
+    let mut session =
+        ProtocolSession::start_with_limits(tools, codex_ssh_bridge::MAX_FRAME_BYTES, 8).await;
+    let started = Instant::now();
+    for (index, (host, _)) in root_paths.iter().enumerate() {
+        let id = 100 + index as u64;
+        session
+            .send(json!({
+                "jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"remote_run","arguments":{
+                    "host":host,
+                    "command":format!("sleep 1; printf HOST-{index}"),
+                    "shell":"sh"
+                }}
+            }))
+            .await;
+    }
+    let mut responses = BTreeMap::new();
+    for _ in 0..5 {
+        let response = session.read_response(Duration::from_secs(3)).await;
+        let id = response["id"].as_u64().unwrap();
+        assert!(responses.insert(id, response).is_none());
+    }
+    let elapsed = started.elapsed();
+    if !cfg!(debug_assertions) {
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "five-host release elapsed={elapsed:?}"
+        );
+    }
+    for (index, (host, root)) in root_paths.iter().enumerate() {
+        let id = 100 + index as u64;
+        let result = &responses[&id]["result"];
+        assert_eq!(result["isError"], Value::Null, "host={host}: {result}");
+        assert_eq!(result["structuredContent"]["host"], host.as_str());
+        assert_eq!(
+            result["structuredContent"]["physical_root"],
+            root.to_string_lossy().as_ref()
+        );
+        let text = text_json(result);
+        assert!(
+            json_contains_exact_encoded_bytes(&text, format!("HOST-{index}").as_bytes()),
+            "host output was interleaved or lost: {text}"
+        );
+    }
+    assert_eq!(
+        transport_call_kinds(&log),
+        vec!["C"; 5],
+        "a sixth or non-command implicit SSH call occurred"
+    );
+    eprintln!("five-host MCP release sample: elapsed={elapsed:?}");
+    session.close().await;
+    drop(roots);
+}
+
+async fn wait_for_file(path: &std::path::Path, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
+}
+
+fn process_group_id(pid: u32) -> i32 {
+    // SAFETY: getpgid only inspects kernel process metadata for the supplied PID.
+    let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+    assert!(group > 0, "failed to resolve process group for PID {pid}");
+    group
+}
+
+fn process_group_exists(group: i32) -> bool {
+    // SAFETY: signal zero performs an existence/permission check and sends no signal.
+    let status = unsafe { libc::kill(-group, 0) };
+    status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+async fn wait_for_process_group_exit(group: i32, timeout: Duration) -> Duration {
+    let started = Instant::now();
+    tokio::time::timeout(timeout, async {
+        while process_group_exists(group) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process group {group} survived cancellation for {timeout:?}"));
+    started.elapsed()
+}
+
+fn regular_file_count(directory: &std::path::Path) -> usize {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.unwrap())
+        .map(|entry| {
+            if entry.file_type().unwrap().is_dir() {
+                regular_file_count(&entry.path())
+            } else if entry.file_type().unwrap().is_file() {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+fn cancellation_tools_fixture() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Arc<RemoteBridge>,
+    RemoteMcpTools,
+) {
+    let remote = tempfile::TempDir::new().unwrap();
+    let runtime_base = tempfile::TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let log = runtime_base.path().join("ssh.log");
+    let pid_file = runtime_base.path().join("command-child.pid");
+    let environment = BTreeMap::from([
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("local-fixed"),
+        ),
+        (
+            OsString::from("FAKE_SSH_FIXED_SLEEP_SECONDS"),
+            OsString::from("10"),
+        ),
+        (OsString::from("FAKE_SSH_IGNORE_TERM"), OsString::from("1")),
+        (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
+        (
+            OsString::from("FAKE_SSH_CHILD_PID_FILE"),
+            pid_file.as_os_str().to_owned(),
+        ),
+    ]);
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            Arc::new(support::config_with_host(
+                "dev",
+                remote.path().to_str().unwrap(),
+            )),
+            runtime,
+            store,
+            support::fake_ssh_path(),
+            environment,
+        )
+        .unwrap(),
+    );
+    let bridge = Arc::new(RemoteBridge::new(runner));
+    let tools = RemoteMcpTools::new(Arc::clone(&bridge));
+    (runtime_base, remote, log, pid_file, bridge, tools)
+}
+
+#[tokio::test]
+async fn task8_cancel_process_mcp_reaches_group_under_250ms_and_service_recovers() {
+    let (runtime, remote, log, pid_file, bridge, tools) = cancellation_tools_fixture();
+    let mut session = ProtocolSession::start(tools).await;
+    let cancelled_id = 41;
+    session
+        .send(json!({
+            "jsonrpc":"2.0","id":cancelled_id,"method":"tools/call",
+            "params":{"name":"remote_run","arguments":{
+                "host":"dev","command":"printf NEVER","shell":"sh"
+            }}
+        }))
+        .await;
+    wait_for_file(&pid_file, Duration::from_secs(2)).await;
+    let pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let process_group = process_group_id(pid);
+    let started = Instant::now();
+    session
+        .send(json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":cancelled_id,"reason":"hostile\n$(touch SHOULD_NOT_EXIST)\0雪"}
+        }))
+        .await;
+    session
+        .send(json!({"jsonrpc":"2.0","id":42,"method":"ping"}))
+        .await;
+    let process_elapsed =
+        wait_for_process_group_exit(process_group, Duration::from_millis(250)).await;
+    let cancel_elapsed = started.elapsed();
+    assert!(
+        cancel_elapsed < Duration::from_millis(250),
+        "cancel-to-process-exit={cancel_elapsed:?}, process-poll={process_elapsed:?}"
+    );
+    let ping = session.read_response(Duration::from_secs(1)).await;
+    assert_eq!(
+        ping["id"], 42,
+        "cancelled request leaked a response: {ping}"
+    );
+    session
+        .send(json!({
+            "jsonrpc":"2.0","id":43,"method":"tools/call",
+            "params":{"name":"remote_hosts","arguments":{}}
+        }))
+        .await;
+    let hosts = session.read_response(Duration::from_secs(1)).await;
+    assert_eq!(hosts["id"], 43);
+    assert_eq!(hosts["result"]["structuredContent"]["host_count"], 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), session.output.fill_buf())
+            .await
+            .is_err(),
+        "cancelled request emitted a late MCP response"
+    );
+    assert_hostile_marker_absent(remote.path());
+    assert_eq!(
+        regular_file_count(runtime.path().join("codex-ssh-bridge").as_path()),
+        0,
+        "cancelled MCP call left a spool file"
+    );
+
+    let direct_cancel = CancellationToken::new();
+    let direct_bridge = Arc::clone(&bridge);
+    let task_cancel = direct_cancel.clone();
+    let prior_calls = command_calls(&log);
+    let direct = tokio::spawn(async move {
+        direct_bridge
+            .run(
+                RemoteRunRequest {
+                    host: "dev".to_owned(),
+                    command: "printf NEVER".to_owned(),
+                    cwd: None,
+                    shell: RunShell::Sh,
+                    timeout_ms: None,
+                    stdin: None,
+                },
+                task_cancel,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while command_calls(&log) == prior_calls {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("direct bridge command did not start");
+    direct_cancel.cancel();
+    let error = direct.await.unwrap().unwrap_err();
+    assert_eq!(
+        error.details.remote_process_may_continue,
+        Some(true),
+        "MCP suppression must not erase direct bridge cancellation truth"
+    );
+    eprintln!(
+        "MCP cancellation release sample: total={cancel_elapsed:?} process_poll={process_elapsed:?}"
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn task8_hostile_cancellation_reason_matrix_is_local_data_only() {
+    let (_runtime, remote, log, pid_file, _bridge, tools) = cancellation_tools_fixture();
+    let mut session = ProtocolSession::start(tools).await;
+    for (index, reason) in task8_hostile_values(true).into_iter().enumerate() {
+        let request_id = 1_000 + index as u64;
+        let ping_id = 2_000 + index as u64;
+        if pid_file.exists() {
+            std::fs::remove_file(&pid_file).unwrap();
+        }
+        let prior_calls = command_calls(&log);
+        session
+            .send(json!({
+                "jsonrpc":"2.0","id":request_id,"method":"tools/call",
+                "params":{"name":"remote_run","arguments":{
+                    "host":"dev","command":"printf NEVER","shell":"sh"
+                }}
+            }))
+            .await;
+        wait_for_file(&pid_file, Duration::from_secs(2)).await;
+        assert_eq!(command_calls(&log), prior_calls + 1);
+        session
+            .send(json!({
+                "jsonrpc":"2.0","method":"notifications/cancelled",
+                "params":{"requestId":request_id,"reason":reason}
+            }))
+            .await;
+        session
+            .send(json!({"jsonrpc":"2.0","id":ping_id,"method":"ping"}))
+            .await;
+        let response = session.read_response(Duration::from_secs(1)).await;
+        assert_eq!(response["id"], ping_id, "reason={reason:?}: {response}");
+        assert_hostile_marker_absent(remote.path());
+    }
+    session.close().await;
+}
+
+fn duration_percentile(samples: &mut [Duration], percentile: usize) -> Duration {
+    assert!(!samples.is_empty());
+    assert!((1..=100).contains(&percentile));
+    samples.sort_unstable();
+    let index = (samples.len() * percentile).div_ceil(100) - 1;
+    samples[index]
+}
+
+fn report_latency_samples(label: &str, samples: &mut [Duration]) -> (Duration, Duration, Duration) {
+    let p50 = duration_percentile(samples, 50);
+    let p95 = duration_percentile(samples, 95);
+    let maximum = *samples.last().unwrap();
+    eprintln!(
+        "{label}: samples={} p50={p50:?} p95={p95:?} max={maximum:?}",
+        samples.len()
+    );
+    (p50, p95, maximum)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task78_release_dispatch_p95_is_below_two_milliseconds() {
+    const WARM_CALLS: usize = 16;
+    const MEASURED_CALLS: usize = 200;
+    let (_runtime, _bridge, tools) = remote_tools_fixture();
+    for _ in 0..WARM_CALLS {
+        let result = tools
+            .call("remote_hosts".to_owned(), json!({}), roomy_context())
+            .await;
+        std::hint::black_box(result);
+    }
+    let mut samples = Vec::with_capacity(MEASURED_CALLS);
+    for _ in 0..MEASURED_CALLS {
+        let started = Instant::now();
+        let result = tools
+            .call("remote_hosts".to_owned(), json!({}), roomy_context())
+            .await;
+        samples.push(started.elapsed());
+        std::hint::black_box(result);
+    }
+    let (_, p95, _) =
+        report_latency_samples("bridge-only MCP dispatch release sample", &mut samples);
+    if !cfg!(debug_assertions) {
+        assert!(
+            p95 < Duration::from_millis(2),
+            "bridge-only dispatch p95={p95:?}, raw={samples:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task78_release_fake_call_p95_is_below_ten_milliseconds() {
+    const WARM_CALLS: usize = 16;
+    const MEASURED_CALLS: usize = 120;
+    let remote = tempfile::TempDir::new().unwrap();
+    let (_runtime, _log, tools) = fake_remote_tools_with_options(
+        remote.path(),
+        false,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("streams")),
+            ("FAKE_SSH_STDOUT", OsString::from("fake-call")),
+            ("FAKE_SSH_STDERR", OsString::from("")),
+        ],
+    );
+    let arguments = json!({"host":"dev","command":":","shell":"sh"});
+    for _ in 0..WARM_CALLS {
+        let result = call_json(&tools, "remote_run", arguments.clone()).await;
+        assert_eq!(result["isError"], Value::Null, "{result}");
+    }
+    let mut samples = Vec::with_capacity(MEASURED_CALLS);
+    for _ in 0..MEASURED_CALLS {
+        let started = Instant::now();
+        let result = call_json(&tools, "remote_run", arguments.clone()).await;
+        samples.push(started.elapsed());
+        assert_eq!(result["isError"], Value::Null, "{result}");
+    }
+    let (_, p95, _) =
+        report_latency_samples("complete fake-SSH MCP call release sample", &mut samples);
+    if !cfg!(debug_assertions) {
+        assert!(
+            p95 < Duration::from_millis(10),
+            "complete fake-SSH call p95={p95:?}, raw={samples:?}"
+        );
+    }
+}
+
+fn resident_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap()
+}
+
+fn compact_context() -> ToolCallContext {
+    let compact = codex_ssh_bridge::mcp::maximum_compact_fallback_result_bytes();
+    ToolCallContext {
+        cancel: CancellationToken::new(),
+        wire_budget: WireBudget {
+            result_bytes: compact,
+            compact_fallback_bytes: compact,
+        },
+    }
+}
+
+fn retention_models_fixture(
+    base: &std::path::Path,
+) -> (tempfile::TempDir, RemoteMcpTools, Value, Value, Value) {
+    let mut root = base.to_owned();
+    for index in 0..14 {
+        root.push(format!("root-{index:02}-{}", "r".repeat(224)));
+        std::fs::create_dir(&root).unwrap();
+    }
+    for index in 0..1_000 {
+        let name = format!("list-{index:04}-{}", "l".repeat(180));
+        std::fs::write(root.join(name), b"x").unwrap();
+    }
+    let search_line = format!("needle {}\n", "s".repeat(2_992));
+    std::fs::write(root.join("search.txt"), search_line.repeat(500)).unwrap();
+    let stat_paths = (0..256)
+        .map(|index| format!("missing-{index:03}-{}", "p".repeat(2_000)))
+        .collect::<Vec<_>>();
+
+    let runtime_base = tempfile::TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let config = Config {
+        hosts: BTreeMap::from([(
+            "dev".to_owned(),
+            HostProfile {
+                root: root.to_string_lossy().into_owned(),
+                description: Some("h".repeat(2 * 1024 * 1024)),
+                read_only: false,
+                limits: HostLimitOverrides::default(),
+            },
+        )]),
+        ..Config::default()
+    };
+    let environment = BTreeMap::from([
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("local-fixed"),
+        ),
+        (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
+    ]);
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config),
+            runtime,
+            store,
+            support::fake_ssh_path(),
+            environment,
+        )
+        .unwrap(),
+    );
+    let bridge = Arc::new(RemoteBridge::new(runner));
+    (
+        runtime_base,
+        RemoteMcpTools::new(bridge),
+        json!({"host":"dev","path":".","max_entries":1_000}),
+        json!({"host":"dev","paths":stat_paths}),
+        json!({
+            "host":"dev","query":"needle","path":".","max_results":500
+        }),
+    )
+}
+
+async fn retain_all_large_models(
+    tools: &RemoteMcpTools,
+    list_args: Value,
+    stat_args: Value,
+    search_args: Value,
+) -> Vec<Value> {
+    let mut retained = Vec::new();
+    for (name, count_field, expected_count, arguments) in [
+        ("remote_hosts", "host_count", 1, json!({})),
+        ("remote_list", "entry_count", 1_000, list_args),
+        ("remote_stat", "entry_count", 256, stat_args),
+        ("remote_search", "match_count", 500, search_args),
+    ] {
+        let result = serde_json::to_value(
+            tools
+                .call(name.to_owned(), arguments, compact_context())
+                .await,
+        )
+        .unwrap();
+        let serialized_bytes = serde_json::to_vec(&result).unwrap().len();
+        assert_eq!(result["isError"], Value::Null, "{name} returned an error");
+        assert_eq!(
+            result["structuredContent"][count_field], expected_count,
+            "{name} did not exercise the intended full success model"
+        );
+        assert_eq!(
+            result["structuredContent"]["detail_retained"],
+            true,
+            "{name}: serialized_bytes={serialized_bytes}, result_budget={}",
+            compact_context().wire_budget.result_bytes
+        );
+        assert!(result["structuredContent"]["output_ref"].is_string());
+        retained.push(result);
+    }
+    retained
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task8_output_rss_large_host_list_stat_search_models_all_force_retention() {
+    let root = tempfile::TempDir::new().unwrap();
+    let (_runtime, tools, list_args, stat_args, search_args) =
+        retention_models_fixture(root.path());
+    let retained = retain_all_large_models(&tools, list_args, stat_args, search_args).await;
+    assert_eq!(retained.len(), 4);
+}
+
+#[test]
+fn task8_output_rss_64_mib_and_retained_models_stay_below_sixteen_mib() {
+    const CHILD_ENV: &str = "CODEX_SSH_BRIDGE_MCP_OUTPUT_RSS_CHILD";
+    const TEST_NAME: &str = "task8_output_rss_64_mib_and_retained_models_stay_below_sixteen_mib";
+    if cfg!(debug_assertions) {
+        eprintln!("MCP output RSS assertion is release-only");
+        return;
+    }
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(task8_output_rss_child());
+        return;
+    }
+    for round in 1..=3 {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, round.to_string())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("MCP output RSS fresh-child round {round}/3:");
+        eprint!("{stdout}");
+        eprint!("{stderr}");
+        assert!(
+            output.status.success(),
+            "fresh MCP output RSS child {round}/3 failed: {output:?}"
+        );
+        assert!(
+            stdout.contains("MCP output release RSS:")
+                || stderr.contains("MCP output release RSS:"),
+            "fresh MCP output RSS child {round}/3 did not run the requested test"
+        );
+    }
+}
+
+async fn task8_output_rss_child() {
+    const RSS_DELTA_CEILING_KIB: u64 = 16 * 1024;
+    let model_root = tempfile::TempDir::new().unwrap();
+    let (_model_runtime, model_tools, list_args, stat_args, search_args) =
+        retention_models_fixture(model_root.path());
+    let output_root = tempfile::TempDir::new().unwrap();
+    let (_output_runtime, _log, output_tools) = fake_remote_tools_with_options(
+        output_root.path(),
+        false,
+        &[
+            ("FAKE_SSH_MODE", OsString::from("bytes")),
+            (
+                "FAKE_SSH_STDOUT_BYTES",
+                OsString::from(codex_ssh_bridge::MAX_OUTPUT_BYTES.to_string()),
+            ),
+            ("FAKE_SSH_STDERR_BYTES", OsString::from("0")),
+        ],
+    );
+
+    let baseline = resident_kib();
+    let worker = tokio::spawn(async move {
+        let retained =
+            retain_all_large_models(&model_tools, list_args, stat_args, search_args).await;
+        let output = call_json(
+            &output_tools,
+            "remote_run",
+            json!({"host":"dev","command":":","shell":"sh"}),
+        )
+        .await;
+        assert_eq!(output["isError"], Value::Null, "{output}");
+        assert_eq!(
+            output["structuredContent"]["aggregate_bytes"],
+            codex_ssh_bridge::MAX_OUTPUT_BYTES
+        );
+        assert!(output["structuredContent"]["output_ref"].is_string());
+        (retained, output)
+    });
+    let mut peak = baseline;
+    while !worker.is_finished() {
+        peak = peak.max(resident_kib());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let values = worker.await.unwrap();
+    std::hint::black_box(values);
+    for _ in 0..20 {
+        peak = peak.max(resident_kib());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let delta = peak.saturating_sub(baseline);
+    eprintln!(
+        "MCP output release RSS: baseline={baseline} KiB peak={peak} KiB delta={delta} KiB ceiling={RSS_DELTA_CEILING_KIB} KiB"
+    );
+    assert!(
+        delta < RSS_DELTA_CEILING_KIB,
+        "MCP output RSS baseline={baseline} peak={peak} delta={delta}"
+    );
 }
