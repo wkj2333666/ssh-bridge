@@ -112,7 +112,7 @@ Uninstall follows the same rule:
 
 Start a new Codex task after installing or updating so the Skill and MCP surface are reloaded. The user running the bridge is the local installation trust boundary: another process running as that same Unix user can bypass the bridge and edit Codex configuration directly because the Codex CLI does not expose compare-and-swap removal.
 
-Keep an installed bundle at a durable, versioned, private path such as `~/.local/share/codex-ssh-bridge/0.1.0`; the MCP entry and Skill symlink intentionally point back to that reviewed bundle. For an update, do not overwrite the active bundle in place: run its recorded `uninstall --user --apply`, stage the new version in a new directory, review the new dry run, then apply it. The content-hashed identity deliberately rejects an overwritten or unrelated bundle instead of guessing that it is a safe upgrade.
+Keep an installed bundle at a durable, versioned, private path such as `~/.local/share/codex-ssh-bridge/0.1.1`; the MCP entry and Skill symlink intentionally point back to that reviewed bundle. For an update, do not overwrite the active bundle in place: run its recorded `uninstall --user --apply`, stage the new version in a new directory, review the new dry run, then apply it. The content-hashed identity deliberately rejects an overwritten or unrelated bundle instead of guessing that it is a safe upgrade.
 
 For a direct MCP entry, Codex can prompt only for tools not marked read-only:
 
