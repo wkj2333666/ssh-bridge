@@ -1,7 +1,9 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use super::{LocalCommandSpec, ensure_secure_absolute_directory, run_local_command};
+use super::{LocalCommandSpec, run_local_command};
 use crate::error::{BridgeError, BridgeResult};
 
 const MCP_NAME: &str = "ssh-bridge";
@@ -96,14 +98,46 @@ struct ResolvedInstall {
     identity: InstallationIdentity,
 }
 
+#[derive(Debug)]
+struct InstallPreflight {
+    resolved: ResolvedInstall,
+    mcp: Presence,
+    skill: Presence,
+    marker: Presence,
+    actions: Vec<String>,
+}
+
+struct InstallLock {
+    _file: fs::File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationOutcome {
+    Applied,
+    NotApplied,
+    Unknown,
+}
+
+struct MutationError {
+    error: BridgeError,
+    outcome: MutationOutcome,
+}
+
+#[derive(Debug)]
+struct QuarantinedPath {
+    original: PathBuf,
+    quarantine: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Presence {
     Absent,
     Matching,
 }
 
-pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<InstallReport> {
+async fn install_preflight(layout: InstallLayout) -> BridgeResult<InstallPreflight> {
     let resolved = resolve_layout(layout)?;
+    validate_install_destinations(&resolved)?;
     let mcp = codex_get(&resolved).await?;
     let skill = skill_presence(&resolved)?;
     let marker = marker_presence(&resolved)?;
@@ -121,9 +155,115 @@ pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<In
             Presence::Matching => "installation identity already matches".to_owned(),
         },
     ];
-    if !apply {
-        return Ok(report(false, &resolved, actions));
+    Ok(InstallPreflight {
+        resolved,
+        mcp,
+        skill,
+        marker,
+        actions,
+    })
+}
+
+async fn uninstall_preflight(layout: InstallLayout) -> BridgeResult<InstallPreflight> {
+    let resolved = resolve_layout(layout)?;
+    validate_install_destinations(&resolved)?;
+    let marker = marker_presence(&resolved)?;
+    if marker != Presence::Matching {
+        return Err(BridgeError::invalid_config(
+            "recorded installation identity is missing",
+        ));
     }
+    let mcp = codex_get(&resolved).await?;
+    let skill = skill_presence(&resolved)?;
+    let actions = vec![
+        match mcp {
+            Presence::Absent => "MCP ssh-bridge is already absent".to_owned(),
+            Presence::Matching => "remove identity-matching MCP ssh-bridge".to_owned(),
+        },
+        match skill {
+            Presence::Absent => "remote-ssh-ops Skill symlink is already absent".to_owned(),
+            Presence::Matching => "remove identity-matching Skill symlink".to_owned(),
+        },
+        "remove private installation identity".to_owned(),
+    ];
+    Ok(InstallPreflight {
+        resolved,
+        mcp,
+        skill,
+        marker,
+        actions,
+    })
+}
+
+fn validate_install_destinations(resolved: &ResolvedInstall) -> BridgeResult<()> {
+    crate::config::validate_secure_existing_ancestors(&resolved.layout.skill_target)?;
+    crate::config::validate_secure_existing_ancestors(&resolved.layout.identity_file)?;
+    Ok(())
+}
+
+fn install_lock_path(resolved: &ResolvedInstall) -> BridgeResult<PathBuf> {
+    let home = resolved
+        .layout
+        .skill_target
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| BridgeError::invalid_config("Skill destination has no user root"))?;
+    Ok(home.join(".codex-ssh-bridge.install.lock"))
+}
+
+async fn acquire_install_lock(resolved: &ResolvedInstall) -> BridgeResult<InstallLock> {
+    let path = install_lock_path(resolved)?;
+    crate::config::validate_secure_existing_ancestors(&path)?;
+    tokio::task::spawn_blocking(move || {
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(&path).map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                BridgeError::invalid_config("installation lock must not be a symlink")
+            } else {
+                BridgeError::io(error)
+            }
+        })?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(BridgeError::io)?;
+        let metadata = file.metadata().map_err(BridgeError::io)?;
+        // SAFETY: geteuid has no preconditions and retains no pointers.
+        let current_uid = unsafe { libc::geteuid() };
+        if !metadata.is_file() || metadata.uid() != current_uid || metadata.mode() & 0o077 != 0 {
+            return Err(BridgeError::invalid_config(
+                "installation lock must be a private current-user-owned regular file",
+            ));
+        }
+        // SAFETY: flock receives a live descriptor and a valid operation constant.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(BridgeError::io(std::io::Error::last_os_error()));
+        }
+        Ok(InstallLock { _file: file })
+    })
+    .await
+    .map_err(|error| BridgeError::io(format!("installation lock task failed: {error}")))?
+}
+
+pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<InstallReport> {
+    let preliminary = install_preflight(layout.clone()).await?;
+    if !apply {
+        return Ok(report(false, &preliminary.resolved, preliminary.actions));
+    }
+    let _lock = acquire_install_lock(&preliminary.resolved).await?;
+    let preflight = install_preflight(layout).await?;
+    let InstallPreflight {
+        resolved,
+        mcp,
+        skill,
+        marker,
+        actions,
+    } = preflight;
 
     let mut journal = InstallJournal::default();
     let applied = async {
@@ -133,11 +273,16 @@ pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<In
                     "MCP entry changed after installation preflight",
                 ));
             }
-            if let Err(error) = codex_add(&resolved).await {
-                if matches!(codex_get(&resolved).await, Ok(Presence::Matching)) {
+            if let Err(failure) = codex_add_checked(&resolved).await {
+                if failure.outcome == MutationOutcome::Applied {
                     journal.mcp_added = true;
                 }
-                return Err(error);
+                if failure.outcome == MutationOutcome::Unknown {
+                    return Err(BridgeError::io(
+                        "Codex MCP add outcome is unknown; rollback incomplete",
+                    ));
+                }
+                return Err(failure.error);
             }
             journal.mcp_added = true;
         }
@@ -152,9 +297,7 @@ pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<In
                 .skill_target
                 .parent()
                 .expect("absolute Skill target has a parent");
-            journal
-                .created_directories
-                .extend(ensure_secure_absolute_directory(parent)?);
+            ensure_destination_directory(parent, &mut journal.created_directories)?;
             symlink(&resolved.layout.skill_source, &resolved.layout.skill_target)
                 .map_err(BridgeError::io)?;
             journal.skill_created = true;
@@ -170,9 +313,7 @@ pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<In
                 .identity_file
                 .parent()
                 .expect("absolute identity path has a parent");
-            journal
-                .created_directories
-                .extend(ensure_secure_absolute_directory(parent)?);
+            ensure_destination_directory(parent, &mut journal.created_directories)?;
             write_identity_noclobber(&resolved)?;
             journal.marker_created = true;
         }
@@ -193,31 +334,23 @@ pub async fn install_user(layout: InstallLayout, apply: bool) -> BridgeResult<In
 }
 
 pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<InstallReport> {
-    let resolved = resolve_layout(layout)?;
-    if marker_presence(&resolved)? != Presence::Matching {
-        return Err(BridgeError::invalid_config(
-            "recorded installation identity is missing",
-        ));
-    }
-    let mcp = codex_get(&resolved).await?;
-    let skill = skill_presence(&resolved)?;
-    let actions = vec![
-        match mcp {
-            Presence::Absent => "MCP ssh-bridge is already absent".to_owned(),
-            Presence::Matching => "remove identity-matching MCP ssh-bridge".to_owned(),
-        },
-        match skill {
-            Presence::Absent => "remote-ssh-ops Skill symlink is already absent".to_owned(),
-            Presence::Matching => "remove identity-matching Skill symlink".to_owned(),
-        },
-        "remove private installation identity".to_owned(),
-    ];
+    let preliminary = uninstall_preflight(layout.clone()).await?;
     if !apply {
-        return Ok(report(false, &resolved, actions));
+        return Ok(report(false, &preliminary.resolved, preliminary.actions));
     }
+    let _lock = acquire_install_lock(&preliminary.resolved).await?;
+    let preflight = uninstall_preflight(layout).await?;
+    let InstallPreflight {
+        resolved,
+        mcp,
+        skill,
+        actions,
+        ..
+    } = preflight;
 
     let mut mcp_removed = false;
-    let mut skill_removed = false;
+    let mut skill_quarantine = None;
+    let mut marker_quarantine = None;
     let removed = async {
         if mcp == Presence::Matching {
             if codex_get(&resolved).await? != Presence::Matching {
@@ -225,8 +358,21 @@ pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<
                     "MCP entry changed after uninstall preflight",
                 ));
             }
-            codex_remove(&resolved).await?;
-            mcp_removed = true;
+            match codex_remove_checked(&resolved).await {
+                Ok(()) => mcp_removed = true,
+                Err(failure) if failure.outcome == MutationOutcome::Applied => {
+                    mcp_removed = true;
+                    return Err(failure.error);
+                }
+                Err(failure) if failure.outcome == MutationOutcome::NotApplied => {
+                    return Err(failure.error);
+                }
+                Err(_) => {
+                    return Err(BridgeError::io(
+                        "Codex MCP removal outcome is unknown; rollback incomplete",
+                    ));
+                }
+            }
         }
         if skill == Presence::Matching {
             if skill_presence(&resolved)? != Presence::Matching {
@@ -234,27 +380,35 @@ pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<
                     "Skill destination changed after uninstall preflight",
                 ));
             }
-            fs::remove_file(&resolved.layout.skill_target).map_err(BridgeError::io)?;
-            skill_removed = true;
+            skill_quarantine = Some(quarantine_path(&resolved.layout.skill_target)?);
         }
         if marker_presence(&resolved)? != Presence::Matching {
             return Err(BridgeError::invalid_config(
                 "installation identity changed after uninstall preflight",
             ));
         }
-        fs::remove_file(&resolved.layout.identity_file).map_err(BridgeError::io)?;
+        marker_quarantine = Some(quarantine_path(&resolved.layout.identity_file)?);
         Ok(())
     }
     .await;
     if let Err(error) = removed {
         let mut rollback_failed = false;
-        if skill_removed
-            && symlink(&resolved.layout.skill_source, &resolved.layout.skill_target).is_err()
+        if let Some(quarantine) = marker_quarantine.as_ref()
+            && restore_quarantine(quarantine).is_err()
         {
             rollback_failed = true;
         }
-        if mcp_removed && codex_add(&resolved).await.is_err() {
+        if let Some(quarantine) = skill_quarantine.as_ref()
+            && restore_quarantine(quarantine).is_err()
+        {
             rollback_failed = true;
+        }
+        if mcp_removed {
+            match codex_add_checked(&resolved).await {
+                Ok(()) => {}
+                Err(error) if error.outcome == MutationOutcome::Applied => {}
+                Err(_) => rollback_failed = true,
+            }
         }
         if rollback_failed {
             return Err(BridgeError::new(
@@ -264,6 +418,12 @@ pub async fn uninstall_user(layout: InstallLayout, apply: bool) -> BridgeResult<
             ));
         }
         return Err(error);
+    }
+    if let Some(quarantine) = marker_quarantine {
+        fs::remove_file(quarantine.quarantine).map_err(BridgeError::io)?;
+    }
+    if let Some(quarantine) = skill_quarantine {
+        fs::remove_file(quarantine.quarantine).map_err(BridgeError::io)?;
     }
     Ok(report(true, &resolved, actions))
 }
@@ -283,23 +443,23 @@ async fn rollback_install(
     let mut failed = false;
     if journal.marker_created
         && matches!(marker_presence(resolved), Ok(Presence::Matching))
-        && fs::remove_file(&resolved.layout.identity_file).is_err()
+        && quarantine_then_remove(&resolved.layout.identity_file).is_err()
     {
         failed = true;
     }
     if journal.skill_created
         && matches!(skill_presence(resolved), Ok(Presence::Matching))
-        && fs::remove_file(&resolved.layout.skill_target).is_err()
+        && quarantine_then_remove(&resolved.layout.skill_target).is_err()
     {
         failed = true;
     }
     if journal.mcp_added {
         match codex_get(resolved).await {
-            Ok(Presence::Matching) => {
-                if codex_remove(resolved).await.is_err() {
-                    failed = true;
-                }
-            }
+            Ok(Presence::Matching) => match codex_remove_checked(resolved).await {
+                Ok(()) => {}
+                Err(error) if error.outcome == MutationOutcome::Applied => {}
+                Err(_) => failed = true,
+            },
             Ok(Presence::Absent) => {}
             Err(error) if error.code == crate::ErrorCode::InvalidConfig => {
                 // A concurrently replaced entry is not ours to remove.
@@ -322,27 +482,126 @@ async fn rollback_install(
     }
 }
 
+fn ensure_destination_directory(path: &Path, created: &mut Vec<PathBuf>) -> BridgeResult<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::Component;
+
+    // SAFETY: credential getters have no preconditions and retain no pointers.
+    let current_uid = unsafe { libc::geteuid() };
+    let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
+    let mut resolved = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => resolved.push(name),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(BridgeError::invalid_config(
+                    "installation destination must be normalized and absolute",
+                ));
+            }
+        }
+        let metadata = match fs::symlink_metadata(&resolved) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&resolved) {
+                    Ok(()) => created.push(resolved.clone()),
+                    Err(create_error)
+                        if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_error) => return Err(BridgeError::io(create_error)),
+                }
+                fs::symlink_metadata(&resolved).map_err(BridgeError::io)?
+            }
+            Err(error) => return Err(BridgeError::io(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(BridgeError::invalid_config(
+                "installation destination ancestors must be real directories",
+            ));
+        }
+        if metadata.uid() != current_uid && metadata.uid() != root_uid {
+            return Err(BridgeError::invalid_config(
+                "installation destination ancestors must be owned by root or the current user",
+            ));
+        }
+        let trusted_tmp = resolved == Path::new("/tmp")
+            && metadata.uid() == root_uid
+            && metadata.mode() & 0o1000 != 0;
+        if metadata.mode() & 0o022 != 0 && !trusted_tmp {
+            return Err(BridgeError::invalid_config(
+                "installation destination ancestors must not be writable by group or other users",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_path(path: &Path) -> BridgeResult<QuarantinedPath> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BridgeError::invalid_config("quarantine target has no parent"))?;
+    for _ in 0..32 {
+        let quarantine = parent.join(format!(
+            ".codex-ssh-bridge.quarantine.{}.{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        match rename_noreplace(path, &quarantine) {
+            Ok(()) => {
+                return Ok(QuarantinedPath {
+                    original: path.to_owned(),
+                    quarantine,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(BridgeError::io(error)),
+        }
+    }
+    Err(BridgeError::io("could not reserve a quarantine name"))
+}
+
+fn restore_quarantine(quarantine: &QuarantinedPath) -> BridgeResult<()> {
+    rename_noreplace(&quarantine.quarantine, &quarantine.original).map_err(BridgeError::io)
+}
+
+fn quarantine_then_remove(path: &Path) -> BridgeResult<()> {
+    let quarantine = quarantine_path(path)?;
+    fs::remove_file(quarantine.quarantine).map_err(BridgeError::io)
+}
+
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the syscall.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn resolve_layout(layout: InstallLayout) -> BridgeResult<ResolvedInstall> {
     let binary = canonical_secure_file(&layout.binary, true)?;
     let plugin_manifest = canonical_secure_file(&layout.plugin_manifest, false)?;
     let mcp_manifest = canonical_secure_file(&layout.mcp_manifest, false)?;
     let codex_executable = canonical_secure_file(&layout.codex_executable, true)?;
-    let skill_source = fs::canonicalize(&layout.skill_source).map_err(BridgeError::io)?;
-    let skill_metadata = fs::metadata(&skill_source).map_err(BridgeError::io)?;
-    if !skill_metadata.is_dir() {
-        return Err(BridgeError::invalid_config(
-            "Skill source must be a directory",
-        ));
+    let skill_source = canonical_secure_directory(&layout.skill_source)?;
+    for required in ["SKILL.md", "agents/openai.yaml", "references/operations.md"] {
+        canonical_secure_file(&skill_source.join(required), false)?;
     }
     validate_package_layout(&binary, &plugin_manifest, &mcp_manifest, &skill_source)?;
-    let skill_files = [
-        skill_source.join("SKILL.md"),
-        skill_source.join("agents/openai.yaml"),
-        skill_source.join("references/operations.md"),
-    ];
-    for file in &skill_files {
-        canonical_secure_file(file, false)?;
-    }
     if !layout.skill_target.is_absolute() || !layout.identity_file.is_absolute() {
         return Err(BridgeError::invalid_config(
             "installation destinations must be absolute paths",
@@ -351,11 +610,7 @@ fn resolve_layout(layout: InstallLayout) -> BridgeResult<ResolvedInstall> {
     let binary_hash = sha256_file(&binary)?;
     let plugin_hash = sha256_file(&plugin_manifest)?;
     let mcp_hash = sha256_file(&mcp_manifest)?;
-    let mut skill_hasher = Sha256::new();
-    for file in &skill_files {
-        skill_hasher.update(sha256_file(file)?.as_bytes());
-    }
-    let skill_hash = hex_digest(&skill_hasher.finalize());
+    let skill_hash = hash_secure_skill_tree(&skill_source)?;
     let strings = [
         path_string(&binary)?,
         binary_hash.clone(),
@@ -462,16 +717,37 @@ fn validate_package_layout(
         ));
     }
     let agent = read_bounded(&skill_source.join("agents/openai.yaml"), 256 * 1024)?;
-    let agent = std::str::from_utf8(&agent)
-        .map_err(|_| BridgeError::invalid_config("Skill agent metadata is not UTF-8"))?;
-    let agent_lines: Vec<&str> = agent.lines().map(str::trim).collect();
-    if !agent_lines.contains(&"- type: \"mcp\"") || !agent_lines.contains(&"value: \"ssh-bridge\"")
+    let agent: AgentMetadata = serde_yaml::from_slice(&agent)
+        .map_err(|_| BridgeError::invalid_config("Skill agent metadata is not valid YAML"))?;
+    if !agent
+        .dependencies
+        .tools
+        .iter()
+        .any(|tool| tool.kind == "mcp" && tool.value == MCP_NAME && tool.transport == "stdio")
     {
         return Err(BridgeError::invalid_config(
-            "Skill agent metadata does not depend on MCP ssh-bridge",
+            "Skill agent metadata does not declare the stdio MCP ssh-bridge dependency",
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMetadata {
+    dependencies: AgentDependencies,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDependencies {
+    tools: Vec<AgentToolDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentToolDependency {
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+    transport: String,
 }
 
 fn read_json_bounded(path: &Path, maximum: u64, label: &str) -> BridgeResult<serde_json::Value> {
@@ -577,9 +853,12 @@ fn null_or_empty_object(value: Option<&serde_json::Value>) -> bool {
     })
 }
 
-async fn codex_add(resolved: &ResolvedInstall) -> BridgeResult<()> {
-    let binary = path_string(&resolved.layout.binary)?;
-    let output = run_codex_os(
+async fn codex_add_checked(resolved: &ResolvedInstall) -> Result<(), MutationError> {
+    let binary = path_string(&resolved.layout.binary).map_err(|error| MutationError {
+        error,
+        outcome: MutationOutcome::NotApplied,
+    })?;
+    let attempted = run_codex_os(
         resolved,
         vec![
             OsString::from("mcp"),
@@ -590,19 +869,47 @@ async fn codex_add(resolved: &ResolvedInstall) -> BridgeResult<()> {
             OsString::from("mcp"),
         ],
     )
-    .await?;
-    if output.status != 0 {
-        return Err(BridgeError::io("`codex mcp add` failed"));
-    }
-    Ok(())
+    .await;
+    let command_succeeded = matches!(&attempted, Ok(output) if output.status == 0);
+    let failure = match attempted {
+        Ok(output) if output.status == 0 => {
+            BridgeError::io("`codex mcp add` reported success without a matching final state")
+        }
+        Ok(_) => BridgeError::io("`codex mcp add` failed"),
+        Err(error) => error,
+    };
+    let outcome = match codex_get(resolved).await {
+        Ok(Presence::Matching) if command_succeeded => return Ok(()),
+        Ok(Presence::Matching) => MutationOutcome::Applied,
+        Ok(Presence::Absent) => MutationOutcome::NotApplied,
+        Err(_) => MutationOutcome::Unknown,
+    };
+    Err(MutationError {
+        error: failure,
+        outcome,
+    })
 }
 
-async fn codex_remove(resolved: &ResolvedInstall) -> BridgeResult<()> {
-    let output = run_codex(resolved, ["mcp", "remove", MCP_NAME]).await?;
-    if output.status != 0 {
-        return Err(BridgeError::io("`codex mcp remove` failed"));
-    }
-    Ok(())
+async fn codex_remove_checked(resolved: &ResolvedInstall) -> Result<(), MutationError> {
+    let attempted = run_codex(resolved, ["mcp", "remove", MCP_NAME]).await;
+    let command_succeeded = matches!(&attempted, Ok(output) if output.status == 0);
+    let failure = match attempted {
+        Ok(output) if output.status == 0 => {
+            BridgeError::io("`codex mcp remove` reported success without an absent final state")
+        }
+        Ok(_) => BridgeError::io("`codex mcp remove` failed"),
+        Err(error) => error,
+    };
+    let outcome = match codex_get(resolved).await {
+        Ok(Presence::Absent) if command_succeeded => return Ok(()),
+        Ok(Presence::Absent) => MutationOutcome::Applied,
+        Ok(Presence::Matching) => MutationOutcome::NotApplied,
+        Err(_) => MutationOutcome::Unknown,
+    };
+    Err(MutationError {
+        error: failure,
+        outcome,
+    })
 }
 
 async fn run_codex<const N: usize>(
@@ -703,9 +1010,127 @@ fn write_identity_noclobber(resolved: &ResolvedInstall) -> BridgeResult<()> {
 
 fn canonical_secure_file(path: &Path, executable: bool) -> BridgeResult<PathBuf> {
     let canonical = fs::canonicalize(path).map_err(BridgeError::io)?;
+    validate_trusted_ancestors(&canonical)?;
     let metadata = fs::metadata(&canonical).map_err(BridgeError::io)?;
     validate_trusted_source_file(&metadata, executable)?;
     Ok(canonical)
+}
+
+fn canonical_secure_directory(path: &Path) -> BridgeResult<PathBuf> {
+    let canonical = fs::canonicalize(path).map_err(BridgeError::io)?;
+    validate_trusted_ancestors(&canonical)?;
+    validate_trusted_source_directory(&fs::metadata(&canonical).map_err(BridgeError::io)?)?;
+    Ok(canonical)
+}
+
+fn validate_trusted_ancestors(path: &Path) -> BridgeResult<()> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(BridgeError::invalid_config(
+            "installation source must resolve to an absolute path",
+        ));
+    }
+    // SAFETY: credential getters have no preconditions and retain no pointers.
+    let current_uid = unsafe { libc::geteuid() };
+    let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
+    let mut resolved = PathBuf::from("/");
+    for component in path.parent().unwrap_or(Path::new("/")).components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => resolved.push(name),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(BridgeError::invalid_config(
+                    "installation source paths must be normalized",
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&resolved).map_err(BridgeError::io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(BridgeError::invalid_config(
+                "installation source ancestors must be real directories",
+            ));
+        }
+        if !trusted_source_owner(metadata.uid(), current_uid, root_uid) {
+            return Err(BridgeError::invalid_config(
+                "installation source ancestors must be owned by root or the current user",
+            ));
+        }
+        let trusted_tmp = resolved == Path::new("/tmp")
+            && metadata.uid() == root_uid
+            && metadata.mode() & 0o1000 != 0;
+        if metadata.mode() & 0o022 != 0 && !trusted_tmp {
+            return Err(BridgeError::invalid_config(
+                "installation source ancestors must not be writable by group or other users",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_trusted_source_directory(metadata: &fs::Metadata) -> BridgeResult<()> {
+    // SAFETY: geteuid has no preconditions and retains no pointers.
+    let uid = unsafe { libc::geteuid() };
+    let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
+    if !metadata.is_dir()
+        || !trusted_source_owner(metadata.uid(), uid, root_uid)
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(BridgeError::invalid_config(
+            "Skill directories must be root/current-user-owned and not group/other writable",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_secure_skill_tree(root: &Path) -> BridgeResult<String> {
+    fn visit(root: &Path, directory: &Path, hasher: &mut Sha256) -> BridgeResult<()> {
+        validate_trusted_source_directory(
+            &fs::symlink_metadata(directory).map_err(BridgeError::io)?,
+        )?;
+        let mut entries = fs::read_dir(directory)
+            .map_err(BridgeError::io)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BridgeError::io)?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(BridgeError::io)?;
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| BridgeError::invalid_config("Skill tree escaped its root"))?;
+            let relative = relative.as_os_str().as_bytes();
+            hasher.update((relative.len() as u64).to_be_bytes());
+            hasher.update(relative);
+            if metadata.is_dir() {
+                hasher.update(b"D");
+                visit(root, &path, hasher)?;
+            } else if metadata.is_file() {
+                validate_trusted_source_file(&metadata, false)?;
+                hasher.update(b"F");
+                hasher.update(metadata.len().to_be_bytes());
+                let mut file = fs::File::open(&path).map_err(BridgeError::io)?;
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer).map_err(BridgeError::io)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+            } else {
+                return Err(BridgeError::invalid_config(
+                    "Skill tree may contain only real directories and regular files",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-ssh-bridge-skill-tree-v1\0");
+    visit(root, root, &mut hasher)?;
+    Ok(hex_digest(&hasher.finalize()))
 }
 
 fn validate_trusted_source_file(metadata: &fs::Metadata, executable: bool) -> BridgeResult<()> {

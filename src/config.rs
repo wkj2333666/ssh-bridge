@@ -149,6 +149,7 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> BridgeResult<Self> {
+        validate_secure_existing_ancestors(path)?;
         let mut file = open_config(path)?;
         validate_file_security(&file)?;
         let mut contents = String::new();
@@ -186,6 +187,12 @@ impl Config {
 
     pub fn save_atomic(&self, path: &Path) -> BridgeResult<()> {
         self.validate()?;
+        validate_secure_existing_ancestors(path)?;
+        match fs::symlink_metadata(path) {
+            Ok(_) => validate_file_security(&open_config(path)?)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BridgeError::io(error)),
+        }
         let serialized = toml::to_string_pretty(self).map_err(|error| {
             BridgeError::invalid_config(format!("cannot serialize configuration: {error}"))
         })?;
@@ -410,6 +417,60 @@ fn open_config(path: &Path) -> BridgeResult<fs::File> {
         }
         BridgeError::io(error)
     })
+}
+
+pub(crate) fn validate_secure_existing_ancestors(path: &Path) -> BridgeResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Component;
+
+        if !path.is_absolute() {
+            return Err(BridgeError::invalid_config(
+                "configuration path must be absolute",
+            ));
+        }
+        // SAFETY: credential getters have no preconditions and retain no pointers.
+        let current_uid = unsafe { libc::geteuid() };
+        let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
+        let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+        let mut resolved = PathBuf::from("/");
+        for component in parent.components() {
+            match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => resolved.push(name),
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(BridgeError::invalid_config(
+                        "configuration path must be normalized",
+                    ));
+                }
+            }
+            let metadata = match fs::symlink_metadata(&resolved) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(BridgeError::io(error)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(BridgeError::invalid_config(
+                    "configuration path ancestors must be real directories",
+                ));
+            }
+            if metadata.uid() != root_uid && metadata.uid() != current_uid {
+                return Err(BridgeError::invalid_config(
+                    "configuration path ancestors must be owned by root or the current user",
+                ));
+            }
+            let trusted_tmp = resolved == Path::new("/tmp")
+                && metadata.uid() == root_uid
+                && metadata.mode() & 0o1000 != 0;
+            if metadata.mode() & 0o022 != 0 && !trusted_tmp {
+                return Err(BridgeError::invalid_config(
+                    "configuration path ancestors must not be writable by group or other users",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_file_security(file: &fs::File) -> BridgeResult<()> {
