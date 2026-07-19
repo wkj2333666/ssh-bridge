@@ -1775,6 +1775,34 @@ async fn transport_and_remote_failures_have_stable_codes_without_diagnostics() {
 }
 
 #[tokio::test]
+async fn bootstrap_crlf_host_key_diagnostic_is_strictly_classified() {
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_PROBE_ERROR", "diagnostic".to_owned()),
+            (
+                "FAKE_SSH_DIAGNOSTIC",
+                "Host key verification failed.\r".to_owned(),
+            ),
+        ],
+    );
+
+    let error = fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Auto, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::HostKeyUnknown);
+    assert!(!error.retryable);
+}
+
+#[tokio::test]
 async fn command_phase_exit_255_canonical_lines_are_nonretryable_remote_exit() {
     let shells = [
         ("sh", ShellRequest::Auto),
