@@ -915,7 +915,7 @@ async fn task9_installer_bounds_a_hung_codex_cli_call() {
 #[tokio::test]
 async fn task9_installer_accepts_trusted_root_owned_codex_executable() {
     let mut fixture = install_fixture(InstallFixtureOptions::default());
-    fixture.layout.codex_executable = std::path::PathBuf::from("/bin/true");
+    fixture.layout.codex_executable = fs::canonicalize("/bin/true").unwrap();
     let metadata = fs::metadata(&fixture.layout.codex_executable).unwrap();
     assert_eq!(
         std::os::unix::fs::MetadataExt::uid(&metadata),
@@ -928,6 +928,80 @@ async fn task9_installer_accepts_trusted_root_owned_codex_executable() {
         error.message,
         "`codex mcp get --json` returned invalid JSON"
     );
+}
+
+#[tokio::test]
+async fn task9_installer_accepts_group_writable_user_source_below_private_user_ancestor() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    assert_eq!(
+        fs::metadata(fixture._private.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    fs::set_permissions(
+        fixture.layout.codex_executable.parent().unwrap(),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+
+    install_user(fixture.layout.clone(), false).await.unwrap();
+}
+
+#[tokio::test]
+async fn task9_installer_rejects_group_writable_user_source_without_private_user_ancestor() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    fs::set_permissions(fixture._private.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(
+        fixture.layout.codex_executable.parent().unwrap(),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+
+    assert!(install_user(fixture.layout.clone(), false).await.is_err());
+    assert!(!fixture.log.exists());
+}
+
+#[tokio::test]
+async fn task9_installer_accepts_codex_path_symlink_to_a_trusted_executable() {
+    let mut fixture = install_fixture(InstallFixtureOptions::default());
+    let linked_codex = fixture._private.path().join("linked-codex");
+    symlink(&fixture.layout.codex_executable, &linked_codex).unwrap();
+    fixture.layout.codex_executable = linked_codex;
+
+    install_user(fixture.layout.clone(), false).await.unwrap();
+    assert!(fixture.log.exists());
+}
+
+#[tokio::test]
+async fn task9_installer_rejects_codex_path_symlink_to_an_unsealed_writable_target() {
+    let mut fixture = install_fixture(InstallFixtureOptions::default());
+    fs::set_permissions(fixture._private.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let unsafe_directory = fixture._private.path().join("unsafe-bin");
+    fs::create_dir(&unsafe_directory).unwrap();
+    fs::set_permissions(&unsafe_directory, fs::Permissions::from_mode(0o775)).unwrap();
+    let unsafe_codex = unsafe_directory.join("codex");
+    fs::copy(&fixture.layout.codex_executable, &unsafe_codex).unwrap();
+    fs::set_permissions(&unsafe_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let linked_codex = fixture._private.path().join("linked-codex");
+    symlink(&unsafe_codex, &linked_codex).unwrap();
+    fixture.layout.codex_executable = linked_codex;
+
+    assert!(install_user(fixture.layout.clone(), false).await.is_err());
+    assert!(!fixture.log.exists());
+}
+
+#[tokio::test]
+async fn task9_installer_rejects_symlinked_package_binary() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    let real_binary = fixture.layout.binary.with_file_name("real-binary");
+    fs::rename(&fixture.layout.binary, &real_binary).unwrap();
+    symlink(&real_binary, &fixture.layout.binary).unwrap();
+
+    assert!(install_user(fixture.layout.clone(), false).await.is_err());
+    assert!(!fixture.log.exists());
 }
 
 #[tokio::test]
@@ -1154,6 +1228,7 @@ async fn task9_failed_codex_remove_that_did_remove_is_compensated() {
 #[tokio::test]
 async fn task9_package_requires_trusted_ancestors_and_hashes_the_complete_skill_tree() {
     let writable = install_fixture(InstallFixtureOptions::default());
+    fs::set_permissions(writable._private.path(), fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(
         writable.layout.binary.ancestors().nth(2).unwrap(),
         fs::Permissions::from_mode(0o777),

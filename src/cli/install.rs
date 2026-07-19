@@ -800,7 +800,7 @@ fn resolve_layout(layout: InstallLayout) -> BridgeResult<ResolvedInstall> {
     let binary = canonical_secure_file(&layout.binary, true)?;
     let plugin_manifest = canonical_secure_file(&layout.plugin_manifest, false)?;
     let mcp_manifest = canonical_secure_file(&layout.mcp_manifest, false)?;
-    let codex_executable = canonical_secure_file(&layout.codex_executable, true)?;
+    let codex_executable = canonical_secure_codex_executable(&layout.codex_executable)?;
     let skill_source = canonical_secure_directory(&layout.skill_source)?;
     for required in ["SKILL.md", "agents/openai.yaml", "references/operations.md"] {
         canonical_secure_file(&skill_source.join(required), false)?;
@@ -1214,17 +1214,56 @@ fn write_identity_noclobber(resolved: &ResolvedInstall) -> BridgeResult<()> {
 }
 
 fn canonical_secure_file(path: &Path, executable: bool) -> BridgeResult<PathBuf> {
+    validate_trusted_ancestors(path)?;
+    let original_metadata = fs::symlink_metadata(path).map_err(BridgeError::io)?;
+    if original_metadata.file_type().is_symlink() {
+        return Err(BridgeError::invalid_config(
+            "installation sources must not be symlinks",
+        ));
+    }
+    validate_trusted_source_file(&original_metadata, executable)?;
     let canonical = fs::canonicalize(path).map_err(BridgeError::io)?;
     validate_trusted_ancestors(&canonical)?;
-    let metadata = fs::metadata(&canonical).map_err(BridgeError::io)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(BridgeError::io)?;
     validate_trusted_source_file(&metadata, executable)?;
     Ok(canonical)
 }
 
-fn canonical_secure_directory(path: &Path) -> BridgeResult<PathBuf> {
+fn canonical_secure_codex_executable(path: &Path) -> BridgeResult<PathBuf> {
+    validate_trusted_ancestors(path)?;
+    let entry_metadata = fs::symlink_metadata(path).map_err(BridgeError::io)?;
+    if entry_metadata.file_type().is_symlink() {
+        // SAFETY: geteuid has no preconditions and retains no pointers.
+        let current_uid = unsafe { libc::geteuid() };
+        let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
+        if !trusted_source_owner(entry_metadata.uid(), current_uid, root_uid) {
+            return Err(BridgeError::invalid_config(
+                "Codex executable symlink must be owned by root or the current user",
+            ));
+        }
+    } else {
+        validate_trusted_source_file(&entry_metadata, true)?;
+    }
+
     let canonical = fs::canonicalize(path).map_err(BridgeError::io)?;
     validate_trusted_ancestors(&canonical)?;
-    validate_trusted_source_directory(&fs::metadata(&canonical).map_err(BridgeError::io)?)?;
+    let target_metadata = fs::symlink_metadata(&canonical).map_err(BridgeError::io)?;
+    validate_trusted_source_file(&target_metadata, true)?;
+    Ok(canonical)
+}
+
+fn canonical_secure_directory(path: &Path) -> BridgeResult<PathBuf> {
+    validate_trusted_ancestors(path)?;
+    let original_metadata = fs::symlink_metadata(path).map_err(BridgeError::io)?;
+    if original_metadata.file_type().is_symlink() {
+        return Err(BridgeError::invalid_config(
+            "installation sources must not be symlinks",
+        ));
+    }
+    validate_trusted_source_directory(&original_metadata)?;
+    let canonical = fs::canonicalize(path).map_err(BridgeError::io)?;
+    validate_trusted_ancestors(&canonical)?;
+    validate_trusted_source_directory(&fs::symlink_metadata(&canonical).map_err(BridgeError::io)?)?;
     Ok(canonical)
 }
 
@@ -1240,6 +1279,7 @@ fn validate_trusted_ancestors(path: &Path) -> BridgeResult<()> {
     let current_uid = unsafe { libc::geteuid() };
     let root_uid = fs::symlink_metadata("/").map_err(BridgeError::io)?.uid();
     let mut resolved = PathBuf::from("/");
+    let mut below_private_user_ancestor = false;
     for component in path.parent().unwrap_or(Path::new("/")).components() {
         match component {
             Component::RootDir | Component::CurDir => continue,
@@ -1256,21 +1296,50 @@ fn validate_trusted_ancestors(path: &Path) -> BridgeResult<()> {
                 "installation source ancestors must be real directories",
             ));
         }
-        if !trusted_source_owner(metadata.uid(), current_uid, root_uid) {
-            return Err(BridgeError::invalid_config(
-                "installation source ancestors must be owned by root or the current user",
-            ));
-        }
         let trusted_tmp = resolved == Path::new("/tmp")
             && metadata.uid() == root_uid
             && metadata.mode() & 0o1000 != 0;
-        if metadata.mode() & 0o022 != 0 && !trusted_tmp {
+        let Some(next_private_boundary) = advance_private_source_boundary(
+            metadata.uid(),
+            metadata.mode(),
+            current_uid,
+            root_uid,
+            below_private_user_ancestor,
+            trusted_tmp,
+        ) else {
+            if !trusted_source_owner(metadata.uid(), current_uid, root_uid) {
+                return Err(BridgeError::invalid_config(
+                    "installation source ancestors must be owned by root or the current user",
+                ));
+            }
             return Err(BridgeError::invalid_config(
-                "installation source ancestors must not be writable by group or other users",
+                "installation source ancestors must not be writable by group or other users unless sealed below a private current-user ancestor",
             ));
-        }
+        };
+        below_private_user_ancestor = next_private_boundary;
     }
     Ok(())
+}
+
+fn advance_private_source_boundary(
+    owner_uid: u32,
+    mode: u32,
+    current_uid: u32,
+    root_uid: u32,
+    below_private_user_ancestor: bool,
+    trusted_tmp: bool,
+) -> Option<bool> {
+    if !trusted_source_owner(owner_uid, current_uid, root_uid) {
+        return None;
+    }
+    let writable_by_group_or_other = mode & 0o022 != 0;
+    if writable_by_group_or_other
+        && !trusted_tmp
+        && !(below_private_user_ancestor && owner_uid == current_uid)
+    {
+        return None;
+    }
+    Some(below_private_user_ancestor || (owner_uid == current_uid && mode & 0o077 == 0))
 }
 
 fn validate_trusted_source_directory(metadata: &fs::Metadata) -> BridgeResult<()> {
@@ -1428,9 +1497,7 @@ fn find_executable(name: &str) -> BridgeResult<PathBuf> {
         .ok_or_else(|| BridgeError::invalid_config("PATH is required to locate Codex"))?;
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join(name);
-        if let Ok(canonical) = fs::canonicalize(candidate)
-            && canonical_secure_file(&canonical, true).is_ok()
-        {
+        if let Ok(canonical) = canonical_secure_codex_executable(&candidate) {
             return Ok(canonical);
         }
     }
@@ -1439,4 +1506,36 @@ fn find_executable(name: &str) -> BridgeResult<PathBuf> {
 
 fn nonempty_environment(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_private_source_boundary;
+
+    #[test]
+    fn private_source_boundary_never_trusts_foreign_or_writable_root_owned_descendants() {
+        let current_uid = 1000;
+        let root_uid = 65534;
+
+        assert_eq!(
+            advance_private_source_boundary(2000, 0o700, current_uid, root_uid, true, false),
+            None
+        );
+        assert_eq!(
+            advance_private_source_boundary(root_uid, 0o775, current_uid, root_uid, true, false),
+            None
+        );
+        assert_eq!(
+            advance_private_source_boundary(root_uid, 0o755, current_uid, root_uid, true, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sticky_tmp_does_not_establish_a_private_user_boundary() {
+        assert_eq!(
+            advance_private_source_boundary(0, 0o1777, 1000, 0, false, true),
+            Some(false)
+        );
+    }
 }
