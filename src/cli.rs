@@ -18,13 +18,15 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, HostLimitOverrides, HostProfile};
+use crate::config::{Config, HostLimitOverrides, HostProfile, ResolvedHost};
 use crate::error::{BridgeError, BridgeResult};
 use crate::output::OutputStore;
 use crate::path::RemotePath;
 use crate::quote::shell_word;
 use crate::remote::{RemoteBridge, RemoteRunRequest, RemoteRunResult, RunShell, StatRequest};
-use crate::ssh::{RuntimePaths, SshRunner, ValidatedMountpoint, build_sshfs_argv};
+use crate::ssh::{
+    RuntimePaths, SshRunner, ValidatedMountpoint, build_ssh_g_argv, build_sshfs_argv,
+};
 
 mod install;
 pub use install::{InstallLayout, InstallReport, install_user, uninstall_user};
@@ -751,7 +753,7 @@ fn signal_local_process_group(process_group: i32, signal: i32) {
 }
 
 async fn run_doctor(path: PathBuf, arguments: DoctorArgs) -> BridgeResult<()> {
-    let (_runner, bridge) = build_remote_bridge(&path)?;
+    let (runner, bridge) = build_remote_bridge(&path)?;
     let mut value = match arguments.host.as_deref() {
         Some(host) => doctor_host(&bridge, host).await?,
         None => serde_json::to_value(bridge.hosts().await?)
@@ -761,7 +763,7 @@ async fn run_doctor(path: PathBuf, arguments: DoctorArgs) -> BridgeResult<()> {
         let host = arguments.host.as_deref().ok_or_else(|| {
             BridgeError::invalid_argument("--verbose-ssh requires an explicit host alias")
         })?;
-        let diagnostic = run_verbose_ssh_diagnostic(host).await?;
+        let diagnostic = run_verbose_ssh_diagnostic(runner.config().host(host)?).await?;
         let object = value
             .as_object_mut()
             .ok_or_else(|| BridgeError::io("doctor result is not an object"))?;
@@ -773,22 +775,14 @@ async fn run_doctor(path: PathBuf, arguments: DoctorArgs) -> BridgeResult<()> {
     print_json(&value)
 }
 
-async fn run_verbose_ssh_diagnostic(host: &str) -> BridgeResult<String> {
-    let mut arguments = vec![OsString::from("-vvv"), OsString::from("-G")];
-    for option in [
-        "BatchMode=yes",
-        "StrictHostKeyChecking=yes",
-        "ForwardAgent=no",
-        "ForwardX11=no",
-        "ClearAllForwardings=yes",
-        "PermitLocalCommand=no",
-        "RequestTTY=no",
-    ] {
-        arguments.push(OsString::from("-o"));
-        arguments.push(OsString::from(option));
-    }
-    arguments.push(OsString::from("--"));
-    arguments.push(OsString::from(host));
+pub fn build_verbose_ssh_diagnostic_argv(host: ResolvedHost<'_>) -> Vec<OsString> {
+    let mut arguments = build_ssh_g_argv(host.alias, host.limits.connect_timeout_ms);
+    arguments.insert(0, OsString::from("-vvv"));
+    arguments
+}
+
+async fn run_verbose_ssh_diagnostic(host: ResolvedHost<'_>) -> BridgeResult<String> {
+    let arguments = build_verbose_ssh_diagnostic_argv(host);
     let output = run_local_command(LocalCommandSpec {
         executable: PathBuf::from("/usr/bin/ssh"),
         arguments,

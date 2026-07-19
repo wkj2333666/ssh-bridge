@@ -32,6 +32,16 @@ const CONTROL_FILENAME_BYTES: usize = 3 + 32;
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 pub(crate) const SERVER_ALIVE_INTERVAL_SECONDS: u64 = 15;
 pub(crate) const SERVER_ALIVE_COUNT_MAX: u64 = 3;
+const SSH_G_OPTIONS: &[&str] = &[
+    "BatchMode=yes",
+    "StrictHostKeyChecking=yes",
+    "ForwardAgent=no",
+    "ForwardX11=no",
+    "ClearAllForwardings=yes",
+    "PermitLocalCommand=no",
+    "RequestTTY=no",
+    "ControlPersist=300",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -311,6 +321,23 @@ pub(crate) fn server_alive_options() -> [OsString; 2] {
         )),
         OsString::from(format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}")),
     ]
+}
+
+pub(crate) fn build_ssh_g_argv(host: &str, connect_timeout_ms: u64) -> Vec<OsString> {
+    let mut argv = vec![OsString::from("-G")];
+    for option in SSH_G_OPTIONS {
+        argv.push(OsString::from("-o"));
+        argv.push(OsString::from(option));
+    }
+    for option in server_alive_options() {
+        argv.push(OsString::from("-o"));
+        argv.push(option);
+    }
+    argv.push(OsString::from("-o"));
+    argv.push(openssh_connect_timeout_option(connect_timeout_ms));
+    argv.push(OsString::from("--"));
+    argv.push(OsString::from(host));
+    argv
 }
 
 fn openssh_connect_timeout_option(milliseconds: u64) -> OsString {

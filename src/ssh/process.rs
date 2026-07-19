@@ -19,9 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    RuntimePaths, SshPolicy, build_ssh_argv, openssh_connect_timeout_option, server_alive_options,
-};
+use super::{RuntimePaths, SshPolicy, build_ssh_argv, build_ssh_g_argv};
 use crate::capability::{
     CAPABILITY_PROBE_SCRIPT, Capability, CapabilityCache, ShellKind, ShellRequest, ShellSelection,
     parse_probe_output, select_shell,
@@ -92,17 +90,6 @@ payload=$3
 CDPATH= cd -P -- "$cwd"||exit 126
 [ -f "$login_shell" ]&&[ -x "$login_shell" ]||exit 126
 exec "$login_shell" -c "$payload""#;
-
-const SSH_G_OPTIONS: &[&str] = &[
-    "BatchMode=yes",
-    "StrictHostKeyChecking=yes",
-    "ForwardAgent=no",
-    "ForwardX11=no",
-    "ClearAllForwardings=yes",
-    "PermitLocalCommand=no",
-    "RequestTTY=no",
-    "ControlPersist=300",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
@@ -793,19 +780,7 @@ impl SshRunner {
         connect_timeout_ms: u64,
         cancel: &CancellationToken,
     ) -> BridgeResult<String> {
-        let mut argv = vec![OsString::from("-G")];
-        for option in SSH_G_OPTIONS {
-            argv.push(OsString::from("-o"));
-            argv.push(OsString::from(option));
-        }
-        for option in server_alive_options() {
-            argv.push(OsString::from("-o"));
-            argv.push(option);
-        }
-        argv.push(OsString::from("-o"));
-        argv.push(openssh_connect_timeout_option(connect_timeout_ms));
-        argv.push(OsString::from("--"));
-        argv.push(OsString::from(host));
+        let argv = build_ssh_g_argv(host, connect_timeout_ms);
         let total_limit = RESOLVED_STDOUT_LIMIT + RESOLVED_STDERR_LIMIT;
         let outcome = self
             .run_child(
