@@ -48,11 +48,11 @@
 - `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1` makes localhost fixture setup failure panic with the setup reason; absence of the flag retains the visible developer skip.
 - `Config::validate` accepts only `version == 1`.
 
-- [ ] **Step 1: Write failing OpenSSH identity-drift and keepalive tests**
+- [x] **Step 1: Write failing OpenSSH identity-drift and keepalive tests**
 
 Add a fake-SSH identity file input so a test can replace the `ssh -G` output between two operations without changing the fake remote root/device/inode. Change the former resolve-once expectation to two `G` calls for two operations. Add a regression that performs one successful call, changes only the resolved configuration text, then proves the second call returns `INVALID_CONFIG` before another `P`, `R`, or `C` call. Assert `ServerAliveInterval=15` and `ServerAliveCountMax=3` occur exactly once in bootstrap `ssh -G`, cold operational, cached operational, and SSHFS argv.
 
-- [ ] **Step 2: Run the transport tests and verify RED**
+- [x] **Step 2: Run the transport tests and verify RED**
 
 Run:
 
@@ -65,11 +65,11 @@ cargo test --test cli sshfs_argv -- --nocapture
 
 Expected: the first two tests fail because identity is resolved once; keepalive assertions fail because ordinary policy and `ssh -G` omit the two options.
 
-- [ ] **Step 3: Implement immutable connection-identity revalidation and shared keepalives**
+- [x] **Step 3: Implement immutable connection-identity revalidation and shared keepalives**
 
 Resolve a digest before every `initialize_host`. Under the identity mutex, insert only when absent; when present, compare in constant ordinary string equality and return a non-retryable invalid-configuration error instructing the operator to verify the alias and restart the bridge. Never replace the cached digest. Build the ControlPath only from that immutable digest. Put the two compiled numeric constants and one option helper in `src/ssh/mod.rs`; consume it from `SshPolicy::for_host` and `resolve_identity_once`. Remove duplicate SSHFS-only keepalive insertion because SSHFS inherits the policy.
 
-- [ ] **Step 4: Run transport/CLI tests and verify GREEN**
+- [x] **Step 4: Run transport/CLI tests and verify GREEN**
 
 Run:
 
@@ -80,11 +80,11 @@ cargo test --test cli -- --test-threads=1
 
 Expected: all tests pass with two `G` calls for two operations, drift rejection before business execution, and exactly one copy of each server-alive option.
 
-- [ ] **Step 5: Write failing configuration-version and required-real-SSH tests**
+- [x] **Step 5: Write failing configuration-version and required-real-SSH tests**
 
 Add core cases for loading and saving `version = 0` and `version = 2`, both expecting `INVALID_CONFIG`. Factor the real-SSH setup decision into a small helper and add tests proving unavailable setup returns `None` only when `required=false`, while `required=true` panics/fails with the original reason. The integration test obtains `required` only from the exact value `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1`.
 
-- [ ] **Step 6: Run focused tests and verify RED**
+- [x] **Step 6: Run focused tests and verify RED**
 
 Run:
 
@@ -95,11 +95,11 @@ cargo test --test real_ssh required_mode -- --nocapture
 
 Expected: version cases fail because `Config::validate` ignores `version`; required-mode cases fail because setup failure always returns successfully.
 
-- [ ] **Step 7: Implement exact config version and required acceptance mode**
+- [x] **Step 7: Implement exact config version and required acceptance mode**
 
 Add one `CONFIG_VERSION: u32 = 1` constant and reject any other value in `Config::validate` before limits or hosts are interpreted. In `tests/real_ssh.rs`, preserve visible skip output for developer mode but panic with `required real SSH integration unavailable: <reason>` in required mode.
 
-- [ ] **Step 8: Run focused tests and verify GREEN**
+- [x] **Step 8: Run focused tests and verify GREEN**
 
 Run:
 
@@ -111,11 +111,11 @@ CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --no
 
 Expected: focused tests pass; the required real-SSH command executes one localhost fixture with one pass, zero failures, and no skip.
 
-- [ ] **Step 9: Align documentation and completion records**
+- [x] **Step 9: Align documentation and completion records**
 
 Document that every operation re-resolves and compares the immutable connection identity, that the same-UID/local SSH configuration remains trusted and an exact post-check race is inside that boundary, and that both server-alive options apply to normal SSH as well as SSHFS. Record the required real-SSH command. Mark the original plan's completed checkboxes and add dated final-review evidence without changing any threshold.
 
-- [ ] **Step 10: Run complete verification and rebuild the package**
+- [x] **Step 10: Run complete verification and rebuild the package**
 
 Run:
 
@@ -130,10 +130,15 @@ cargo build --release
 
 Copy `target/release/codex-ssh-bridge` to `bin/codex-ssh-bridge`, keep mode `0755`, and verify their SHA-256 values match. Expected: all commands exit zero; required real SSH does not print `SKIP`; all performance thresholds remain unchanged and pass.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add src tests README.md docs bin
 git commit -m "fix: pin OpenSSH identity across remote operations"
 ```
 
+## Final Evidence — 2026-07-19
+
+- All 11 steps above are complete.
+- The controller ran `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture` outside the bind-restricted sandbox: 3 passed, 0 failed, 0 ignored, and the localhost integration emitted no `SKIP`.
+- Final release and packaged binaries match at SHA-256 `d75c745b756d381dcf1266ce34fb3201dafb5898ed20b9ad413d45365c4d298a`; `bin/codex-ssh-bridge` remains mode `0755`.
