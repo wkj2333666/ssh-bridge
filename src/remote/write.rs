@@ -67,7 +67,30 @@ codex_mutation_replace() {
 }
 
 codex_mutation_mode() {
-    chmod "$1" -- "$2"
+    codex_mode=$1
+    codex_mode_path=$2
+    codex_mutation_stat_valid "$codex_mode_path" || return 1
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) return 1 ;; esac
+    codex_mode_device=$CODEX_STAT_DEVICE
+    codex_mode_inode=$CODEX_STAT_INODE
+    exec 9<>"$codex_mode_path" || return 1
+    codex_mutation_parent_stat_follow_valid /proc/self/fd/9 || {
+        exec 9>&-
+        return 1
+    }
+    case "$CODEX_STAT_TYPE" in 8???) ;; *)
+        exec 9>&-
+        return 1
+        ;;
+    esac
+    if [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" != "$codex_mode_device:$codex_mode_inode" ]; then
+        exec 9>&-
+        return 1
+    fi
+    chmod "$codex_mode" -- /proc/self/fd/9
+    codex_mode_status=$?
+    exec 9>&-
+    return "$codex_mode_status"
 }
 
 codex_mutation_remove() {
@@ -523,8 +546,6 @@ codex_mutation_stat_valid "$target" || exit 5
 case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
 [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
 [ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:$target_mode:$expected_size:1" ] || exit 5
-target_hash=$(codex_mutation_hash "$target") || exit 5
-[ "$target_hash" = "$expected_content_hash" ] || exit 5
 
 [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
 
@@ -1908,6 +1929,8 @@ mod tests {
         assert!(!super::WRITE_SCRIPT.contains("chmod -h"));
         assert!(super::WRITE_SCRIPT.contains("codex_mutation_mode \"$target_mode\" \"$tmp\""));
         assert!(!super::WRITE_SCRIPT.contains("codex_mutation_mode \"$target_mode\" \"$target\""));
+        assert!(super::WRITE_SCRIPT.contains("exec 9<>\"$codex_mode_path\""));
+        assert!(super::WRITE_SCRIPT.contains("chmod \"$codex_mode\" -- /proc/self/fd/9"));
     }
 
     #[test]

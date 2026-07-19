@@ -425,7 +425,30 @@ name'
     }
 
     codex_mutation_mode() {
-        chmod "$1" -- "$2"
+        codex_mode=$1
+        codex_mode_path=$2
+        codex_mutation_stat_valid "$codex_mode_path" || return 1
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) return 1 ;; esac
+        codex_mode_device=$CODEX_STAT_DEVICE
+        codex_mode_inode=$CODEX_STAT_INODE
+        exec 9<>"$codex_mode_path" || return 1
+        codex_mutation_parent_stat_follow_valid /proc/self/fd/9 || {
+            exec 9>&-
+            return 1
+        }
+        case "$CODEX_STAT_TYPE" in 8???) ;; *)
+            exec 9>&-
+            return 1
+            ;;
+        esac
+        if [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" != "$codex_mode_device:$codex_mode_inode" ]; then
+            exec 9>&-
+            return 1
+        fi
+        chmod "$codex_mode" -- /proc/self/fd/9
+        codex_mode_status=$?
+        exec 9>&-
+        return "$codex_mode_status"
     }
 
     codex_mutation_remove() {
