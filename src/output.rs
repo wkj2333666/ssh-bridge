@@ -1508,7 +1508,7 @@ impl OutputSink {
     }
 
     async fn finish(mut self, store: &OutputStore) -> BridgeResult<CapturedOutput> {
-        self.stderr_scanner.finish_pending_line();
+        self.stderr_scanner.finish_pending_line(false);
         let reference = match &mut self.retained {
             RetainedOutput::Memory { .. } => None,
             RetainedOutput::Spool(spool) => {
@@ -1559,7 +1559,7 @@ impl OutputSink {
     }
 
     async fn finish_internal(mut self) -> BridgeResult<InternalCapturedOutput> {
-        self.stderr_scanner.finish_pending_line();
+        self.stderr_scanner.finish_pending_line(false);
         let RetainedOutput::Spool(spool) = &mut self.retained else {
             return Err(BridgeError::new(
                 ErrorCode::Io,
@@ -1841,7 +1841,7 @@ impl DiagnosticScanner {
         const MAX_DIAGNOSTIC_LINE_BYTES: usize = 1024;
         for byte in bytes {
             if *byte == b'\n' {
-                self.finish_pending_line();
+                self.finish_pending_line(true);
             } else if !self.line_overflowed {
                 if self.line.len() == MAX_DIAGNOSTIC_LINE_BYTES {
                     self.line.clear();
@@ -1853,13 +1853,18 @@ impl DiagnosticScanner {
         }
     }
 
-    fn finish_pending_line(&mut self) {
-        if !self.line_overflowed
-            && let Ok(line) = std::str::from_utf8(&self.line)
-        {
-            self.signals.host_key |= is_host_key_diagnostic(line);
-            self.signals.authentication |= is_authentication_diagnostic(line);
-            self.signals.connect_timeout |= is_connect_timeout_diagnostic(line);
+    fn finish_pending_line(&mut self, line_ended_by_lf: bool) {
+        if !self.line_overflowed {
+            let diagnostic_line = if line_ended_by_lf {
+                self.line.strip_suffix(b"\r").unwrap_or(&self.line)
+            } else {
+                &self.line
+            };
+            if let Ok(line) = std::str::from_utf8(diagnostic_line) {
+                self.signals.host_key |= is_host_key_diagnostic(line);
+                self.signals.authentication |= is_authentication_diagnostic(line);
+                self.signals.connect_timeout |= is_connect_timeout_diagnostic(line);
+            }
         }
         self.line.clear();
         self.line_overflowed = false;
@@ -1933,9 +1938,9 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::{
-        ByteQuota, CleanupTombstone, EntryAccounting, InternalSpoolOwner, OutputStore,
-        PendingSpool, StoredAggregateKind, StoredProvenance, cleanup_entry, cleanup_paths,
-        create_private_file, create_spool, retry_tombstones, write_all_counted,
+        ByteQuota, CleanupTombstone, DiagnosticScanner, EntryAccounting, InternalSpoolOwner,
+        OutputStore, PendingSpool, StoredAggregateKind, StoredProvenance, cleanup_entry,
+        cleanup_paths, create_private_file, create_spool, retry_tombstones, write_all_counted,
     };
     use crate::config::{
         MAX_GLOBAL_SPOOL_QUOTA_BYTES, MAX_SPOOL_ENTRIES, MIN_GLOBAL_SPOOL_QUOTA_BYTES,
@@ -2087,6 +2092,67 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn diagnostic_scanner_classifies_crlf_split_between_chunks() {
+        let mut scanner = DiagnosticScanner::default();
+
+        scanner.push(b"Host key verification failed.\r");
+        assert!(
+            !scanner.signals.host_key,
+            "an incomplete line is not classified"
+        );
+        scanner.push(b"\n");
+
+        assert!(scanner.signals.host_key);
+    }
+
+    #[test]
+    fn diagnostic_scanner_does_not_strip_arbitrary_control_bytes_before_crlf() {
+        let mut scanner = DiagnosticScanner::default();
+
+        scanner.push(b"Host key verification failed.\x0b\r\n");
+
+        assert!(!scanner.signals.host_key);
+    }
+
+    #[test]
+    fn diagnostic_scanner_does_not_treat_a_bare_carriage_return_as_crlf() {
+        let mut scanner = DiagnosticScanner::default();
+
+        scanner.push(b"Host key verification failed.\r");
+        scanner.finish_pending_line(false);
+
+        assert!(!scanner.signals.host_key);
+    }
+
+    #[tokio::test]
+    async fn crlf_diagnostic_classification_preserves_captured_stderr_bytes() {
+        let base = tempfile::TempDir::new().unwrap();
+        let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+        let store = OutputStore::with_limits(&runtime, MAX_GLOBAL_SPOOL_QUOTA_BYTES, 1).unwrap();
+        let stderr = b"Host key verification failed.\r\n";
+
+        let captured = store
+            .capture(
+                tokio::io::empty(),
+                std::io::Cursor::new(stderr),
+                super::CaptureLimits {
+                    preview_bytes: 128,
+                    max_output_bytes: 1024,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(captured.stderr.head, stderr);
+        assert!(captured.stderr.tail.is_empty());
+        assert_eq!(captured.stderr.bytes_seen, stderr.len() as u64);
+        assert!(!captured.stderr.truncated);
+        assert_eq!(captured.aggregate_bytes, stderr.len() as u64);
+        assert!(captured.stderr_signals.host_key);
     }
 
     #[test]
