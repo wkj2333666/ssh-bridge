@@ -709,7 +709,12 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
         let result = runner
             .execute(run, CancellationToken::new())
             .await
-            .unwrap_or_else(|error| panic!("boundary cache execution failed: {error:?}"));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "boundary cache execution failed: code={:?}, message={}",
+                    error.code, error.message
+                )
+            });
         assert_eq!(result.physical_root, root);
         assert_eq!(
             result.shell.shell,
