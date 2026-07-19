@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use codex_ssh_bridge::cli::{
-    InstallLayout, LocalCommandSpec, RunArgs, ShellArg, doctor_host, install_user,
-    mount_sshfs_with_executable, parse_sshfs_mount_status, redact_ssh_diagnostics,
-    run_local_command, run_remote_argv, uninstall_user,
+    InstallLayout, LocalCommandSpec, RunArgs, ShellArg, build_verbose_ssh_diagnostic_argv,
+    doctor_host, install_user, mount_sshfs_with_executable, parse_sshfs_mount_status,
+    redact_ssh_diagnostics, run_local_command, run_remote_argv, uninstall_user,
 };
 use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile};
 use codex_ssh_bridge::output::OutputStore;
@@ -615,6 +615,61 @@ safe-control:\x1b[31m\n";
             "leaked {secret:?}: {rendered:?}"
         );
     }
+}
+
+#[test]
+fn verbose_doctor_ssh_g_argv_uses_effective_timeout_and_exact_hardening_once() {
+    let mut config = Config::default();
+    config.hosts.insert(
+        "dev".to_owned(),
+        HostProfile {
+            root: "/srv/project".to_owned(),
+            description: None,
+            read_only: false,
+            limits: HostLimitOverrides {
+                connect_timeout_ms: Some(2_501),
+                ..HostLimitOverrides::default()
+            },
+        },
+    );
+    let host = config.host("dev").unwrap();
+    assert_eq!(host.limits.connect_timeout_ms, 2_501);
+    let argv = build_verbose_ssh_diagnostic_argv(host);
+
+    assert_eq!(argv.first(), Some(&OsString::from("-vvv")));
+    assert_eq!(argv.iter().filter(|argument| *argument == "-G").count(), 1);
+    for option in [
+        "BatchMode=yes",
+        "StrictHostKeyChecking=yes",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "ClearAllForwardings=yes",
+        "PermitLocalCommand=no",
+        "RequestTTY=no",
+        "ControlPersist=300",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=3",
+        "ConnectTimeout=3",
+    ] {
+        assert_eq!(
+            option_count(&argv, option),
+            1,
+            "option={option:?}, argv={argv:?}"
+        );
+    }
+    assert_eq!(
+        argv.iter()
+            .filter(|argument| {
+                argument
+                    .to_str()
+                    .is_some_and(|argument| argument.starts_with("ConnectTimeout="))
+            })
+            .count(),
+        1,
+        "argv={argv:?}"
+    );
+    let separator = argv.iter().position(|argument| argument == "--").unwrap();
+    assert_eq!(argv.get(separator + 1), Some(&OsString::from("dev")));
 }
 
 #[test]
