@@ -69,7 +69,7 @@ Read-only host profiles reject `remote_apply_patch`, `remote_write`, and `remote
 Install and uninstall are dry-run unless `--apply` is present. Apply mode:
 
 - validates the canonical package and complete deterministic Skill tree;
-- rejects symlinks, special files, untrusted owners, and writable ancestors;
+- rejects symlinks, special files, untrusted owners, and unsafe writable ancestors outside a sealed current-user boundary;
 - structurally validates the plugin, MCP JSON, Skill frontmatter, and typed stdio MCP dependency;
 - obtains a private `O_NOFOLLOW`, mode-`0600`, current-user-owned cross-bundle lock;
 - repeats preflight under that lock;
@@ -79,6 +79,8 @@ Install and uninstall are dry-run unless `--apply` is present. Apply mode:
 - removes only content matching the recorded installation identity.
 
 The lock serializes this bridge's transactions. The local Unix user remains trusted: a separate process running as that same user can ignore the lock and directly edit Codex configuration, and the current Codex CLI has no compare-and-swap remove operation. Final rechecks detect many such races, but this is not a hostile-same-UID isolation mechanism.
+
+Source validation remains component-by-component and no-follow. A real current-user-owned `0700` ancestor establishes a sealed boundary: below it, current-user-owned directories may retain group/other mode bits because other UIDs cannot traverse the seal and the same UID is already trusted. Sticky `/tmp` does not establish that boundary; foreign owners, writable root-owned descendants, package symlinks, and unsafe canonical Codex executable targets remain rejected. This accommodates the local Codex release layout under a private home without weakening a shared directory tree.
 
 ## SSHFS boundary
 
@@ -96,6 +98,8 @@ cargo test --release --test mcp_protocol task7_adversarial_ -- --nocapture
 cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --test cli
+cargo test --release --test performance_acceptance -- --nocapture
+cargo test --release --test real_ssh -- --nocapture
 ```
 
-Final acceptance also runs the predictable-temp symlink regression, 16 MiB stdout+stderr serialization case, oversized-frame recovery, SSHFS policy/race tests, and an isolated real-OpenSSH fixture when local facilities permit.
+Final acceptance also runs the predictable-temp symlink regression, 16 MiB stdout+stderr serialization case, oversized-frame recovery, SSHFS policy/race tests, CRLF OpenSSH diagnostic classification, and an isolated real-OpenSSH fixture. The recorded real fixture ran successfully without a skip.

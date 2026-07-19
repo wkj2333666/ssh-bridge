@@ -19,6 +19,8 @@ cargo test --release --test mcp_tools task8_five_hosts_ -- --nocapture
 cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture
+cargo test --release --test performance_acceptance -- --nocapture
+cargo test --release --test real_ssh -- --nocapture
 ```
 
 Latency tests warm the relevant path, collect at least 120 samples, sort raw durations, and enforce the compiled p95 thresholds. RSS tests run fresh child processes and report warmed baseline, observed peak, and delta from `/proc/self/status`.
@@ -27,13 +29,15 @@ Latency tests warm the relevant path, collect at least 120 samples, sort raw dur
 
 | Case | Samples / shape | Observed | Gate |
 |---|---:|---:|---:|
-| Bridge-only MCP dispatch | 200 | p50 3.611 µs, p95 5.092 µs across review runs, max 238.434 µs | p95 < 2 ms |
-| Complete fake-SSH MCP call | 120 | p50 1.140415 ms, p95 1.620265 ms, max 2.817937 ms | p95 < 10 ms |
-| Five hosts, one-second command each | 5 concurrent | 1.010546 s wall time | < 1.5 s |
-| Cancellation to whole process-group exit | one TERM-ignoring fixture | 54.567412 ms | < 250 ms |
-| 64 MiB output plus retained host/list/stat/search models | 3 fresh children | RSS delta 13,088 / 12,944 / 13,264 KiB | each < 16 MiB |
-| Maximum-budget wide JSON array | fresh child | RSS delta 8,400 KiB | < 48 MiB |
-| Maximum-budget wide JSON object | separate fresh child | RSS delta 17,152 KiB | < 48 MiB |
+| Bridge-only MCP dispatch | 200 | p50 4.755 µs, p95 6.550 µs, max 107.089 µs | p95 < 2 ms |
+| Complete fake-SSH MCP call | 120 | p50 1.480011 ms, p95 3.560485 ms, max 11.365453 ms | p95 < 10 ms |
+| Five hosts, one-second command each | 5 concurrent | 1.020463499 s wall time; prepare/run/capability calls each exactly 5 | < 1.5 s |
+| Cancellation to whole process-group exit | one TERM-ignoring fixture | 51.381166 ms | < 250 ms |
+| 64 MiB output plus retained models | fresh child | baseline 3,888 KiB, peak 6,128 KiB, delta 2,240 KiB | < 16 MiB |
+| Maximum-budget wide JSON array | fresh child | RSS delta 8,528 KiB | < 48 MiB |
+| Maximum-budget wide JSON object | separate fresh child | RSS delta 17,216 KiB | < 48 MiB |
+| Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
+| Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 
 The fake-SSH p95 includes process creation and the complete bridge/MCP rendering path but not a network round trip. The five-host result demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond the configured limits.
 
@@ -55,4 +59,10 @@ The bridge still uses the remote Bash or POSIX sh selected by capability probing
 
 SSHFS is optional because repository walks and builds can turn many small filesystem calls into network round trips. The structured tools batch list/stat/read/search work remotely and return bounded results, which reduces both latency and Agent-side context pressure.
 
-Task 11 repeats these gates in `tests/performance_acceptance.rs`, records maximum MCP wire bytes, and appends isolated real-SSH status before final release.
+The final `tests/performance_acceptance.rs` run repeated every gate above in release mode. The following localhost fixture records real-SSH behavior separately from fake-transport timing.
+
+## Isolated real OpenSSH
+
+`tests/real_ssh.rs` generated temporary Ed25519 host, client, and wrong-host keys; launched an unprivileged OpenSSH 10.0p2 `sshd` on a localhost high port; and completed in 1.85 seconds with one pass, zero failures, and no skip. It verified strict known-host rejection, public-key login, ControlMaster inode reuse, explicit Bash, explicit sh, visible auto-to-sh fallback, hostile quoting, list/stat/read/fixed-string search, guarded write/patch, timeout, cancellation uncertainty, and identity-checked cleanup of the master sockets, remote test processes, and daemon.
+
+The managed sandbox denies local `bind(2)`, so the final fixture was run with approved local-network execution. If a host genuinely lacks the required local facilities, the test prints one explicit skip reason; this recorded run did not skip.
