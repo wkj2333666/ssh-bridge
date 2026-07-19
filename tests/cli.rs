@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use codex_ssh_bridge::cli::{
-    LocalCommandSpec, RunArgs, ShellArg, doctor_host, mount_sshfs_with_executable,
-    parse_sshfs_mount_status, redact_ssh_diagnostics, run_local_command, run_remote_argv,
-    unmount_sshfs_with_executable,
+    InstallLayout, LocalCommandSpec, RunArgs, ShellArg, doctor_host, install_user,
+    mount_sshfs_with_executable, parse_sshfs_mount_status, redact_ssh_diagnostics,
+    run_local_command, run_remote_argv, uninstall_user, unmount_sshfs_with_executable,
 };
 use codex_ssh_bridge::config::{Config, HostLimitOverrides, HostProfile};
 use codex_ssh_bridge::output::OutputStore;
@@ -631,4 +631,344 @@ async fn task9_unmount_executes_only_for_identity_checked_sshfs_mount() {
             .is_err()
     );
     assert!(!log.exists());
+}
+
+struct InstallFixture {
+    _private: tempfile::TempDir,
+    layout: InstallLayout,
+    codex_state: std::path::PathBuf,
+    log: std::path::PathBuf,
+}
+
+#[derive(Default)]
+struct InstallFixtureOptions {
+    add_skill_conflict: bool,
+    drift_mcp_after_add: bool,
+    fail_after_add: bool,
+    get_failure: Option<&'static str>,
+    known_warning_before_missing: bool,
+}
+
+fn install_fixture(options: InstallFixtureOptions) -> InstallFixture {
+    let private = tempfile::TempDir::new().unwrap();
+    let bundle = private.path().join("bundle");
+    let binary = bundle.join("bin/codex-ssh-bridge");
+    let plugin_manifest = bundle.join(".codex-plugin/plugin.json");
+    let mcp_manifest = bundle.join(".mcp.json");
+    let skill_source = bundle.join("skills/remote-ssh-ops");
+    let skill_target = private.path().join("user/.agents/skills/remote-ssh-ops");
+    let identity_file = private
+        .path()
+        .join("user/state/codex-ssh-bridge/install.toml");
+    let codex = private.path().join("bin/codex");
+    let codex_state = private.path().join("codex-state.json");
+    let mcp_value = private.path().join("matching-mcp.json");
+    let log = private.path().join("codex.log");
+    for directory in [
+        binary.parent().unwrap().to_owned(),
+        plugin_manifest.parent().unwrap().to_owned(),
+        skill_source.join("agents"),
+        skill_source.join("references"),
+        codex.parent().unwrap().to_owned(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(&binary, b"RUST-BINARY-FIXTURE").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        &plugin_manifest,
+        br#"{"name":"codex-ssh-bridge","skills":"./skills/","mcpServers":"./.mcp.json"}"#,
+    )
+    .unwrap();
+    fs::write(
+        &mcp_manifest,
+        br#"{"mcpServers":{"ssh-bridge":{"command":"./bin/codex-ssh-bridge","args":["mcp"]}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        skill_source.join("SKILL.md"),
+        b"---\nname: remote-ssh-ops\ndescription: safe remote operations\n---\n\n# Remote SSH Ops\n",
+    )
+    .unwrap();
+    fs::write(
+        skill_source.join("agents/openai.yaml"),
+        b"interface: {}\ndependencies:\n  tools:\n    - type: \"mcp\"\n      value: \"ssh-bridge\"\n",
+    )
+    .unwrap();
+    fs::write(
+        skill_source.join("references/operations.md"),
+        b"# operations\n",
+    )
+    .unwrap();
+    fs::write(
+        &mcp_value,
+        serde_json::to_vec(&serde_json::json!({
+            "transport": {
+                "type": "stdio",
+                "command": binary,
+                "args": ["mcp"],
+                "env": null,
+                "cwd": null
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let quote = |path: &std::path::Path| {
+        codex_ssh_bridge::quote::shell_word(path.to_str().unwrap()).unwrap()
+    };
+    let get_body = match options.get_failure {
+        Some(message) => format!(
+            "printf '%s\\n' {} >&2; exit 1",
+            codex_ssh_bridge::quote::shell_word(message).unwrap()
+        ),
+        None => {
+            let warning = if options.known_warning_before_missing {
+                "printf '%s\\n' \"WARNING: proceeding, even though we could not create PATH aliases: Read-only file system (os error 30)\" >&2;"
+            } else {
+                ""
+            };
+            format!(
+                "if [ -f {state} ]; then cat {state}; else {warning} printf '%s\\n' \"Error: No MCP server named 'ssh-bridge' found.\" >&2; exit 1; fi",
+                state = quote(&codex_state)
+            )
+        }
+    };
+    let mut add_actions = vec![format!(
+        "cp {source} {state}",
+        source = quote(&mcp_value),
+        state = quote(&codex_state)
+    )];
+    if options.add_skill_conflict {
+        add_actions.push(format!(
+            "mkdir -p {parent}; printf conflict >{target}",
+            parent = quote(skill_target.parent().unwrap()),
+            target = quote(&skill_target)
+        ));
+    }
+    if options.drift_mcp_after_add {
+        add_actions.push(format!(
+            "printf '%s' '{{\"transport\":{{\"type\":\"stdio\",\"command\":\"/bin/false\",\"args\":[\"mcp\"]}}}}' >{state}",
+            state = quote(&codex_state)
+        ));
+    }
+    if options.fail_after_add {
+        add_actions.push("exit 7".to_owned());
+    }
+    let add_body = add_actions.join("; ");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>{log}\ncase \"$1:$2\" in\n  mcp:get) {get_body};;\n  mcp:add) {add_body};;\n  mcp:remove) rm -f {state};;\n  *) exit 64;;\nesac\n",
+        log = quote(&log),
+        state = quote(&codex_state),
+    );
+    fs::write(&codex, script).unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    InstallFixture {
+        _private: private,
+        layout: InstallLayout {
+            binary,
+            plugin_manifest,
+            mcp_manifest,
+            skill_source,
+            skill_target,
+            identity_file,
+            codex_executable: codex,
+        },
+        codex_state,
+        log,
+    }
+}
+
+#[tokio::test]
+async fn task9_installer_is_dry_run_by_default_then_applies_idempotently() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    let dry = install_user(fixture.layout.clone(), false).await.unwrap();
+    assert!(!dry.applied);
+    assert!(!fixture.codex_state.exists());
+    assert!(!fixture.layout.skill_target.exists());
+    assert!(!fixture.layout.identity_file.exists());
+
+    let applied = install_user(fixture.layout.clone(), true).await.unwrap();
+    assert!(applied.applied);
+    assert!(fixture.codex_state.exists());
+    assert_eq!(
+        fs::canonicalize(&fixture.layout.skill_target).unwrap(),
+        fs::canonicalize(&fixture.layout.skill_source).unwrap()
+    );
+    assert_eq!(
+        fs::metadata(&fixture.layout.identity_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let before = fs::read_to_string(&fixture.log).unwrap();
+    install_user(fixture.layout.clone(), true).await.unwrap();
+    let after = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        before.matches("mcp add").count(),
+        after.matches("mcp add").count()
+    );
+}
+
+#[tokio::test]
+async fn task9_installer_refuses_unrelated_mcp_and_differentiates_get_failure() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    fs::write(
+        &fixture.codex_state,
+        br#"{"transport":{"type":"stdio","command":"/bin/false","args":["mcp"]}}"#,
+    )
+    .unwrap();
+    assert!(install_user(fixture.layout.clone(), true).await.is_err());
+    assert!(!fixture.layout.skill_target.exists());
+    assert!(!fixture.layout.identity_file.exists());
+
+    let failed = install_fixture(InstallFixtureOptions {
+        get_failure: Some("permission denied reading Codex config"),
+        ..InstallFixtureOptions::default()
+    });
+    assert!(install_user(failed.layout.clone(), true).await.is_err());
+    assert!(!failed.layout.skill_target.exists());
+    assert!(!failed.layout.identity_file.exists());
+}
+
+#[tokio::test]
+async fn task9_installer_accepts_only_exact_missing_stderr_plus_known_codex_warning() {
+    let warning = install_fixture(InstallFixtureOptions {
+        known_warning_before_missing: true,
+        ..InstallFixtureOptions::default()
+    });
+    assert!(install_user(warning.layout.clone(), false).await.is_ok());
+
+    let mixed = install_fixture(InstallFixtureOptions {
+        get_failure: Some("Error: No MCP server named 'ssh-bridge' found.\nunexpected diagnostic"),
+        ..InstallFixtureOptions::default()
+    });
+    assert!(install_user(mixed.layout.clone(), false).await.is_err());
+}
+
+#[tokio::test]
+async fn task9_installer_accepts_trusted_root_owned_codex_executable() {
+    let mut fixture = install_fixture(InstallFixtureOptions::default());
+    fixture.layout.codex_executable = std::path::PathBuf::from("/bin/true");
+    let metadata = fs::metadata(&fixture.layout.codex_executable).unwrap();
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::uid(&metadata),
+        std::os::unix::fs::MetadataExt::uid(&fs::symlink_metadata("/").unwrap())
+    );
+    let error = install_user(fixture.layout.clone(), false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "`codex mcp get --json` returned invalid JSON"
+    );
+}
+
+#[tokio::test]
+async fn task9_installer_validates_the_rust_package_chain_before_codex_mutation() {
+    let plugin = install_fixture(InstallFixtureOptions::default());
+    fs::write(
+        &plugin.layout.plugin_manifest,
+        br#"{"name":"some-other-plugin","skills":"./skills/","mcpServers":"./.mcp.json"}"#,
+    )
+    .unwrap();
+    assert!(install_user(plugin.layout.clone(), true).await.is_err());
+    assert!(!plugin.log.exists());
+
+    let mcp = install_fixture(InstallFixtureOptions::default());
+    fs::write(
+        &mcp.layout.mcp_manifest,
+        br#"{"mcpServers":{"ssh-bridge":{"command":"/bin/false","args":["wrong-mode"]}}}"#,
+    )
+    .unwrap();
+    assert!(install_user(mcp.layout.clone(), true).await.is_err());
+    assert!(!mcp.log.exists());
+
+    let skill = install_fixture(InstallFixtureOptions::default());
+    fs::write(
+        skill.layout.skill_source.join("SKILL.md"),
+        b"---\nname: unrelated-skill\ndescription: wrong\n---\n",
+    )
+    .unwrap();
+    assert!(install_user(skill.layout.clone(), true).await.is_err());
+    assert!(!skill.log.exists());
+}
+
+#[tokio::test]
+async fn task9_installer_rolls_back_only_its_mcp_when_skill_creation_races() {
+    let fixture = install_fixture(InstallFixtureOptions {
+        add_skill_conflict: true,
+        ..InstallFixtureOptions::default()
+    });
+    assert!(install_user(fixture.layout.clone(), true).await.is_err());
+    assert!(!fixture.codex_state.exists());
+    assert!(
+        fixture.layout.skill_target.exists(),
+        "race target missing; codex log: {}",
+        fs::read_to_string(&fixture.log).unwrap_or_default()
+    );
+    assert_eq!(fs::read(&fixture.layout.skill_target).unwrap(), b"conflict");
+    assert!(!fixture.layout.identity_file.exists());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("mcp add"));
+    assert!(log.contains("mcp remove"));
+}
+
+#[tokio::test]
+async fn task9_installer_rollback_never_removes_concurrently_replaced_mcp() {
+    let fixture = install_fixture(InstallFixtureOptions {
+        add_skill_conflict: true,
+        drift_mcp_after_add: true,
+        ..InstallFixtureOptions::default()
+    });
+    assert!(install_user(fixture.layout.clone(), true).await.is_err());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.codex_state).unwrap()).unwrap();
+    assert_eq!(state["transport"]["command"], "/bin/false");
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("mcp remove")
+    );
+}
+
+#[tokio::test]
+async fn task9_installer_rolls_back_matching_mcp_left_by_failed_codex_add() {
+    let fixture = install_fixture(InstallFixtureOptions {
+        fail_after_add: true,
+        ..InstallFixtureOptions::default()
+    });
+    assert!(install_user(fixture.layout.clone(), true).await.is_err());
+    assert!(!fixture.codex_state.exists());
+    assert!(
+        fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("mcp remove")
+    );
+}
+
+#[tokio::test]
+async fn task9_uninstall_requires_recorded_identity_and_exact_skill_target() {
+    let fixture = install_fixture(InstallFixtureOptions::default());
+    install_user(fixture.layout.clone(), true).await.unwrap();
+    let other = fixture._private.path().join("other-skill");
+    fs::create_dir(&other).unwrap();
+    fs::remove_file(&fixture.layout.skill_target).unwrap();
+    symlink(&other, &fixture.layout.skill_target).unwrap();
+    assert!(uninstall_user(fixture.layout.clone(), true).await.is_err());
+    assert!(fixture.codex_state.exists());
+    assert!(fixture.layout.identity_file.exists());
+
+    fs::remove_file(&fixture.layout.skill_target).unwrap();
+    symlink(&fixture.layout.skill_source, &fixture.layout.skill_target).unwrap();
+    let dry = uninstall_user(fixture.layout.clone(), false).await.unwrap();
+    assert!(!dry.applied);
+    assert!(fixture.codex_state.exists());
+    let applied = uninstall_user(fixture.layout.clone(), true).await.unwrap();
+    assert!(applied.applied);
+    assert!(!fixture.codex_state.exists());
+    assert!(!fixture.layout.skill_target.exists());
+    assert!(!fixture.layout.identity_file.exists());
 }
