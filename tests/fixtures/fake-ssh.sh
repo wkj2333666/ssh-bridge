@@ -118,6 +118,14 @@ for argument do
     remote_command=$argument
 done
 
+fake_root_value() {
+	if [ -n "${FAKE_SSH_ROOT_FILE:-}" ]; then
+		cat -- "$FAKE_SSH_ROOT_FILE"
+	else
+		printf '%s' "${FAKE_SSH_ROOT:-/srv/project}"
+	fi
+}
+
 if [ -n "${FAKE_SSH_PHASE_LOG:-}" ]; then
     case "$remote_command" in
         *codex_patch_snapshot_sentinel*) printf 'S\n' >>"$FAKE_SSH_PHASE_LOG" ;;
@@ -147,7 +155,7 @@ case "$remote_command" in
 			fi
 			exit "$root_status"
 		fi
-		fake_root=${FAKE_SSH_ROOT:-/srv/project}
+		fake_root=$(fake_root_value) || exit 1
 		printf 'CODEX_SSH_ROOT_OBSERVE=1\0'
 		printf 'ROOT=%s\0' "$fake_root"
 		printf 'DEVICE=%s\0' "${FAKE_SSH_ROOT_DEVICE:-1}"
@@ -165,7 +173,7 @@ case "$remote_command" in
         if [ -n "${FAKE_SSH_PROBE_SLEEP_SECONDS:-}" ]; then
             run_fake_sleep "$FAKE_SSH_PROBE_SLEEP_SECONDS"
         fi
-        fake_root=${FAKE_SSH_ROOT:-/srv/project}
+        fake_root=$(fake_root_value) || exit 1
         fake_shell=${FAKE_SSH_SHELL:-sh}
         fake_timeout=${FAKE_SSH_HAS_TIMEOUT:-0}
         if [ "$fake_shell" = bash ]; then

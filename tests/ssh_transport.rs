@@ -678,13 +678,22 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
     let base = TempDir::new().unwrap();
     let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
     let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let root_file = base.path().join("remote-root");
+    fs::write(&root_file, &root).unwrap();
     let log = base.path().join("cache.log");
     let environment = BTreeMap::from([
         (
             OsString::from("FAKE_SSH_MODE"),
             OsString::from("echo-command"),
         ),
-        (OsString::from("FAKE_SSH_ROOT"), OsString::from(&root)),
+        // Keep the huge boundary value out of the child environment. GitHub
+        // runners have a much larger inherited environment than local runs;
+        // passing the 64 KiB root inline can otherwise hit execve's aggregate
+        // environment limit before the fake SSH process starts.
+        (
+            OsString::from("FAKE_SSH_ROOT_FILE"),
+            root_file.as_os_str().to_owned(),
+        ),
         (OsString::from("FAKE_SSH_SHELL"), OsString::from("bash")),
         (
             OsString::from("FAKE_SSH_BASH_VERSION"),
