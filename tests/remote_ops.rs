@@ -733,7 +733,7 @@ async fn task78_remote_run_requires_canonical_bounded_base64_before_command_chil
 }
 
 #[tokio::test]
-async fn task78_remote_run_auto_fallback_and_missing_bash_are_explicit() {
+async fn task78_remote_run_requires_explicit_bash_support() {
     let remote = tempfile::TempDir::new().unwrap();
     let (_runtime, _runner, bridge) = fixture_with_options(
         remote.path(),
@@ -741,28 +741,21 @@ async fn task78_remote_run_auto_fallback_and_missing_bash_are_explicit() {
         None,
         &[("FAKE_SSH_MODE", OsString::from("echo-command"))],
     );
-    let result = bridge
+    let error = bridge
         .run(
             RemoteRunRequest {
                 host: "dev".to_owned(),
                 command: "printf safe".to_owned(),
                 cwd: None,
-                shell: RunShell::Auto,
+                shell: RunShell::Bash,
                 timeout_ms: Some(2_000),
                 stdin: None,
             },
             CancellationToken::new(),
         )
         .await
-        .unwrap();
-    assert_eq!(result.context.shell.kind, ShellName::Sh);
-    assert!(result.context.shell.fallback);
-    assert_eq!(
-        result.warnings,
-        [
-            "selected POSIX sh does not support Bash arrays, [[ ]], source, pipefail, or Bash substitutions; use POSIX syntax, or request Bash and ensure it is installed"
-        ]
-    );
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RemoteCapabilityMissing);
 
     let controls = tempfile::TempDir::new().unwrap();
     let log = controls.path().join("missing-bash.log");

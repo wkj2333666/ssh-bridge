@@ -662,7 +662,6 @@ pub enum WriteEncoding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunShell {
-    Auto,
     Bash,
     Sh,
     Login,

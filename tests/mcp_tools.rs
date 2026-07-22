@@ -582,81 +582,53 @@ async fn task8_complete_surface_all_nine_tools_are_real_json_rpc_calls() {
 }
 
 #[tokio::test]
-async fn task8_shell_surface_reports_bash_auto_sh_and_fallback_exactly() {
-    let cases = [
-        (
-            "bash-auto",
-            vec![
-                ("FAKE_SSH_MODE", OsString::from("echo-command")),
-                ("FAKE_SSH_SHELL", OsString::from("bash")),
-                ("FAKE_SSH_BASH_VERSION", OsString::from("5.2.15")),
-            ],
-            "auto",
-            "bash",
-            Some("5.2.15"),
-            false,
-        ),
-        (
-            "auto-fallback",
-            vec![
-                ("FAKE_SSH_MODE", OsString::from("echo-command")),
-                ("FAKE_SSH_SHELL", OsString::from("sh")),
-            ],
-            "auto",
-            "sh",
-            None,
-            true,
-        ),
-        (
-            "explicit-sh",
-            vec![
-                ("FAKE_SSH_MODE", OsString::from("echo-command")),
-                ("FAKE_SSH_SHELL", OsString::from("bash")),
-                ("FAKE_SSH_BASH_VERSION", OsString::from("5.2.15")),
-            ],
-            "sh",
-            "sh",
-            None,
-            false,
-        ),
+async fn task8_shell_surface_reports_bash_default_and_explicit_sh() {
+    let remote = tempfile::TempDir::new().unwrap();
+    let bash_extra = [
+        ("FAKE_SSH_MODE", OsString::from("echo-command")),
+        ("FAKE_SSH_SHELL", OsString::from("bash")),
+        ("FAKE_SSH_BASH_VERSION", OsString::from("5.2.15")),
     ];
-    for (name, environment, requested, kind, version, fallback) in cases {
-        let remote = tempfile::TempDir::new().unwrap();
-        let extra = environment
+    let extra = bash_extra
+        .iter()
+        .map(|(key, value)| (*key, value.clone()))
+        .collect::<Vec<_>>();
+    let (_runtime, _log, tools) = fake_remote_tools_with_options(remote.path(), false, &extra);
+    let mut session = ProtocolSession::start(tools).await;
+    let default_bash = session
+        .call("remote_run", json!({"host":"dev","command":"printf safe"}))
+        .await;
+    assert_eq!(default_bash["isError"], Value::Null, "{default_bash}");
+    assert_eq!(default_bash["structuredContent"]["shell"]["kind"], "bash");
+    assert_eq!(
+        default_bash["structuredContent"]["shell"]["version"],
+        "5.2.15"
+    );
+    assert_eq!(
+        default_bash["structuredContent"]["shell"]["fallback"],
+        false
+    );
+    session.close().await;
+
+    let (_runtime, _log, tools) = fake_remote_tools_with_options(remote.path(), false, &extra);
+    let mut session = ProtocolSession::start(tools).await;
+    let explicit_sh = session
+        .call(
+            "remote_run",
+            json!({"host":"dev","command":"printf safe","shell":"sh"}),
+        )
+        .await;
+    assert_eq!(explicit_sh["isError"], Value::Null, "{explicit_sh}");
+    assert_eq!(explicit_sh["structuredContent"]["shell"]["kind"], "sh");
+    assert_eq!(explicit_sh["structuredContent"]["shell"]["fallback"], false);
+    assert!(
+        explicit_sh["structuredContent"]["warnings"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|(key, value)| (*key, value.clone()))
-            .collect::<Vec<_>>();
-        let (_runtime, _log, tools) = fake_remote_tools_with_options(remote.path(), false, &extra);
-        let mut session = ProtocolSession::start(tools).await;
-        let run = session
-            .call(
-                "remote_run",
-                json!({"host":"dev","command":"printf safe","shell":requested}),
-            )
-            .await;
-        assert_eq!(run["isError"], Value::Null, "{name}: {run}");
-        assert_eq!(run["structuredContent"]["shell"]["kind"], kind, "{name}");
-        assert_eq!(
-            run["structuredContent"]["shell"]["version"],
-            version.map_or(Value::Null, |version| json!(version)),
-            "{name}"
-        );
-        assert_eq!(
-            run["structuredContent"]["shell"]["fallback"], fallback,
-            "{name}"
-        );
-        if kind == "sh" {
-            assert!(
-                run["structuredContent"]["warnings"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|warning| warning.as_str().unwrap().contains("POSIX sh")),
-                "{name}: {run}"
-            );
-        }
-        session.close().await;
-    }
+            .any(|warning| warning.as_str().unwrap().contains("POSIX sh"))
+    );
+    session.close().await;
 }
 
 #[tokio::test]
@@ -1142,7 +1114,7 @@ fn task8_schema_has_exact_required_fields_and_advisory_bounds() {
     assert_string_bounds(property(tool("remote_run"), "command"), 8_388_608);
     assert_eq!(
         property(tool("remote_run"), "shell")["enum"],
-        json!(["auto", "bash", "sh", "login"])
+        json!(["bash", "sh", "login"])
     );
     assert_integer_range(property(tool("remote_run"), "timeout_ms"), 1, 3_600_000);
     let stdin = property(tool("remote_run"), "stdin");
@@ -1180,7 +1152,7 @@ fn task8_schema_defaults_and_closed_write_mode_are_exact() {
         262_144
     );
     assert_eq!(property(tool("remote_run"), "cwd")["default"], ".");
-    assert_eq!(property(tool("remote_run"), "shell")["default"], "auto");
+    assert_eq!(property(tool("remote_run"), "shell")["default"], "bash");
 
     let alternatives = property(tool("remote_write"), "mode")["oneOf"]
         .as_array()

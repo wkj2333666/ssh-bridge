@@ -425,7 +425,7 @@ async fn task9_direct_run_quotes_each_argv_word_and_reports_shell() {
         RunArgs {
             host: "dev".to_owned(),
             cwd: ".".to_owned(),
-            shell: ShellArg::Auto,
+            shell: ShellArg::Bash,
             timeout_ms: Some(5_000),
             argv: vec!["printf".to_owned(), "%s".to_owned(), hostile.to_owned()],
         },
@@ -442,7 +442,7 @@ async fn task9_direct_run_quotes_each_argv_word_and_reports_shell() {
 }
 
 #[tokio::test]
-async fn task9_auto_run_reports_sh_fallback_and_warning_when_bash_is_unavailable() {
+async fn task9_bash_run_fails_when_bash_is_unavailable() {
     let private = tempfile::TempDir::new().unwrap();
     let remote = tempfile::TempDir::new().unwrap();
     let mut config = Config::default();
@@ -480,28 +480,22 @@ async fn task9_auto_run_reports_sh_fallback_and_warning_when_bash_is_unavailable
         .unwrap(),
     );
     let bridge = RemoteBridge::new(runner);
-    let result = run_remote_argv(
+    let error = run_remote_argv(
         &bridge,
         RunArgs {
             host: "dev".to_owned(),
             cwd: ".".to_owned(),
-            shell: ShellArg::Auto,
+            shell: ShellArg::Bash,
             timeout_ms: Some(5_000),
             argv: vec!["printf".to_owned(), "%s".to_owned(), "ok".to_owned()],
         },
     )
     .await
-    .unwrap();
-    let value = serde_json::to_value(result).unwrap();
-    assert_eq!(value["shell"]["kind"], "sh");
-    assert_eq!(value["shell"]["fallback"], true);
-    assert!(value["warnings"].as_array().unwrap().iter().any(|warning| {
-        warning
-            .as_str()
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("bash")
-    }));
+    .unwrap_err();
+    assert_eq!(
+        error.code,
+        codex_ssh_bridge::error::ErrorCode::RemoteCapabilityMissing
+    );
 }
 
 #[tokio::test]

@@ -98,7 +98,6 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ShellArg {
-    Auto,
     Bash,
     Sh,
     Login,
@@ -109,7 +108,7 @@ pub struct RunArgs {
     pub host: String,
     #[arg(long, default_value = ".")]
     pub cwd: String,
-    #[arg(long, value_enum, default_value = "auto")]
+    #[arg(long, value_enum, default_value = "bash")]
     pub shell: ShellArg,
     #[arg(long)]
     pub timeout_ms: Option<u64>,
@@ -245,7 +244,6 @@ pub async fn run_remote_argv(
                 command,
                 cwd: Some(arguments.cwd),
                 shell: match arguments.shell {
-                    ShellArg::Auto => RunShell::Auto,
                     ShellArg::Bash => RunShell::Bash,
                     ShellArg::Sh => RunShell::Sh,
                     ShellArg::Login => RunShell::Login,

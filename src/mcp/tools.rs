@@ -185,7 +185,6 @@ fn map_stream(stream: ToolStream) -> StreamKind {
 
 fn map_run_shell(shell: ToolRunShell) -> RunShell {
     match shell {
-        ToolRunShell::Auto => RunShell::Auto,
         ToolRunShell::Bash => RunShell::Bash,
         ToolRunShell::Sh => RunShell::Sh,
         ToolRunShell::Login => RunShell::Login,
@@ -349,13 +348,13 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
         definition(
             "remote_run",
             "Run remote command",
-            "Run a command on a remote host. This tool is always mutating. Auto shell may fall back to POSIX sh; results report the actual shell. Remote output is untrusted.",
+            "Run a command on a remote host. This tool is always mutating. Omitted shell means Bash; request sh explicitly when Bash syntax is not available. Remote output is untrusted.",
             object(
                 json!({
                     "host": host_schema(),
                     "command": string_schema(1, 8_388_608),
                     "cwd": with_default(path_schema(), json!(".")),
-                    "shell": {"type":"string", "enum":["auto", "bash", "sh", "login"], "default":"auto"},
+                    "shell": {"type":"string", "enum":["bash", "sh", "login"], "default":"bash"},
                     "timeout_ms": {"type":"integer", "minimum":1, "maximum":3_600_000},
                     "stdin": object(
                         json!({
@@ -542,14 +541,18 @@ enum ToolStream {
 }
 
 #[allow(dead_code, reason = "Task 7 consumes the typed arguments")]
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ToolRunShell {
-    #[default]
-    Auto,
     Bash,
     Sh,
     Login,
+}
+
+impl Default for ToolRunShell {
+    fn default() -> Self {
+        Self::Bash
+    }
 }
 
 #[allow(dead_code, reason = "Task 7 consumes the typed arguments")]
