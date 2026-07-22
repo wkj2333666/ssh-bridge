@@ -1586,36 +1586,9 @@ fn fixed_script_prefix(command: &str, marker: &str) -> String {
 }
 
 fn normalized_remote_run_shape(log: &std::path::Path) -> (String, String) {
-    let (argv, command) = only_command_record(log);
-    let operation_end = command
-        .rfind("\n)\ns=$?")
-        .expect("guarded remote_run command has an operation boundary");
-    let (prefix, timeout_word) = command[..operation_end]
-        .rsplit_once(' ')
-        .expect("remote_run command has a timeout argument");
-    const EMBEDDED_SINGLE_QUOTE: &str = "'\"'\"'";
-    let timeout = timeout_word
-        .strip_prefix(EMBEDDED_SINGLE_QUOTE)
-        .and_then(|value| value.strip_suffix(EMBEDDED_SINGLE_QUOTE))
-        .and_then(|value| value.strip_suffix('s'))
-        .unwrap_or_else(|| {
-            panic!("remote_run timeout is a quoted seconds value: {timeout_word:?}")
-        });
-    let (seconds, milliseconds) = timeout
-        .split_once('.')
-        .expect("remote_run timeout has millisecond precision");
-    assert_eq!(milliseconds.len(), 3);
-    assert!(
-        seconds.bytes().all(|byte| byte.is_ascii_digit())
-            && milliseconds.bytes().all(|byte| byte.is_ascii_digit())
-    );
-    let timeout_ms = seconds.parse::<u64>().unwrap() * 1000 + milliseconds.parse::<u64>().unwrap();
-    assert!((1..=300_000).contains(&timeout_ms));
-    let mut normalized = String::with_capacity(command.len());
-    normalized.push_str(prefix);
-    normalized.push_str(" '<REMOTE_TIMEOUT>'");
-    normalized.push_str(&command[operation_end..]);
-    (argv, normalized)
+    // The payload is carried in DATA frames; a hostile stdin value must not
+    // alter the static direct-rendered remote command at all.
+    only_command_record(log)
 }
 
 fn assert_hostile_marker_absent(remote: &std::path::Path) {
@@ -2023,8 +1996,8 @@ async fn task8_five_hosts_pipeline_in_parallel_with_exact_context_and_no_sixth_c
     call_kinds.sort_unstable();
     assert_eq!(
         call_kinds,
-        [vec!["C"; 5], vec!["G"; 5]].concat(),
-        "each warm operation must perform exactly one identity revalidation and one command"
+        vec!["C"; 5],
+        "each warm operation must perform exactly one command"
     );
     eprintln!("five-host MCP release sample: elapsed={elapsed:?}");
     session.close().await;
