@@ -63,6 +63,14 @@ path-safe operations, expected hashes, and atomic replacement where applicable.
 
 - Existing `elapsed_ms` compatibility is preserved while its meaning is
   documented as bridge operation time, not remote CPU or disk time.
+- In a warm persistent session, bridge work is expected to approach the cost of
+  one request-frame encode/decode and local bookkeeping; it must not add a
+  second SSH round trip or a per-request root probe. The dominant steady-state
+  terms should therefore be network propagation and remote command execution.
+- Rust-side timing instrumentation must report enough phase data to distinguish
+  local bridge bookkeeping, SSH/session transport, and remote command timing in
+  benchmarks. It must not require a Python helper or make the Agent assemble
+  these phases itself.
 - Implementation timing instrumentation may expose phase data for diagnostics,
   but it must not change command output or make the Agent reconstruct transport
   behavior.
@@ -100,4 +108,7 @@ path-safe operations, expected hashes, and atomic replacement where applicable.
 - Run the full library, remote operation, MCP, packaging, real-SSH, clippy,
   release-build, and performance acceptance suites.
 - Compare first-request and warm-request timings before and after the change;
-  report bridge elapsed time separately from remote command inner timing.
+  report bridge bookkeeping, SSH/session transport, and remote command inner
+  timing separately. The warm-request acceptance check must show no extra
+  `CODEX_SSH_ROOT_OBSERVE` frame and no material bridge-only work beyond frame
+  handling and local bookkeeping.
