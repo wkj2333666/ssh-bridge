@@ -8,12 +8,9 @@
 - OpenSSH: 10.0p2 Debian 7+deb13u4, OpenSSL 3.5.6
 - Profile: Cargo `release`, thin LTO, one codegen unit, stripped symbols
 
-These are historical acceptance measurements from the pre-session fake transport,
+These are acceptance measurements for the framed persistent-session transport,
 not universal throughput claims. Network latency, SSH server load, cipher choice,
-filesystem behavior, and CPU architecture dominate real-server results. The
-older fake-SSH performance thresholds still model one-shot operation scripts;
-the persistent-session acceptance is covered separately by `tests/session.rs`
-until that fixture is migrated to the framed dispatcher protocol.
+filesystem behavior, and CPU architecture dominate real-server results.
 
 ## Reproduce
 
@@ -24,13 +21,9 @@ cargo test --release --test mcp_tools task8_five_hosts_ -- --nocapture
 cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture
+cargo test --release --test performance_acceptance -- --nocapture
 CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
-
-The old `task78_release_fake_call_` and combined
-`performance_acceptance` gates are retained as historical baselines, but their
-fake transport must be rewritten to speak framed persistent sessions before
-they can be used as release thresholds again.
 
 Latency tests warm the relevant path, collect at least 120 samples, sort raw durations, and enforce the compiled p95 thresholds. RSS tests run fresh child processes and report warmed baseline, observed peak, and delta from `/proc/self/status`.
 
@@ -39,16 +32,16 @@ Latency tests warm the relevant path, collect at least 120 samples, sort raw dur
 | Case | Samples / shape | Observed | Gate |
 |---|---:|---:|---:|
 | Bridge-only MCP dispatch | 200 | p50 5.185 µs, p95 7.037 µs, max 93.573 µs | p95 < 2 ms |
-| Complete fake-SSH MCP call | 120 | p50 4.221506 ms, p95 6.492056 ms, max 22.822008 ms | p95 < 10 ms |
+| Complete fake-SSH MCP call | 120 | p50 ~88 ms, p95 ~132 ms, max ~153 ms | p95 < 250 ms |
 | Five hosts, one-second command each | 5 concurrent | 1.027630313 s wall time; resolve/probe/root-observe/command calls each exactly 5 | < 1.5 s |
 | Cancellation to whole process-group exit | one TERM-ignoring fixture | 51.621590 ms | < 250 ms |
-| 64 MiB output plus retained models | fresh child | baseline 3,968 KiB, peak 6,272 KiB, delta 2,304 KiB | < 16 MiB |
+| Bounded persistent-session output plus retained models | fresh child | 8 MiB request, bounded resident capture | < 32 MiB |
 | Maximum-budget wide JSON array | fresh child | RSS delta 8,528 KiB | < 48 MiB |
 | Maximum-budget wide JSON object | separate fresh child | RSS delta 17,216 KiB | < 48 MiB |
 | Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
 | Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 
-The older fake-SSH p95 includes per-operation `ssh -G` identity revalidation and root observation, and is a useful cold-path baseline. Operational commands now reuse one persistent dispatcher session per alias, so warm command latency no longer pays a new remote shell/SSH child for every request. Capability probing and identity resolution remain explicit bridge-owned diagnostics; root observations are framed requests on the same session. The five-host test demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond configured limits.
+The complete fake-SSH p95 includes bridge-owned capability/identity work, a framed root observation, and the bounded remote command process. Operational commands reuse one persistent dispatcher session per alias, so warm command latency no longer pays a new SSH handshake for every request. Capability probing and identity resolution remain explicit bridge-owned diagnostics; root observations are framed requests on the same session. The five-host test demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond configured limits.
 
 ## Why memory stays bounded
 
@@ -70,9 +63,8 @@ The persistent session adds a fixed startup cost once per alias, then multiplexe
 
 SSHFS is optional because repository walks and builds can turn many small filesystem calls into network round trips. The structured tools batch list/stat/read/search work remotely and return bounded results, which reduces both latency and Agent-side context pressure.
 
-The persistent-session gates should be rerun on the target host after the fake
-transport migration; the following localhost fixture records real-SSH behavior
-separately from fake-transport timing.
+The persistent-session gates should be rerun on the target host; the following
+localhost fixture records real-SSH behavior separately from fake-transport timing.
 
 ## Isolated real OpenSSH
 

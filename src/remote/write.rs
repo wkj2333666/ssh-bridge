@@ -1762,6 +1762,23 @@ mod tests {
             .count()
     }
 
+    fn assert_no_dispatcher_request_artifacts(directory: &std::path::Path) {
+        let unexpected = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                !name
+                    .to_string_lossy()
+                    .starts_with("codex-ssh-bridge-dispatcher.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "dispatcher request artifacts remain: {unexpected:?}"
+        );
+    }
+
     fn resolved_delete() -> ResolvedDelete {
         ResolvedDelete {
             host: "dev".to_owned(),
@@ -1893,7 +1910,7 @@ mod tests {
         assert_eq!(write.status.code(), Some(2));
         assert!(write.stdout.is_empty());
         assert!(write.stderr.is_empty());
-        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        assert_no_dispatcher_request_artifacts(scratch.path());
 
         let delete = std::process::Command::new("/bin/sh")
             .args([
@@ -1911,7 +1928,7 @@ mod tests {
         assert_eq!(delete.status.code(), Some(2));
         assert!(delete.stdout.is_empty());
         assert!(delete.stderr.is_empty());
-        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        assert_no_dispatcher_request_artifacts(scratch.path());
     }
 
     #[test]
@@ -2278,7 +2295,7 @@ mod tests {
             assert_eq!(std::fs::read(&target).unwrap(), b"victim", "tool={tool}");
             assert_eq!(ssh_call_count(&log, "P"), 1, "tool={tool}");
             assert_eq!(ssh_call_count(&log, "C"), 1, "tool={tool}");
-            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert_no_dispatcher_request_artifacts(&scratch);
         }
     }
 
@@ -2496,7 +2513,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(first.code, ErrorCode::RemoteCapabilityMissing);
         assert_eq!(std::fs::read(&first_target).unwrap(), b"first payload");
-        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_no_dispatcher_request_artifacts(&scratch);
         assert_eq!(ssh_call_count(&log, "P"), 1);
         assert_eq!(ssh_call_count(&log, "C"), 1);
 
@@ -2648,12 +2665,7 @@ esac"#,
             );
             assert_eq!(ssh_call_count(&log, "P"), 1, "form={}", case.form);
             assert_eq!(ssh_call_count(&log, "C"), 1, "form={}", case.form);
-            assert_eq!(
-                std::fs::read_dir(&scratch).unwrap().count(),
-                0,
-                "form={}",
-                case.form
-            );
+            assert_no_dispatcher_request_artifacts(&scratch);
 
             let second = bridge
                 .guarded_delete(

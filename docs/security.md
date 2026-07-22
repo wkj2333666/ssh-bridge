@@ -118,9 +118,9 @@ cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
 
-The pre-session `remote_ops` and `performance_acceptance` fake fixtures still
-assume one-shot SSH and are not acceptance gates for the persistent dispatcher;
-their migration is tracked separately. Final focused acceptance also runs the
-predictable-temp symlink regression, 16 MiB stdout+stderr serialization case,
-oversized-frame recovery, SSHFS policy/race tests, CRLF OpenSSH diagnostic
-classification, and an isolated real-OpenSSH fixture.
+The `remote_ops` and `performance_acceptance` fixtures use the persistent
+dispatcher protocol, including request cancellation, bounded output, cleanup,
+and capability-mismatch cases. Final acceptance also runs the predictable-temp
+symlink regression, 16 MiB stdout+stderr serialization case, oversized-frame
+recovery, SSHFS policy/race tests, CRLF OpenSSH diagnostic classification, and
+an isolated real-OpenSSH fixture.

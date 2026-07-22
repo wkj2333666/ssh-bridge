@@ -50,11 +50,26 @@ pub struct RemoteBridge {
 }
 
 fn attach_fixed_result_context(
-    error: BridgeError,
+    mut error: BridgeError,
     host: &str,
     result: &FixedRunResult,
 ) -> BridgeError {
-    attach_shell_selection_context(error, host, &result.capability.physical_root, &result.shell)
+    error = attach_shell_selection_context(
+        error,
+        host,
+        &result.capability.physical_root,
+        &result.shell,
+    );
+    if error.details.elapsed_ms.is_none() {
+        error.details.elapsed_ms = Some(result.elapsed_ms);
+    }
+    if error.details.bytes_seen.is_none() {
+        error.details.bytes_seen = Some(result.output.aggregate_bytes);
+    }
+    if error.details.remote_process_may_continue.is_none() {
+        error.details.remote_process_may_continue = Some(result.remote_process_may_continue);
+    }
+    error
 }
 
 fn attach_shell_selection_context(

@@ -154,6 +154,8 @@ pub(crate) struct FixedRunResult {
     pub root_identity: RootIdentity,
     pub shell: ShellSelection,
     pub output: InternalCapturedOutput,
+    pub elapsed_ms: u64,
+    pub remote_process_may_continue: bool,
 }
 
 pub struct SshRunner {
@@ -277,13 +279,11 @@ impl SshRunner {
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
+        let root_observation_timeout = remaining_timeout(operation_deadline).map_err(|error| {
+            attach_selected_context(error, &request.host, &capability.physical_root, &shell)
+        })?;
         let observed_root = self
-            .observe_root_session(
-                &session,
-                &root,
-                remaining_timeout(operation_deadline)?,
-                &cancel,
-            )
+            .observe_root_session(&session, &root, root_observation_timeout, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
@@ -522,7 +522,7 @@ impl SshRunner {
 
     async fn capture_session_internal(
         &self,
-        result: &SessionResult,
+        result: SessionResult,
         limits: EffectiveLimits,
         max_output_bytes: u64,
         cleanup: InternalSpoolRegistration,
@@ -530,8 +530,8 @@ impl SshRunner {
     ) -> BridgeResult<InternalCapturedOutput> {
         let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
         let (mut stderr_writer, stderr_reader) = duplex(64 * 1024);
-        let stdout = result.stdout.clone();
-        let stderr = result.stderr.clone();
+        let stdout = result.stdout;
+        let stderr = result.stderr;
         let stdout_task = tokio::spawn(async move {
             let _ = stdout_writer.write_all(&stdout).await;
             let _ = stdout_writer.shutdown().await;
@@ -733,13 +733,11 @@ impl SshRunner {
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
+        let root_observation_timeout = remaining_timeout(operation_deadline).map_err(|error| {
+            attach_selected_context(error, &request.host, &capability.physical_root, &shell)
+        })?;
         let observed_root = self
-            .observe_root_session(
-                &session,
-                &root,
-                remaining_timeout(operation_deadline)?,
-                &cancel,
-            )
+            .observe_root_session(&session, &root, root_observation_timeout, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
@@ -791,7 +789,14 @@ impl SshRunner {
                     login_shell: None,
                     env: BTreeMap::new(),
                     stdin: request.stdin,
-                    timeout: remaining_timeout(operation_deadline)?,
+                    timeout: remaining_timeout(operation_deadline).map_err(|error| {
+                        attach_selected_context(
+                            error,
+                            &request.host,
+                            &observed_root.physical_root,
+                            &shell,
+                        )
+                    })?,
                     stdout_limit: request.stdout_limit,
                     stderr_limit: request.stderr_limit,
                 },
@@ -813,17 +818,20 @@ impl SshRunner {
             }
         };
         if session_result.status != 0 {
-            let mut error = if session_result.status == ROOT_GUARD_EXIT {
-                root_drift_error(request.kind)
-            } else {
-                let mut error = BridgeError::new(
-                    ErrorCode::RemoteExit,
-                    "remote fixed operation failed",
-                    false,
-                );
-                error.details.exit_status = Some(session_result.status);
-                error
-            };
+            if session_result.status == ROOT_GUARD_EXIT {
+                return Err(attach_selected_context(
+                    root_drift_error(request.kind),
+                    &request.host,
+                    &observed_root.physical_root,
+                    &shell,
+                ));
+            }
+            let mut error = BridgeError::new(
+                ErrorCode::RemoteExit,
+                "remote fixed operation failed",
+                false,
+            );
+            error.details.exit_status = Some(session_result.status);
             error.details.host = Some(request.host.clone());
             return Err(attach_selected_context(
                 request.kind.after_spawn_error(error),
@@ -833,20 +841,30 @@ impl SshRunner {
             ));
         }
         if session_result.stdout_truncated || session_result.stderr_truncated {
+            let mut error = BridgeError::new(
+                ErrorCode::OutputLimit,
+                "fixed output exceeded its stream limit",
+                false,
+            );
+            error.details.elapsed_ms = Some(session_result.elapsed_ms);
+            error.details.bytes_seen = Some(
+                u64::try_from(session_result.stdout.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(session_result.stderr.len()).unwrap_or(u64::MAX)),
+            );
+            error.details.remote_process_may_continue = Some(true);
             return Err(attach_selected_context(
-                request.kind.after_spawn_error(BridgeError::new(
-                    ErrorCode::OutputLimit,
-                    "fixed output exceeded its stream limit",
-                    false,
-                )),
+                request.kind.after_spawn_error(error),
                 &request.host,
                 &observed_root.physical_root,
                 &shell,
             ));
         }
+        let session_elapsed_ms = session_result.elapsed_ms;
+        let session_remote_process_may_continue = session_result.remote_process_may_continue;
         let output = self
             .capture_session_internal(
-                &session_result,
+                session_result,
                 limits,
                 capture_limit,
                 request.cleanup,
@@ -882,6 +900,8 @@ impl SshRunner {
             root_identity: observed_root,
             shell,
             output,
+            elapsed_ms: session_elapsed_ms,
+            remote_process_may_continue: session_remote_process_may_continue,
         })
     }
 
@@ -2988,7 +3008,7 @@ mod tests {
             .execute_fixed_once(
                 task5_fixed_request(
                     FixedOperationKind::Mutation,
-                    Duration::from_millis(20),
+                    Duration::from_millis(200),
                     owner.registration(),
                     16,
                     16,
@@ -3037,7 +3057,7 @@ mod tests {
         let fixture = task5_fixed_fixture(&[
             ("FAKE_SSH_LOG", overflow_log.display().to_string()),
             ("FAKE_SSH_MODE", "bytes".to_owned()),
-            ("FAKE_SSH_STDOUT_BYTES", "64".to_owned()),
+            ("FAKE_SSH_FIXED_STDOUT_BYTES", "64".to_owned()),
         ]);
         let owner = InternalSpoolOwner::new();
         let error = fixture

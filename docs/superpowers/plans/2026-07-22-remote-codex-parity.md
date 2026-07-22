@@ -10,11 +10,10 @@
 
 ## Implementation status
 
-Tasks 1–7 are implemented. Task 8's focused gates pass; the older `remote_ops`
-integration fixture still models one-shot SSH and is intentionally excluded from
-the persistent-session acceptance result until that fixture speaks the framed
-dispatcher protocol. Environment overrides are deferred from the v0 public
-contract rather than silently ignored.
+Tasks 1–8 are implemented. The integration and performance fixtures now speak
+the framed persistent-session protocol, including session lifecycle, cancellation,
+bounded output, and remote capability differences. Environment overrides remain
+deferred from the v0 public contract rather than silently ignored.
 
 ## Global Constraints
 
