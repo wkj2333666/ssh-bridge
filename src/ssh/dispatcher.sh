@@ -274,7 +274,6 @@ exit 0"
 (
     trap '' TERM HUP
     exec 0<&3 3<&-
-    exec >/dev/null 2>/dev/null
     if [ -n \"\${FAKE_SSH_CHILD_READY_FILE-}\" ]; then printf \"%s\\\\n\" ready >\"\$FAKE_SSH_CHILD_READY_FILE\"; fi
     sleep \"\${FAKE_SSH_SLEEP_SECONDS-10}\"
 ) &
