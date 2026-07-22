@@ -31,10 +31,10 @@ Latency tests warm the relevant path, collect at least 120 samples, sort raw dur
 
 | Case | Samples / shape | Observed | Gate |
 |---|---:|---:|---:|
-| Bridge-only MCP dispatch | 200 | p50 5.185 µs, p95 7.037 µs, max 93.573 µs | p95 < 2 ms |
-| Complete fake-SSH MCP call | 120 | p50 ~88 ms, p95 ~132 ms, max ~153 ms | p95 < 250 ms |
-| Five hosts, one-second command each | 5 concurrent | 1.027630313 s wall time; resolve/probe/command calls each exactly 5, with no root-observe calls | < 1.5 s |
-| Cancellation to whole process-group exit | one TERM-ignoring fixture | 51.621590 ms | < 250 ms |
+| Bridge-only MCP dispatch | 200 | p50 4.685 µs, p95 5.889 µs, max 40.704 µs | p95 < 2 ms |
+| Complete fake-SSH MCP call | 120 | p50 35.238 ms, p95 53.699 ms, max 76.542 ms | p95 < 250 ms |
+| Five hosts, one-second command each | 5 concurrent | 1.121394528 s wall time; resolve/probe/command calls each exactly 5, with no root-observe calls | < 1.5 s |
+| Cancellation to whole process-group exit | one TERM-ignoring fixture | 71.637629 ms | < 250 ms |
 | Bounded persistent-session output plus retained models | fresh child | 8 MiB request, bounded resident capture | < 32 MiB |
 | Maximum-budget wide JSON array | fresh child | RSS delta 8,528 KiB | < 48 MiB |
 | Maximum-budget wide JSON object | separate fresh child | RSS delta 17,216 KiB | < 48 MiB |
