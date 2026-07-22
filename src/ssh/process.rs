@@ -529,8 +529,7 @@ impl SshRunner {
             .await?;
         let prepared = self
             .initialize_host(host, &root, limits.connect_timeout_ms, cancel)
-            .await
-            .map(|(policy, capability)| (policy, capability));
+            .await;
         drop(initialize_guard);
         prepared
     }
