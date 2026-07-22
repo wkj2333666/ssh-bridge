@@ -29,10 +29,9 @@ const DISPATCH_MEASURED_CALLS: usize = 200;
 const SSH_WARM_CALLS: usize = 16;
 const SSH_MEASURED_CALLS: usize = 120;
 const DISPATCH_P95_CEILING: Duration = Duration::from_millis(2);
-// A persistent SSH transport removes handshake cost, but each request still
-// starts a bounded remote process and performs a root observation. The fake
-// transport's p95 therefore measures the complete request path, not a local
-// in-process dispatch.
+// A persistent SSH transport removes handshake and setup probes from warm
+// requests. The fake transport's p95 therefore measures the complete framed
+// request path, including the remote process and output capture.
 const SSH_P95_CEILING: Duration = Duration::from_millis(250);
 const FIVE_HOST_CEILING: Duration = Duration::from_millis(1_500);
 const CANCELLATION_CEILING: Duration = Duration::from_millis(250);
@@ -196,7 +195,7 @@ async fn task11_release_latency_concurrency_cancellation_and_wire_acceptance() {
     let complete_kinds = transport_call_kinds(&complete.log);
     assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "G").count(),
-        SSH_WARM_CALLS + SSH_MEASURED_CALLS
+        1
     );
     assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "P").count(),
@@ -204,7 +203,7 @@ async fn task11_release_latency_concurrency_cancellation_and_wire_acceptance() {
     );
     assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "R").count(),
-        SSH_WARM_CALLS + SSH_MEASURED_CALLS
+        0
     );
     assert_eq!(
         complete_kinds.iter().filter(|kind| **kind == "C").count(),
@@ -251,13 +250,14 @@ async fn five_hosts_finish_in_parallel() {
         elapsed < FIVE_HOST_CEILING,
         "five one-second hosts took {elapsed:?}"
     );
-    for kind in ["G", "P", "R", "C"] {
+    for kind in ["G", "P", "C"] {
         assert_eq!(
             kinds.iter().filter(|observed| **observed == kind).count(),
             5,
             "each host must perform exactly one {kind} call: {kinds:?}"
         );
     }
+    assert_eq!(kinds.iter().filter(|observed| **observed == "R").count(), 0);
 }
 
 async fn cancellation_kills_the_entire_process_group() {

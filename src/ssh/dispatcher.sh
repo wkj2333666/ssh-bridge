@@ -93,7 +93,6 @@ record_test_call() {
 }
 
 record_test_command() { record_test_call C "$1"; }
-record_test_observation() { record_test_call R "$1"; }
 
 record_test_phase() {
     if [ -n "${FAKE_SSH_PHASE_LOG-}" ]; then
@@ -189,10 +188,14 @@ run_request() {
     run_stderr_marker=$run_dir/stderr.truncated
     run_cwd=$(cat "$run_cwd_file"; printf .) || exit 74
     run_cwd=${run_cwd%.}
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ] &&
+       [ "${FAKE_SSH_MODE-}" != local-fixed ]; then
+        run_cwd=/
+    fi
     run_command=$(cat "$run_command_file"; printf .) || exit 74
     run_command=${run_command%.}
-    run_is_root=0
-    case "$run_command" in *CODEX_SSH_ROOT_OBSERVE*) run_is_root=1 ;; esac
+    run_original_command=$run_dir/original-command
+    printf '%s' "$run_command" >"$run_original_command"
     mkfifo "$run_stdout_fifo" "$run_stderr_fifo" || exit 74
     copy_capped "$run_stdout_fifo" "$run_stdout" "$run_stdout_marker" "$run_stdout_limit" &
     run_stdout_collector=$!
@@ -200,41 +203,23 @@ run_request() {
     run_stderr_collector=$!
     run_command_path=
     test_sleep_seconds=0
-    case "$run_command" in
-        *CODEX_SSH_ROOT_OBSERVE*) ;;
-        *)
-            if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
-                test_sleep_seconds=${FAKE_SSH_FIXED_SLEEP_SECONDS-${FAKE_SSH_SLEEP_SECONDS-}}
-            fi
-            ;;
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
+        test_sleep_seconds=${FAKE_SSH_FIXED_SLEEP_SECONDS-${FAKE_SSH_SLEEP_SECONDS-}}
+    fi
+    case "${FAKE_SSH_MODE-}" in
+        sleep|orphan-streams|orphan-stdin) test_sleep_seconds=0 ;;
     esac
     case "$test_sleep_seconds" in
         ''|*[!0-9]*) test_sleep_seconds=0 ;;
     esac
-    if [ "$test_sleep_seconds" -gt 0 ]; then
-        run_command="sleep $test_sleep_seconds; $run_command"
-    fi
-    if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ] &&
-       [ "${FAKE_SSH_MODE-}" != local-fixed ]; then
-        case "$run_command" in
-            *CODEX_SSH_ROOT_OBSERVE*)
-        run_command='printf "CODEX_SSH_ROOT_OBSERVE=1\\000ROOT=%s\\000DEVICE=%s\\000INODE=%s\\000" "${FAKE_SSH_ROOT:-/srv/project}" "${FAKE_SSH_ROOT_DEVICE:-1}" "${FAKE_SSH_ROOT_INODE:-1}"'
-                ;;
-        esac
-    fi
     if [ -n "${CODEX_SSH_LOCAL_FIXED_PATH_ONCE-}" ] &&
        [ -n "${CODEX_SSH_LOCAL_FIXED_PATH_MARKER-}" ]; then
-        case "$run_command" in
-            *CODEX_SSH_ROOT_OBSERVE*) ;;
-            *)
-                if [ ! -e "$CODEX_SSH_LOCAL_FIXED_PATH_MARKER" ]; then
-                    : >"$CODEX_SSH_LOCAL_FIXED_PATH_MARKER"
-                    run_command_path=$CODEX_SSH_LOCAL_FIXED_PATH_ONCE
-                fi
-                ;;
-        esac
+        if [ ! -e "$CODEX_SSH_LOCAL_FIXED_PATH_MARKER" ]; then
+            : >"$CODEX_SSH_LOCAL_FIXED_PATH_MARKER"
+            run_command_path=$CODEX_SSH_LOCAL_FIXED_PATH_ONCE
+        fi
     fi
-    if [ "$run_is_root" -eq 0 ] && [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
         if [ -n "${FAKE_SSH_FIXED_STDOUT_BYTES-}" ] ||
            [ -n "${FAKE_SSH_FIXED_STDERR_BYTES-}" ]; then
             test_stdout_bytes=${FAKE_SSH_FIXED_STDOUT_BYTES-0}
@@ -245,7 +230,7 @@ run_request() {
             run_command="dd if=/dev/zero bs=1 count=$test_stdout_bytes 2>/dev/null; dd if=/dev/zero bs=1 count=$test_stderr_bytes >&2 2>/dev/null; $run_command"
         fi
     fi
-    if [ "$run_is_root" -eq 0 ] && [ -n "${FAKE_SSH_MISMATCH_FILE-}" ] &&
+    if [ -n "${FAKE_SSH_MISMATCH_FILE-}" ] &&
        [ ! -e "$FAKE_SSH_MISMATCH_FILE" ]; then
         : >"$FAKE_SSH_MISMATCH_FILE"
         mismatch_stdout=$run_dir/mismatch.stdout
@@ -256,14 +241,75 @@ run_request() {
         run_command="cat \"$mismatch_stdout\"; cat \"$mismatch_stderr\" >&2; exit 0"
     fi
     if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
-        case "$run_command" in
-            *CODEX_SSH_ROOT_OBSERVE*) ;;
-            *)
                 case "${FAKE_SSH_MODE-}" in
+                    echo-command)
+                        run_command="cat '$run_original_command'"
+                        ;;
+                    stdin)
+                        run_command='cat'
+                        ;;
+                    sleep)
+                        test_sleep_seconds=${FAKE_SSH_SLEEP_SECONDS-1}
+                        case "$test_sleep_seconds" in
+                            ''|*[!0-9.]*|*.*.*) test_sleep_seconds=1 ;;
+                        esac
+                        if [ "${FAKE_SSH_IGNORE_TERM-0}" = 1 ]; then
+                            run_command="trap '' TERM; sleep $test_sleep_seconds"
+                        else
+                            run_command="sleep $test_sleep_seconds"
+                        fi
+                        ;;
+                    orphan-streams)
+                        run_command="(
+    trap '' TERM HUP
+    sleep \"\${FAKE_SSH_SLEEP_SECONDS-10}\"
+) &
+orphan_pid=\$!
+if [ -n \"\${FAKE_SSH_CHILD_PID_FILE-}\" ]; then printf \"%s\\\\n\" \"\$orphan_pid\" >\"\$FAKE_SSH_CHILD_PID_FILE\"; fi
+if [ -n \"\${FAKE_SSH_PARENT_EXIT_FILE-}\" ]; then printf \"%s\\\\n\" exited >\"\$FAKE_SSH_PARENT_EXIT_FILE\"; fi
+exit 0"
+                        ;;
+                    orphan-stdin)
+                        run_command="exec 3<&0
+(
+    trap '' TERM HUP
+    exec 0<&3 3<&-
+    exec >/dev/null 2>/dev/null
+    if [ -n \"\${FAKE_SSH_CHILD_READY_FILE-}\" ]; then printf \"%s\\\\n\" ready >\"\$FAKE_SSH_CHILD_READY_FILE\"; fi
+    sleep \"\${FAKE_SSH_SLEEP_SECONDS-10}\"
+) &
+orphan_pid=\$!
+exec 3<&-
+if [ -n \"\${FAKE_SSH_CHILD_PID_FILE-}\" ]; then printf \"%s\\\\n\" \"\$orphan_pid\" >\"\$FAKE_SSH_CHILD_PID_FILE\"; fi
+if [ -n \"\${FAKE_SSH_CHILD_READY_FILE-}\" ]; then while [ ! -f \"\$FAKE_SSH_CHILD_READY_FILE\" ]; do sleep 0.005; done; fi
+if [ -n \"\${FAKE_SSH_PARENT_EXIT_FILE-}\" ]; then printf \"%s\\\\n\" exited >\"\$FAKE_SSH_PARENT_EXIT_FILE\"; fi
+exit 0"
+                        ;;
                     error)
-                        test_status=${FAKE_SSH_EXIT_STATUS-7}
+                        case "${FAKE_SSH_ERROR-remote}" in
+                            diagnostic)
+                                test_status=${FAKE_SSH_ERROR_STATUS-255}
+                                test_diagnostic=${FAKE_SSH_DIAGNOSTIC-}
+                                ;;
+                            host-key)
+                                test_status=255
+                                test_diagnostic='Host key verification failed.'
+                                ;;
+                            auth)
+                                test_status=255
+                                test_diagnostic='fixture@fake.internal: Permission denied (publickey).'
+                                ;;
+                            connect-timeout)
+                                test_status=255
+                                test_diagnostic='ssh: connect to host fake.internal port 22: Connection timed out'
+                                ;;
+                            *)
+                                test_status=${FAKE_SSH_EXIT_STATUS-7}
+                                test_diagnostic=VERY_SECRET_REMOTE_DIAGNOSTIC
+                                ;;
+                        esac
                         case "$test_status" in ''|*[!0-9]*) test_status=7 ;; esac
-                        run_command="printf '%s\\n' 'VERY_SECRET_REMOTE_DIAGNOSTIC' >&2; exit $test_status"
+                        run_command="printf '%s\\n' '$test_diagnostic' >&2; exit $test_status"
                         ;;
                     bytes)
                         test_stdout_bytes=${FAKE_SSH_STDOUT_BYTES-${FAKE_SSH_FIXED_STDOUT_BYTES-0}}
@@ -272,7 +318,11 @@ run_request() {
                         case "$test_stdout_bytes:$test_stderr_bytes:$test_status" in
                             *[!0-9:]*|:*:*:) test_stdout_bytes=0; test_stderr_bytes=0; test_status=0 ;;
                         esac
-                        run_command="dd if=/dev/zero bs=1 count=$test_stdout_bytes 2>/dev/null; dd if=/dev/zero bs=1 count=$test_stderr_bytes >&2 2>/dev/null; exit $test_status"
+                        test_stdout_blocks=$((test_stdout_bytes / 65536))
+                        test_stdout_remainder=$((test_stdout_bytes % 65536))
+                        test_stderr_blocks=$((test_stderr_bytes / 65536))
+                        test_stderr_remainder=$((test_stderr_bytes % 65536))
+                        run_command="(dd if=/dev/zero bs=65536 count=$test_stdout_blocks 2>/dev/null; dd if=/dev/zero bs=1 count=$test_stdout_remainder 2>/dev/null) & test_stdout_pid=\$!; (dd if=/dev/zero bs=65536 count=$test_stderr_blocks >&2 2>/dev/null; dd if=/dev/zero bs=1 count=$test_stderr_remainder >&2 2>/dev/null) & test_stderr_pid=\$!; wait \$test_stdout_pid; wait \$test_stderr_pid; exit $test_status"
                         ;;
                     streams)
                         test_status=${FAKE_SSH_EXIT_STATUS-0}
@@ -288,9 +338,15 @@ run_request() {
                         esac
                         ;;
                 esac
-                ;;
-        esac
     fi
+    case "${FAKE_SSH_MODE-}" in
+        sleep|orphan-streams|orphan-stdin) ;;
+        *)
+            if [ "$test_sleep_seconds" -gt 0 ]; then
+                run_command="sleep $test_sleep_seconds; $run_command"
+            fi
+            ;;
+    esac
     setsid sh -c '
         run_cwd=$1
         run_shell=$2
@@ -327,12 +383,9 @@ run_request() {
     done
     if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ] &&
        [ -n "${FAKE_SSH_CHILD_PID_FILE-}" ]; then
-        case "$run_command" in
-            *CODEX_SSH_ROOT_OBSERVE*) ;;
-            *) printf '%s\n' "$run_pid" >"$FAKE_SSH_CHILD_PID_FILE" 2>/dev/null || true ;;
-        esac
+        printf '%s\n' "$run_pid" >"$FAKE_SSH_CHILD_PID_FILE" 2>/dev/null || true
     fi
-    if [ "$run_is_root" -eq 0 ] && [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_MODE-}" ]; then
         if [ -n "${FAKE_SSH_FIXED_READY_FILE-}" ]; then
             : >"$FAKE_SSH_FIXED_READY_FILE"
         fi
@@ -374,20 +427,7 @@ run_request() {
     wait "$run_stderr_collector" 2>/dev/null || true
     send_stream STDOUT "$run_id" "$run_stdout" "$run_dir"
     send_stream STDERR "$run_id" "$run_stderr" "$run_dir"
-    if [ "$run_is_root" -eq 1 ] &&
-       [ "${FAKE_SSH_MODE-}" = local-fixed ] &&
-       [ -n "${FAKE_SSH_ROOT_RETARGET_TRIGGER-}" ] &&
-       [ -e "$FAKE_SSH_ROOT_RETARGET_TRIGGER" ] &&
-       [ -n "${FAKE_SSH_ROOT_RETARGET_LINK-}" ] &&
-       [ -n "${FAKE_SSH_ROOT_RETARGET_TARGET-}" ] &&
-       [ -n "${FAKE_SSH_ROOT_RETARGET_MARKER-}" ] &&
-       [ ! -e "$FAKE_SSH_ROOT_RETARGET_MARKER" ]; then
-        retarget_tmp=$FAKE_SSH_ROOT_RETARGET_LINK.codex-retarget.$$
-        ln -s -- "$FAKE_SSH_ROOT_RETARGET_TARGET" "$retarget_tmp" 2>/dev/null || true
-        mv -T -- "$retarget_tmp" "$FAKE_SSH_ROOT_RETARGET_LINK" 2>/dev/null || true
-        : >"$FAKE_SSH_ROOT_RETARGET_MARKER"
-    fi
-    if [ "$run_is_root" -eq 0 ] && [ "${FAKE_SSH_MODE-}" = local-fixed ] &&
+    if [ "${FAKE_SSH_MODE-}" = local-fixed ] &&
        [ "$run_status" -eq 0 ] && [ -n "${FAKE_SSH_LOCAL_FIXED_POST-}" ]; then
         case "$FAKE_SSH_LOCAL_FIXED_POST" in
             stderr)
@@ -502,10 +542,7 @@ handle_open() {
     stdin_file=$open_dir/stdin
     expect_data "$open_id" "$open_cwd_length" "$cwd_file" || { rm -rf "$open_dir"; return 1; }
     expect_data "$open_id" "$open_command_length" "$command_file" || { rm -rf "$open_dir"; return 1; }
-    case "$(cat "$command_file")" in
-        *CODEX_SSH_ROOT_OBSERVE*) record_test_observation "$command_file" ;;
-        *) record_test_command "$command_file" ;;
-    esac
+    record_test_command "$command_file"
     record_test_phase "$command_file"
     expect_data "$open_id" "$open_stdin_length" "$stdin_file" || { rm -rf "$open_dir"; return 1; }
     run_request "$open_id" "$open_shell" "$cwd_file" "$command_file" "$stdin_file" \

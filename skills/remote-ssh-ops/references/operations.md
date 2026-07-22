@@ -30,7 +30,7 @@ ssh devbox
 
 Add future servers the same way. The bridge accepts concrete OpenSSH aliases and stores no credentials. The default bridge config is `~/.config/codex-ssh-bridge/config.toml`; set `CODEX_SSH_BRIDGE_CONFIG` only as trusted local execution-authority input.
 
-The first operation performs local SSH identity checks and a bounded capability probe. Root observations, user commands, and fixed read/write operations then reuse one persistent SSH session per alias; the remote dispatcher is streamed over that SSH connection and is never installed on disk. No remote bridge helper or Codex installation is used.
+The first operation performs local SSH identity checks and a bounded capability probe. User commands and fixed read/write operations then reuse one persistent SSH session per alias; warm requests send one framed request without another `ssh -G` or root observation. The remote dispatcher is streamed over that SSH connection and is never installed on disk. No remote bridge helper or Codex installation is used. The configured root is a lexical routing boundary; remote filesystem retargeting follows ordinary server semantics.
 
 ## MCP tool shapes
 

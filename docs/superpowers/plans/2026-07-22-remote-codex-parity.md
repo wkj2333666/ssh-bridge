@@ -260,7 +260,7 @@ deferred from the v0 public contract rather than silently ignored.
 
 **Interfaces:**
 
-  `SshRunner` keeps its current public `execute` and fixed-operation methods. Internally it owns `Mutex<HashMap<String, Arc<HostSession>>>` and exposes no raw session handle to MCP. `initialize_host` performs capability/root identity initialization over the already-open session, and all later root observations and business commands use the same session.
+  `SshRunner` keeps its current public `execute` and fixed-operation methods. Internally it owns `Mutex<HashMap<String, Arc<HostSession>>>` and exposes no raw session handle to MCP. `initialize_host` performs capability initialization once per alias; later business commands use the cached policy and the same session without root-observation frames.
 
 - [ ] **Step 1: Write failing integration tests.**
 
@@ -270,7 +270,7 @@ deferred from the v0 public contract rather than silently ignored.
 
 - [ ] **Step 3: Replace per-call `build_ssh_argv` execution.**
 
-  Keep the existing root guard script and capability payloads as request commands, but submit them as `SessionRequest`s. Do not move root identity trust into the remote dispatcher. Preserve `OutputStore` provenance and all existing fixed-operation capability requirements.
+  Keep capability probing as an explicit connection-time diagnostic, but submit business commands directly as `SessionRequest`s. The configured root remains a lexical routing boundary rather than a per-request physical-root trust guard. Preserve `OutputStore` provenance and all existing fixed-operation capability requirements.
 
 - [ ] **Step 4: Handle session invalidation.**
 

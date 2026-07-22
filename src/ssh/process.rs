@@ -71,6 +71,17 @@ pub struct RunResult {
     pub physical_root: String,
     pub output: CapturedOutput,
     pub remote_process_may_continue: bool,
+    pub timing: RunTiming,
+}
+
+/// Internal phase timing for validating warm SSH latency. The MCP response
+/// intentionally keeps the existing wire shape; callers that need timings
+/// can inspect the Rust runner result directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunTiming {
+    pub preparation_ms: u64,
+    pub session_ms: u64,
+    pub capture_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +280,7 @@ impl SshRunner {
             attach_selected_context(error, &request.host, &capability.physical_root, &shell)
         })?;
         let (remote_command, local_deadline) = prepared;
+        let preparation_ms = elapsed_ms(operation_started.elapsed());
         let session_result = match session
             .execute(
                 SessionRequest {
@@ -309,6 +321,11 @@ impl SshRunner {
                 false,
             );
             error.details.host = Some(request.host.clone());
+            error.details.bytes_seen = Some(
+                u64::try_from(session_result.stdout.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(session_result.stderr.len()).unwrap_or(u64::MAX)),
+            );
             error.details.remote_process_may_continue = Some(false);
             return Err(attach_selected_context(
                 error,
@@ -317,12 +334,14 @@ impl SshRunner {
                 &shell,
             ));
         }
+        let capture_started = Instant::now();
         let output = self
             .capture_session_output(&session_result, limits, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
+        let capture_ms = elapsed_ms(capture_started.elapsed());
         self.output_store
             .set_provenance(
                 &output,
@@ -340,6 +359,11 @@ impl SshRunner {
             physical_root: capability.physical_root.clone(),
             output,
             remote_process_may_continue: false,
+            timing: RunTiming {
+                preparation_ms,
+                session_ms: session_result.elapsed_ms,
+                capture_ms,
+            },
         })
     }
 

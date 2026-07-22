@@ -33,7 +33,7 @@ Latency tests warm the relevant path, collect at least 120 samples, sort raw dur
 |---|---:|---:|---:|
 | Bridge-only MCP dispatch | 200 | p50 5.185 µs, p95 7.037 µs, max 93.573 µs | p95 < 2 ms |
 | Complete fake-SSH MCP call | 120 | p50 ~88 ms, p95 ~132 ms, max ~153 ms | p95 < 250 ms |
-| Five hosts, one-second command each | 5 concurrent | 1.027630313 s wall time; resolve/probe/root-observe/command calls each exactly 5 | < 1.5 s |
+| Five hosts, one-second command each | 5 concurrent | 1.027630313 s wall time; resolve/probe/command calls each exactly 5, with no root-observe calls | < 1.5 s |
 | Cancellation to whole process-group exit | one TERM-ignoring fixture | 51.621590 ms | < 250 ms |
 | Bounded persistent-session output plus retained models | fresh child | 8 MiB request, bounded resident capture | < 32 MiB |
 | Maximum-budget wide JSON array | fresh child | RSS delta 8,528 KiB | < 48 MiB |
@@ -41,7 +41,7 @@ Latency tests warm the relevant path, collect at least 120 samples, sort raw dur
 | Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
 | Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 
-The complete fake-SSH p95 includes bridge-owned capability/identity work, a framed root observation, and the bounded remote command process. Operational commands reuse one persistent dispatcher session per alias, so warm command latency no longer pays a new SSH handshake for every request. Capability probing and identity resolution remain explicit bridge-owned diagnostics; root observations are framed requests on the same session. The five-host test demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond configured limits.
+The complete fake-SSH p95 includes the bounded remote command process and output capture. The first request for an alias pays local identity resolution, capability probing, and SSH session startup; warm commands reuse one persistent dispatcher session and send one request frame, so they do not pay another SSH handshake, `ssh -G`, or root observation. Capability root metadata is connection-time diagnostic context, not a warm authorization round trip. The five-host test demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond configured limits.
 
 ## Why memory stays bounded
 
@@ -68,7 +68,7 @@ localhost fixture records real-SSH behavior separately from fake-transport timin
 
 ## Isolated real OpenSSH
 
-`tests/real_ssh.rs` generated temporary Ed25519 host, client, and wrong-host keys; launched an unprivileged OpenSSH 10.0p2 `sshd` on a localhost high port; and completed in 2.80 seconds with one pass, zero failures, and no skip. It verified strict known-host rejection, public-key login, ControlMaster inode reuse, physical-root observations, trusted account-login-shell resolution, explicit Bash, explicit sh, strict shell selection, hostile quoting, list/stat/read/fixed-string search, guarded write/patch, timeout, cancellation uncertainty, and identity-checked cleanup of the master sockets, remote test processes, and daemon.
+`tests/real_ssh.rs` generated temporary Ed25519 host, client, and wrong-host keys; launched an unprivileged OpenSSH 10.0p2 `sshd` on a localhost high port; and completed in 2.80 seconds with one pass, zero failures, and no skip. It verified strict known-host rejection, public-key login, ControlMaster inode reuse, connection-time root diagnostics, trusted account-login-shell resolution, explicit Bash, explicit sh, strict shell selection, hostile quoting, list/stat/read/fixed-string search, guarded write/patch, timeout, cancellation uncertainty, and cleanup of the master sockets, remote test processes, and daemon.
 
 The managed sandbox denies local `bind(2)`, so the final fixture was run with approved local-network execution. Developer runs without `CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1` retain one visible skip reason when facilities are unavailable. Release acceptance uses the required-mode command above: setup failure is fatal, so a required run cannot report a skip as a pass. The recorded real-SSH run completed without a skip.
 

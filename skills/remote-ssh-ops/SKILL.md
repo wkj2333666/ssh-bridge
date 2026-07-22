@@ -11,7 +11,7 @@ Keep Codex, credentials, approvals, and the bridge on the local machine. Every p
 
 Use only configured aliases returned by `remote_hosts`. Never construct raw SSH commands or invent a hostname. The bridge owns host resolution, transport quoting, capability probes, limits, and shell selection.
 
-The bridge keeps one local-owned persistent SSH session per configured alias and multiplexes independent requests over it. This reduces repeated SSH handshakes without installing Codex or a helper on the server. The session is an implementation detail: each request still has its own process group, cwd, stdin, stdout, stderr, timeout, and cancellation state.
+The bridge keeps one local-owned persistent SSH session per configured alias and multiplexes independent requests over it. The first request resolves local SSH policy and probes capabilities; warm requests send one framed command with no per-request `ssh -G`, root observation, or physical-root guard. No Codex or helper is installed on the server. Each request still has its own process group, cwd, stdin, stdout, stderr, timeout, and cancellation state.
 
 ## Default workflow
 
@@ -40,7 +40,7 @@ Prefer POSIX command syntax. Omit `shell` (or set `shell:"bash"`) for Bash; set 
 
 Commands that use Bash-only syntax must request Bash explicitly (or rely on the omitted Bash default); the bridge never labels a POSIX `sh` execution as an implicit Bash fallback.
 
-Requests on one host are concurrent up to configured capacity; mutations are not implicitly serialized. Do not rely on ordering between concurrent calls. A timeout or cancellation targets only its request first; if the dispatcher cannot confirm termination, the session is closed and the result marks the remote outcome as unknown.
+Requests on one host are concurrent up to configured capacity; mutations are not implicitly serialized. Do not rely on ordering between concurrent calls. A timeout or cancellation targets only its request first; if the dispatcher cannot confirm termination, the session is closed and the result marks the remote outcome as unknown. The configured root is a lexical routing boundary, not an inode pin: remote symlink retargeting follows ordinary server filesystem semantics.
 
 The account/forced login shell must be able to start the POSIX dispatcher. A failed dispatcher handshake is a hard error; never ask the bridge to silently fall back to a one-shot SSH command.
 

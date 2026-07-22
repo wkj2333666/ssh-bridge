@@ -137,34 +137,6 @@ if [ -n "${FAKE_SSH_PHASE_LOG:-}" ]; then
 fi
 
 case "$remote_command" in
-	*CODEX_SSH_ROOT_OBSERVE*)
-		log_call R "$@"
-		if [ -n "${FAKE_SSH_ROOT_OBSERVE_SLEEP_SECONDS:-}" ]; then
-			run_fake_sleep "$FAKE_SSH_ROOT_OBSERVE_SLEEP_SECONDS"
-		fi
-		if [ "${FAKE_SSH_MODE:-echo-argv}" = local-fixed ]; then
-			"${FAKE_SSH_ACCOUNT_SHELL:-/bin/sh}" -c "$remote_command"
-			root_status=$?
-			if [ -n "${FAKE_SSH_ROOT_RETARGET_TRIGGER:-}" ] &&
-			   [ -e "$FAKE_SSH_ROOT_RETARGET_TRIGGER" ] &&
-			   [ -n "${FAKE_SSH_ROOT_RETARGET_LINK:-}" ] &&
-			   [ -n "${FAKE_SSH_ROOT_RETARGET_TARGET:-}" ] &&
-			   [ -n "${FAKE_SSH_ROOT_RETARGET_MARKER:-}" ] &&
-			   [ ! -e "$FAKE_SSH_ROOT_RETARGET_MARKER" ]; then
-				retarget_tmp=$FAKE_SSH_ROOT_RETARGET_LINK.codex-retarget.$$
-				ln -s -- "$FAKE_SSH_ROOT_RETARGET_TARGET" "$retarget_tmp"
-				mv -T -- "$retarget_tmp" "$FAKE_SSH_ROOT_RETARGET_LINK"
-				: >"$FAKE_SSH_ROOT_RETARGET_MARKER"
-			fi
-			exit "$root_status"
-		fi
-		fake_root=${FAKE_SSH_ROOT:-/srv/project}
-		printf 'CODEX_SSH_ROOT_OBSERVE=1\0'
-		printf 'ROOT=%s\0' "$fake_root"
-		printf 'DEVICE=%s\0' "${FAKE_SSH_ROOT_DEVICE:-1}"
-		printf 'INODE=%s\0' "${FAKE_SSH_ROOT_INODE:-1}"
-		exit 0
-		;;
 	*CODEX_SSH_PROBE*)
 		log_call P "$@"
 		if [ "${FAKE_SSH_MODE:-echo-argv}" = local-fixed ]; then

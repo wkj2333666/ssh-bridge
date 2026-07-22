@@ -133,6 +133,7 @@ fn convert_result(host: String, result: crate::ssh::RunResult) -> RemoteRunResul
         physical_root,
         output,
         remote_process_may_continue,
+        timing: _,
     } = result;
     let CapturedOutput {
         stdout,
