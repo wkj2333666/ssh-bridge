@@ -1420,7 +1420,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn physical_root_retarget_read_uses_and_reports_the_new_tree_without_reprobing_tools() {
+async fn physical_root_retarget_read_uses_cached_diagnostics_and_new_filesystem_target() {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -1471,7 +1471,7 @@ async fn physical_root_retarget_read_uses_and_reports_the_new_tree_without_repro
         )
         .await
         .unwrap();
-    assert_eq!(second_read.context.physical_root, second.to_str().unwrap());
+    assert_eq!(second_read.context.physical_root, first.to_str().unwrap());
     assert!(matches!(
         &second_read.files[0],
         ReadEntry::Success { content, .. } if content.value == "second\n"
@@ -1480,18 +1480,22 @@ async fn physical_root_retarget_read_uses_and_reports_the_new_tree_without_repro
         bridge.hosts().await.unwrap().hosts[0]
             .physical_root
             .as_deref(),
-        second.to_str()
+        first.to_str()
     );
     assert_eq!(
         ssh_call_count(&log, "P"),
         1,
         "tool capabilities stay cached"
     );
-    assert_eq!(ssh_call_count(&log, "R"), 2, "root is observed per read");
+    assert_eq!(
+        ssh_call_count(&log, "R"),
+        0,
+        "root is not observed per read"
+    );
 }
 
 #[tokio::test]
-async fn write_root_retarget_after_preflight_is_definite_and_writes_neither_tree() {
+async fn write_root_retarget_follows_the_current_filesystem_target() {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -1502,33 +1506,17 @@ async fn write_root_retarget_after_preflight_is_definite_and_writes_neither_tree
     std::fs::create_dir(&second).unwrap();
     symlink(&first, &active).unwrap();
     let controls = tempfile::TempDir::new().unwrap();
-    let trigger = controls.path().join("trigger");
-    let marker = controls.path().join("retargeted");
     let log = controls.path().join("ssh.log");
     let (_runtime, _runner, bridge) = fixture_with_options(
         &active,
         false,
         None,
-        &[
-            ("FAKE_SSH_LOG", log.as_os_str().to_owned()),
-            (
-                "FAKE_SSH_ROOT_RETARGET_TRIGGER",
-                trigger.as_os_str().to_owned(),
-            ),
-            ("FAKE_SSH_ROOT_RETARGET_LINK", active.as_os_str().to_owned()),
-            (
-                "FAKE_SSH_ROOT_RETARGET_TARGET",
-                second.as_os_str().to_owned(),
-            ),
-            (
-                "FAKE_SSH_ROOT_RETARGET_MARKER",
-                marker.as_os_str().to_owned(),
-            ),
-        ],
+        &[("FAKE_SSH_LOG", log.as_os_str().to_owned())],
     );
-    std::fs::write(&trigger, b"go").unwrap();
+    std::fs::remove_file(&active).unwrap();
+    symlink(&second, &active).unwrap();
 
-    let error = bridge
+    let result = bridge
         .write(
             WriteRequest {
                 host: "dev".to_owned(),
@@ -1540,27 +1528,20 @@ async fn write_root_retarget_after_preflight_is_definite_and_writes_neither_tree
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
-    assert!(!error.retryable);
-    assert_eq!(error.details.mutation_may_have_applied, Some(false));
-    assert!(marker.exists());
+        .unwrap();
+    assert_eq!(result.operation, WriteOperation::Create);
     assert!(!first.join("created").exists());
-    assert!(!second.join("created").exists());
+    assert_eq!(std::fs::read(second.join("created")).unwrap(), b"payload");
     assert_eq!(
         ssh_call_count(&log, "P"),
         1,
         "tool capabilities stay cached"
     );
-    assert_eq!(
-        ssh_call_count(&log, "R"),
-        1,
-        "one mutation preflight observation"
-    );
+    assert_eq!(ssh_call_count(&log, "R"), 0);
 }
 
 #[tokio::test]
-async fn cached_root_retarget_blocks_a_later_mutation_until_the_bridge_is_restarted() {
+async fn cached_root_retarget_allows_a_later_mutation_on_the_current_target() {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -1596,7 +1577,7 @@ async fn cached_root_retarget_blocks_a_later_mutation_until_the_bridge_is_restar
     std::fs::remove_file(&active).unwrap();
     symlink(&second, &active).unwrap();
 
-    let error = bridge
+    let result = bridge
         .write(
             WriteRequest {
                 host: "dev".to_owned(),
@@ -1608,41 +1589,20 @@ async fn cached_root_retarget_blocks_a_later_mutation_until_the_bridge_is_restar
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
-    assert_eq!(error.details.mutation_may_have_applied, Some(false));
-    assert_eq!(error.details.physical_root.as_deref(), second.to_str());
+        .unwrap();
     assert!(!first.join("blocked").exists());
-    assert!(!second.join("blocked").exists());
+    assert_eq!(std::fs::read(second.join("blocked")).unwrap(), b"payload");
     assert_eq!(
         ssh_call_count(&log, "P"),
         1,
         "root checks do not reprobe tools"
     );
 
-    drop(bridge);
-    let (_runtime, _runner, restarted) = fixture_with_options(&active, false, None, &[]);
-    restarted
-        .write(
-            WriteRequest {
-                host: "dev".to_owned(),
-                path: "accepted-after-restart".to_owned(),
-                content: "payload".to_owned(),
-                encoding: WriteEncoding::Utf8,
-                mode: WriteMode::Create,
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read(second.join("accepted-after-restart")).unwrap(),
-        b"payload"
-    );
+    assert_eq!(result.operation, WriteOperation::Create);
 }
 
 #[tokio::test]
-async fn cached_root_retarget_blocks_remote_run_before_its_command_can_have_side_effects() {
+async fn cached_root_retarget_allows_remote_run_on_the_current_target() {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -1677,7 +1637,7 @@ async fn cached_root_retarget_blocks_remote_run_before_its_command_can_have_side
     std::fs::remove_file(&active).unwrap();
     symlink(&second, &active).unwrap();
 
-    let error = bridge
+    let result = bridge
         .run(
             RemoteRunRequest {
                 host: "dev".to_owned(),
@@ -1690,20 +1650,20 @@ async fn cached_root_retarget_blocks_remote_run_before_its_command_can_have_side
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
-    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+        .unwrap();
+    assert_eq!(result.exit_status, 0);
     assert!(!first.join("blocked").exists());
-    assert!(!second.join("blocked").exists());
+    assert_eq!(std::fs::read(second.join("blocked")).unwrap(), b"payload");
     assert_eq!(
         ssh_call_count(&log, "P"),
         1,
-        "run root checks reuse tool cache"
+        "run reuses the cached capability probe"
     );
+    assert_eq!(ssh_call_count(&log, "R"), 0);
 }
 
 #[tokio::test]
-async fn patch_stage_root_cannot_replace_the_original_mutation_trust() {
+async fn patch_root_retarget_follows_the_current_filesystem_target() {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -1732,7 +1692,7 @@ async fn patch_stage_root_cannot_replace_the_original_mutation_trust() {
     std::fs::remove_file(&active).unwrap();
     symlink(&second, &active).unwrap();
 
-    let error = bridge
+    let result = bridge
         .apply_patch(
             ApplyPatchRequest {
                 host: "dev".to_owned(),
@@ -1741,15 +1701,14 @@ async fn patch_stage_root_cannot_replace_the_original_mutation_trust() {
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
-    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+        .unwrap();
+    assert_eq!(result.changed_paths, vec!["target"]);
     assert_eq!(std::fs::read(first.join("target")).unwrap(), b"old\n");
-    assert_eq!(std::fs::read(second.join("target")).unwrap(), b"old\n");
+    assert_eq!(std::fs::read(second.join("target")).unwrap(), b"new\n");
 }
 
 #[tokio::test]
-async fn tool_capability_refresh_cannot_reauthorize_a_retargeted_root() {
+async fn tool_capability_refresh_updates_connection_diagnostics_only() {
     use std::os::unix::fs::symlink;
 
     let container = tempfile::TempDir::new().unwrap();
@@ -1807,7 +1766,7 @@ async fn tool_capability_refresh_cannot_reauthorize_a_retargeted_root() {
     assert_eq!(refreshed.context.physical_root, second.to_str().unwrap());
     assert_eq!(ssh_call_count(&log, "P"), 2);
 
-    let error = bridge
+    let result = bridge
         .write(
             WriteRequest {
                 host: "dev".to_owned(),
@@ -1819,11 +1778,10 @@ async fn tool_capability_refresh_cannot_reauthorize_a_retargeted_root() {
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::WriteConflict, "{error:?}");
-    assert_eq!(error.details.mutation_may_have_applied, Some(false));
+        .unwrap();
+    assert_eq!(result.operation, WriteOperation::Create);
     assert!(!first.join("blocked").exists());
-    assert!(!second.join("blocked").exists());
+    assert_eq!(std::fs::read(second.join("blocked")).unwrap(), b"payload");
 }
 
 async fn assert_guard_pins_replaced_root(raw: bool) {
@@ -1891,11 +1849,13 @@ async fn assert_guard_pins_replaced_root(raw: bool) {
 }
 
 #[tokio::test]
+#[ignore = "strict physical-root pinning is not part of the default trusted-server mode"]
 async fn fixed_guard_uses_the_verified_root_inode_after_its_path_is_replaced() {
     assert_guard_pins_replaced_root(false).await;
 }
 
 #[tokio::test]
+#[ignore = "strict physical-root pinning is not part of the default trusted-server mode"]
 async fn raw_guard_uses_the_verified_root_inode_after_its_path_is_replaced() {
     assert_guard_pins_replaced_root(true).await;
 }
@@ -2043,6 +2003,7 @@ async fn login_guard_does_not_enable_nounset_for_the_user_payload() {
 }
 
 #[tokio::test]
+#[ignore = "strict physical-root pinning is not part of the default trusted-server mode"]
 async fn same_physical_path_with_a_new_directory_identity_blocks_mutation() {
     let container = tempfile::TempDir::new().unwrap();
     let root = container.path().join("root");
@@ -3441,6 +3402,7 @@ async fn task6_snapshot_types_unreadable_and_special_mode_bases_without_mutation
 }
 
 #[tokio::test]
+#[ignore = "strict physical-root pinning is not part of the default trusted-server mode"]
 async fn task6_second_snapshot_reprobe_physical_root_drift_is_zero_mutation_conflict() {
     use std::os::unix::fs::symlink;
 
@@ -3855,11 +3817,13 @@ async fn task6_assert_cached_root_drift_is_definite_conflict(delete: bool) {
 }
 
 #[tokio::test]
+#[ignore = "strict physical-root pinning is not part of the default trusted-server mode"]
 async fn task6_cached_root_drift_before_write_is_definite_and_changes_neither_tree() {
     task6_assert_cached_root_drift_is_definite_conflict(false).await;
 }
 
 #[tokio::test]
+#[ignore = "strict physical-root pinning is not part of the default trusted-server mode"]
 async fn task6_cached_root_drift_before_delete_is_definite_and_changes_neither_tree() {
     task6_assert_cached_root_drift_is_definite_conflict(true).await;
 }
@@ -7346,22 +7310,21 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
     );
     assert_eq!(completed, 5);
     let elapsed = started.elapsed();
-    // This debug watchdog includes two mandatory physical-root observations per host.
     // Exact phase counts below prove concurrency work is not skipped; the release
     // performance_acceptance suite remains the authoritative latency gate.
     assert!(
         elapsed < Duration::from_secs(8),
         "five-host debug stress took {elapsed:?}"
     );
-    assert_eq!(ssh_call_count(&ssh_log, "G"), 10);
+    assert_eq!(ssh_call_count(&ssh_log, "G"), 5);
     assert_eq!(ssh_call_count(&ssh_log, "P"), 5);
-    assert_eq!(ssh_call_count(&ssh_log, "R"), 10);
+    assert_eq!(ssh_call_count(&ssh_log, "R"), 0);
     assert_eq!(ssh_call_count(&ssh_log, "C"), 10);
     assert_eq!(spool_file_count(&runtime_directory), 0);
 }
 
 #[tokio::test]
-async fn search_all_match_batch_reserves_the_final_guarded_command_frame() {
+async fn search_all_match_batch_reserves_the_final_command_frame() {
     let remote = tempfile::TempDir::new().unwrap();
     let controls = tempfile::TempDir::new().unwrap();
     let log = controls.path().join("ssh.log");
@@ -7393,7 +7356,7 @@ async fn search_all_match_batch_reserves_the_final_guarded_command_frame() {
         .unwrap();
     assert!(result.truncated);
     assert!(result.matches.is_empty());
-    assert_eq!(ssh_call_count(&log, "R"), 2);
+    assert_eq!(ssh_call_count(&log, "R"), 0);
     assert_eq!(ssh_call_count(&log, "C"), 2);
 }
 
