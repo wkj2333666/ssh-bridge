@@ -2612,6 +2612,25 @@ mod tests {
     }
 
     #[test]
+    fn direct_rendering_has_no_physical_root_protocol() {
+        let fixed = render_fixed_command("printf ok", &[]).unwrap();
+        assert!(!fixed.contains("CODEX_SSH_ROOT_OBSERVE"));
+        assert!(!fixed.contains("237"));
+
+        let run = render_remote_command(
+            "printf ok",
+            ".",
+            &ShellKind::PosixSh,
+            false,
+            1000,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(!run.contains("CODEX_SSH_ROOT_OBSERVE"));
+        assert!(!run.contains("237"));
+    }
+
+    #[test]
     fn task5_mutation_unknown_is_closed_non_retryable_and_preserves_safe_context() {
         let mut source = BridgeError::new(ErrorCode::RemoteExit, "untrusted detail", true);
         source.details.host = Some("dev".to_owned());

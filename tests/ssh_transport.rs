@@ -1514,6 +1514,43 @@ fn request(host: &str, shell: ShellRequest, timeout: Duration) -> RunRequest {
 }
 
 #[tokio::test]
+async fn warm_requests_use_one_persistent_command_without_identity_or_root_roundtrips() {
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Sh, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .runner
+        .execute(
+            request("dev", ShellRequest::Sh, Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 0);
+    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
+}
+
+#[tokio::test]
 async fn task78_run_cwd_is_encoded_as_data_and_never_executed() {
     let filesystem = TempDir::new().unwrap();
     let sentinel = filesystem.path().join("cwd-injection");
