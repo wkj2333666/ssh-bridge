@@ -4,6 +4,7 @@
 )]
 
 mod argv;
+mod frame;
 mod process;
 
 use std::ffi::{CString, OsStr, OsString};
