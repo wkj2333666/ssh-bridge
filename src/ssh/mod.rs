@@ -4,6 +4,7 @@
 )]
 
 mod argv;
+mod dispatcher;
 mod frame;
 mod process;
 
