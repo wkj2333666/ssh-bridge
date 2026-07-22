@@ -9,8 +9,7 @@ use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
 use crate::path::RemotePath;
 use crate::ssh::{
-    FixedOperationKind, FixedRunRequest, FixedRunResult, RootIdentity, RootedPathInputs,
-    render_fixed_command,
+    FixedOperationKind, FixedRunRequest, FixedRunResult, RootedPathInputs, render_fixed_command,
 };
 
 use super::protocol::{context, encode_bytes, read_small_stream};
@@ -987,13 +986,12 @@ pub(super) async fn execute_preflighted_write(
     resolved: ResolvedWrite,
     cancel: CancellationToken,
 ) -> BridgeResult<WriteResult> {
-    execute_preflighted_write_at_root(bridge, resolved, None, cancel).await
+    execute_preflighted_write_at_root(bridge, resolved, cancel).await
 }
 
 pub(super) async fn execute_preflighted_write_at_root(
     bridge: &RemoteBridge,
     mut resolved: ResolvedWrite,
-    expected_root: Option<RootIdentity>,
     cancel: CancellationToken,
 ) -> BridgeResult<WriteResult> {
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
@@ -1010,7 +1008,6 @@ pub(super) async fn execute_preflighted_write_at_root(
             argument_indices: &[0],
             stdin_nul_paths: false,
         },
-        expected_root,
         required_capabilities: &["safe_write"],
         stdout_limit: WRITE_PROTOCOL_LIMIT,
         stderr_limit: 1,
@@ -1079,13 +1076,12 @@ pub(super) async fn execute_preflighted_delete(
     resolved: ResolvedDelete,
     cancel: CancellationToken,
 ) -> BridgeResult<(GuardedDeleteResult, super::RemoteContext)> {
-    execute_preflighted_delete_at_root(bridge, resolved, None, cancel).await
+    execute_preflighted_delete_at_root(bridge, resolved, cancel).await
 }
 
 pub(super) async fn execute_preflighted_delete_at_root(
     bridge: &RemoteBridge,
     resolved: ResolvedDelete,
-    expected_root: Option<RootIdentity>,
     cancel: CancellationToken,
 ) -> BridgeResult<(GuardedDeleteResult, super::RemoteContext)> {
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
@@ -1100,7 +1096,6 @@ pub(super) async fn execute_preflighted_delete_at_root(
             argument_indices: &[0],
             stdin_nul_paths: false,
         },
-        expected_root,
         required_capabilities: &["guarded_delete"],
         stdout_limit: WRITE_PROTOCOL_LIMIT,
         stderr_limit: 1,

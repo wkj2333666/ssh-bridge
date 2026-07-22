@@ -264,7 +264,6 @@ pub(super) async fn search(
                     argument_indices: &[0],
                     stdin_nul_paths: false,
                 },
-                expected_root: None,
                 required_capabilities: &["find_nul", "search_bound"],
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
                 stderr_limit: 1024,
@@ -382,12 +381,7 @@ pub(super) async fn search(
         )
     };
     let command_reserve = runner
-        .guarded_fixed_command_length(
-            &request.host,
-            &candidates_result.root_identity,
-            script,
-            &args,
-        )
+        .fixed_command_length(&request.host, script, &args)
         .map_err(&attach_candidates)?;
     if command_reserve >= limits.max_frame_bytes {
         return Err(attach_candidates(BridgeError::new(
@@ -435,7 +429,6 @@ pub(super) async fn search(
                     argument_indices: &[],
                     stdin_nul_paths: false,
                 },
-                expected_root: Some(candidates_result.root_identity.clone()),
                 required_capabilities: required,
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,
                 stderr_limit: 1024,
