@@ -118,6 +118,13 @@ for argument do
     remote_command=$argument
 done
 
+case "$remote_command" in
+    *codex-ssh-dispatcher-1*)
+        log_call S "$@"
+        exec "${FAKE_SSH_ACCOUNT_SHELL:-/bin/sh}" -c "$remote_command"
+        ;;
+esac
+
 if [ -n "${FAKE_SSH_PHASE_LOG:-}" ]; then
     case "$remote_command" in
         *codex_patch_snapshot_sentinel*) printf 'S\n' >>"$FAKE_SSH_PHASE_LOG" ;;

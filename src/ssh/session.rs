@@ -54,6 +54,7 @@ pub(crate) struct HostSession {
 struct SessionInner {
     host: String,
     max_payload: usize,
+    max_output_bytes: u64,
     tx: mpsc::Sender<Outbound>,
     pending: Mutex<HashMap<u64, PendingRequest>>,
     next_id: AtomicU64,
@@ -68,6 +69,7 @@ struct PendingRequest {
     started: Instant,
     stdout_limit: usize,
     stderr_limit: usize,
+    aggregate_limit: usize,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     stdout_truncated: bool,
@@ -197,6 +199,7 @@ impl HostSession {
         let inner = Arc::new(SessionInner {
             host,
             max_payload: limits.max_frame_bytes,
+            max_output_bytes: limits.max_output_bytes,
             tx,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -233,6 +236,13 @@ impl HostSession {
                 .map_err(|_| BridgeError::invalid_argument("stdout limit is too large"))?,
             stderr_limit: usize::try_from(request.stderr_limit)
                 .map_err(|_| BridgeError::invalid_argument("stderr limit is too large"))?,
+            aggregate_limit: usize::try_from(
+                request
+                    .stdout_limit
+                    .saturating_add(request.stderr_limit)
+                    .min(self.inner.max_output_bytes),
+            )
+            .map_err(|_| BridgeError::invalid_argument("output limit is too large"))?,
             stdout: Vec::new(),
             stderr: Vec::new(),
             stdout_truncated: false,
@@ -291,6 +301,10 @@ impl HostSession {
     pub(crate) async fn close(&self) -> BridgeResult<()> {
         self.inner.shutdown().await;
         Ok(())
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
     }
 }
 
@@ -450,6 +464,7 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
             let request = pending.get_mut(&frame.request_id).ok_or_else(|| {
                 protocol_error(&inner.host, "dispatcher returned an unknown request ID")
             })?;
+            let aggregate_used = request.stdout.len().saturating_add(request.stderr.len());
             let (output, limit, truncated) = if frame.kind == FrameKind::Stdout {
                 (
                     &mut request.stdout,
@@ -463,7 +478,9 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                     &mut request.stderr_truncated,
                 )
             };
-            let remaining = limit.saturating_sub(output.len());
+            let remaining = limit
+                .saturating_sub(output.len())
+                .min(request.aggregate_limit.saturating_sub(aggregate_used));
             if frame.payload.len() > remaining {
                 output.extend_from_slice(&frame.payload[..remaining]);
                 *truncated = true;

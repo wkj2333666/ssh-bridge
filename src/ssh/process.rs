@@ -12,14 +12,17 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, duplex};
 use tokio::process::Command;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{RuntimePaths, SshPolicy, build_ssh_argv, build_ssh_g_argv};
+use super::{
+    HostSession, RuntimePaths, SessionRequest, SessionResult, SshPolicy, build_ssh_argv,
+    build_ssh_g_argv,
+};
 use crate::capability::{
     CAPABILITY_PROBE_SCRIPT, Capability, CapabilityCache, ShellKind, ShellRequest, ShellSelection,
     parse_probe_output, select_shell,
@@ -166,6 +169,7 @@ pub struct SshRunner {
     initializers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     global_limit: Arc<Semaphore>,
     host_limits: StdMutex<HashMap<String, Arc<Semaphore>>>,
+    sessions: Mutex<HashMap<String, Arc<HostSession>>>,
 }
 
 impl SshRunner {
@@ -218,6 +222,7 @@ impl SshRunner {
             initializers: Mutex::new(HashMap::new()),
             global_limit: Arc::new(Semaphore::new(global_concurrency)),
             host_limits: StdMutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -335,33 +340,66 @@ impl SshRunner {
             attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
         })?;
         let (remote_command, local_deadline) = prepared;
-        let argv = build_ssh_argv(&policy, &request.host, &remote_command);
-        let outcome = self
-            .run_child(
-                ChildSpec {
-                    argv,
-                    stdin: request.stdin,
-                    capture_limits: CaptureLimits {
-                        preview_bytes: limits.preview_bytes,
-                        max_output_bytes: limits.max_output_bytes,
-                    },
-                    deadline: local_deadline,
-                    phase: Phase::Command {
-                        remote_timeout_wrapped: remote_timeout,
-                    },
-                    internal_registration: None,
-                },
-                &cancel,
-                &request.host,
-            )
+        let session = self
+            .session_for_host(&policy, &request.host, limits, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
             })?;
-
-        let output = outcome.output.into_public().map_err(|error| {
-            attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
-        })?;
+        let session_result = match session
+            .execute(
+                SessionRequest {
+                    command: remote_command,
+                    cwd: "/".to_owned(),
+                    shell: ShellSelection {
+                        shell: ShellKind::PosixSh,
+                        fallback: false,
+                    },
+                    login_shell: None,
+                    env: BTreeMap::new(),
+                    stdin: request.stdin,
+                    timeout: local_deadline,
+                    stdout_limit: limits.max_output_bytes,
+                    stderr_limit: limits.max_output_bytes,
+                },
+                cancel.clone(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if session.is_closed() {
+                    self.drop_session(&request.host, &session).await;
+                }
+                return Err(attach_selected_context(
+                    error,
+                    &request.host,
+                    &observed_root.physical_root,
+                    &shell,
+                ));
+            }
+        };
+        if session_result.stdout_truncated || session_result.stderr_truncated {
+            let mut error = BridgeError::new(
+                ErrorCode::OutputLimit,
+                "command output exceeded the configured limit",
+                false,
+            );
+            error.details.host = Some(request.host.clone());
+            error.details.remote_process_may_continue = Some(false);
+            return Err(attach_selected_context(
+                error,
+                &request.host,
+                &observed_root.physical_root,
+                &shell,
+            ));
+        }
+        let output = self
+            .capture_session_output(&session_result, limits, &cancel)
+            .await
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
+            })?;
         self.observed_roots
             .lock()
             .await
@@ -377,7 +415,7 @@ impl SshRunner {
             )
             .await;
         Ok(RunResult {
-            status: outcome.status,
+            status: session_result.status,
             elapsed_ms: elapsed_ms(operation_started.elapsed()),
             shell,
             physical_root: observed_root.physical_root,
@@ -388,6 +426,119 @@ impl SshRunner {
 
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    async fn session_for_host(
+        &self,
+        policy: &SshPolicy,
+        host: &str,
+        limits: EffectiveLimits,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<Arc<HostSession>> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(host) {
+            if !session.is_closed() {
+                return Ok(Arc::clone(session));
+            }
+            sessions.remove(host);
+        }
+        let session = Arc::new(
+            HostSession::connect_with(
+                policy.clone(),
+                host.to_owned(),
+                limits,
+                self.executable.clone().into_os_string(),
+                self.environment.clone(),
+                cancel.clone(),
+            )
+            .await?,
+        );
+        sessions.insert(host.to_owned(), Arc::clone(&session));
+        Ok(session)
+    }
+
+    async fn drop_session(&self, host: &str, expected: &Arc<HostSession>) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(host)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            sessions.remove(host);
+        }
+    }
+
+    async fn capture_session_output(
+        &self,
+        result: &SessionResult,
+        limits: EffectiveLimits,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<CapturedOutput> {
+        let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
+        let (mut stderr_writer, stderr_reader) = duplex(64 * 1024);
+        let stdout = result.stdout.clone();
+        let stderr = result.stderr.clone();
+        let stdout_task = tokio::spawn(async move {
+            let _ = stdout_writer.write_all(&stdout).await;
+            let _ = stdout_writer.shutdown().await;
+        });
+        let stderr_task = tokio::spawn(async move {
+            let _ = stderr_writer.write_all(&stderr).await;
+            let _ = stderr_writer.shutdown().await;
+        });
+        let captured = self
+            .output_store
+            .capture(
+                stdout_reader,
+                stderr_reader,
+                CaptureLimits {
+                    preview_bytes: limits.preview_bytes,
+                    max_output_bytes: limits.max_output_bytes,
+                },
+                cancel.clone(),
+            )
+            .await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        captured
+    }
+
+    async fn capture_session_internal(
+        &self,
+        result: &SessionResult,
+        limits: EffectiveLimits,
+        max_output_bytes: u64,
+        cleanup: InternalSpoolRegistration,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<InternalCapturedOutput> {
+        let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
+        let (mut stderr_writer, stderr_reader) = duplex(64 * 1024);
+        let stdout = result.stdout.clone();
+        let stderr = result.stderr.clone();
+        let stdout_task = tokio::spawn(async move {
+            let _ = stdout_writer.write_all(&stdout).await;
+            let _ = stdout_writer.shutdown().await;
+        });
+        let stderr_task = tokio::spawn(async move {
+            let _ = stderr_writer.write_all(&stderr).await;
+            let _ = stderr_writer.shutdown().await;
+        });
+        let captured = self
+            .output_store
+            .capture_internal(
+                stdout_reader,
+                stderr_reader,
+                CaptureLimits {
+                    preview_bytes: limits.preview_bytes.max(1),
+                    max_output_bytes,
+                },
+                cancel.clone(),
+                CancellationToken::new(),
+                cleanup,
+            )
+            .await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        captured
     }
 
     pub(crate) fn guarded_fixed_command_length(
@@ -546,7 +697,7 @@ impl SshRunner {
                 return Err(attach_selected_context(
                     BridgeError::new(
                         ErrorCode::RemoteCapabilityMissing,
-                        "remote host lacks a required capability",
+                        format!("remote host lacks required capability: {key}"),
                         false,
                     ),
                     &request.host,
@@ -608,29 +759,83 @@ impl SshRunner {
             &request.args,
             command_limit,
         )?;
-        let outcome = self
-            .run_child(
-                ChildSpec {
-                    argv: build_ssh_argv(&policy, &request.host, &remote_command),
-                    stdin: request.stdin,
-                    capture_limits: CaptureLimits {
-                        preview_bytes: 1,
-                        max_output_bytes: capture_limit,
-                    },
-                    deadline: remaining_timeout(operation_deadline)?,
-                    phase: Phase::Fixed { kind: request.kind },
-                    internal_registration: Some(request.cleanup),
-                },
-                &cancel,
-                &request.host,
-            )
+        let session = self
+            .session_for_host(&policy, &request.host, limits, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
             })?;
-        let output = outcome
-            .output
-            .into_internal()
+        let session_result = match session
+            .execute(
+                SessionRequest {
+                    command: remote_command,
+                    cwd: "/".to_owned(),
+                    shell: shell.clone(),
+                    login_shell: None,
+                    env: BTreeMap::new(),
+                    stdin: request.stdin,
+                    timeout: remaining_timeout(operation_deadline)?,
+                    stdout_limit: request.stdout_limit,
+                    stderr_limit: request.stderr_limit,
+                },
+                cancel.clone(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if session.is_closed() {
+                    self.drop_session(&request.host, &session).await;
+                }
+                return Err(attach_selected_context(
+                    request.kind.after_spawn_error(error),
+                    &request.host,
+                    &observed_root.physical_root,
+                    &shell,
+                ));
+            }
+        };
+        if session_result.status != 0 {
+            let mut error = if session_result.status == ROOT_GUARD_EXIT {
+                root_drift_error(request.kind)
+            } else {
+                let mut error = BridgeError::new(
+                    ErrorCode::RemoteExit,
+                    "remote fixed operation failed",
+                    false,
+                );
+                error.details.exit_status = Some(session_result.status);
+                error
+            };
+            error.details.host = Some(request.host.clone());
+            return Err(attach_selected_context(
+                request.kind.after_spawn_error(error),
+                &request.host,
+                &observed_root.physical_root,
+                &shell,
+            ));
+        }
+        if session_result.stdout_truncated || session_result.stderr_truncated {
+            return Err(attach_selected_context(
+                request.kind.after_spawn_error(BridgeError::new(
+                    ErrorCode::OutputLimit,
+                    "fixed output exceeded its stream limit",
+                    false,
+                )),
+                &request.host,
+                &observed_root.physical_root,
+                &shell,
+            ));
+        }
+        let output = self
+            .capture_session_internal(
+                &session_result,
+                limits,
+                capture_limit,
+                request.cleanup,
+                &cancel,
+            )
+            .await
             .map_err(|error| request.kind.after_spawn_error(error))
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
