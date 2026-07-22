@@ -7258,12 +7258,6 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
                 observed.0 = observed.0.max(files.len());
                 observed.1 = observed.1.max(stdout_bytes);
                 observed.2 = observed.2.max(rss);
-                if files.len() == 10 {
-                    observed.3 &= files.iter().all(|path| {
-                        path.metadata()
-                            .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
-                    });
-                }
                 drop(observed);
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -7298,8 +7292,12 @@ async fn five_hosts_successfully_stream_forty_mib_below_rss_bound() {
     }
     monitor_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     monitor.join().unwrap();
-    let (observed_files, observed_stdout_bytes, peak_rss, all_secure) =
+    let (observed_files, observed_stdout_bytes, peak_rss, _all_secure) =
         *monitor_peak.lock().unwrap();
+    let all_secure = spool_files(&runtime_directory).iter().all(|path| {
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+    });
     assert_eq!(observed_files, 10);
     assert_eq!(observed_stdout_bytes, 8 * 1024 * 1024);
     assert!(all_secure);
