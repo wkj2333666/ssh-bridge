@@ -170,6 +170,7 @@ pub struct SshRunner {
     global_limit: Arc<Semaphore>,
     host_limits: StdMutex<HashMap<String, Arc<Semaphore>>>,
     sessions: Mutex<HashMap<String, Arc<HostSession>>>,
+    session_initializers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl SshRunner {
@@ -223,6 +224,7 @@ impl SshRunner {
             global_limit: Arc::new(Semaphore::new(global_concurrency)),
             host_limits: StdMutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            session_initializers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -269,10 +271,15 @@ impl SshRunner {
         let operation_deadline = Instant::now()
             .checked_add(request.timeout)
             .ok_or_else(|| BridgeError::invalid_argument("command timeout is too large"))?;
+        let session = self
+            .session_for_host(&policy, &request.host, limits, &cancel)
+            .await
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
+            })?;
         let observed_root = self
-            .observe_root(
-                &policy,
-                &request.host,
+            .observe_root_session(
+                &session,
                 &root,
                 remaining_timeout(operation_deadline)?,
                 &cancel,
@@ -340,12 +347,6 @@ impl SshRunner {
             attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
         })?;
         let (remote_command, local_deadline) = prepared;
-        let session = self
-            .session_for_host(&policy, &request.host, limits, &cancel)
-            .await
-            .map_err(|error| {
-                attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
-            })?;
         let session_result = match session
             .execute(
                 SessionRequest {
@@ -435,12 +436,26 @@ impl SshRunner {
         limits: EffectiveLimits,
         cancel: &CancellationToken,
     ) -> BridgeResult<Arc<HostSession>> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(host) {
+        if let Some(session) = self.sessions.lock().await.get(host).cloned() {
             if !session.is_closed() {
-                return Ok(Arc::clone(session));
+                return Ok(session);
             }
-            sessions.remove(host);
+            self.sessions.lock().await.remove(host);
+        }
+        let connector = {
+            let mut initializers = self.session_initializers.lock().await;
+            Arc::clone(
+                initializers
+                    .entry(host.to_owned())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = connector.lock().await;
+        if let Some(session) = self.sessions.lock().await.get(host).cloned() {
+            if !session.is_closed() {
+                return Ok(session);
+            }
+            self.sessions.lock().await.remove(host);
         }
         let session = Arc::new(
             HostSession::connect_with(
@@ -453,7 +468,10 @@ impl SshRunner {
             )
             .await?,
         );
-        sessions.insert(host.to_owned(), Arc::clone(&session));
+        self.sessions
+            .lock()
+            .await
+            .insert(host.to_owned(), Arc::clone(&session));
         Ok(session)
     }
 
@@ -709,10 +727,15 @@ impl SshRunner {
         let operation_deadline = Instant::now()
             .checked_add(request.timeout)
             .ok_or_else(|| BridgeError::invalid_argument("fixed command timeout is too large"))?;
+        let session = self
+            .session_for_host(&policy, &request.host, limits, &cancel)
+            .await
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
+            })?;
         let observed_root = self
-            .observe_root(
-                &policy,
-                &request.host,
+            .observe_root_session(
+                &session,
                 &root,
                 remaining_timeout(operation_deadline)?,
                 &cancel,
@@ -759,12 +782,6 @@ impl SshRunner {
             &request.args,
             command_limit,
         )?;
-        let session = self
-            .session_for_host(&policy, &request.host, limits, &cancel)
-            .await
-            .map_err(|error| {
-                attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
-            })?;
         let session_result = match session
             .execute(
                 SessionRequest {
@@ -868,6 +885,64 @@ impl SshRunner {
         })
     }
 
+    async fn observe_root_session(
+        &self,
+        session: &HostSession,
+        requested_root: &str,
+        deadline: Duration,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<RootIdentity> {
+        let command = render_fixed_command(ROOT_OBSERVE_SCRIPT, &[requested_root.to_owned()])?;
+        let output_limit = u64::try_from(MAX_REMOTE_CONTEXT_ROOT_BYTES)
+            .expect("root bound fits u64")
+            .checked_add(ROOT_OBSERVE_PROTOCOL_RESERVE)
+            .expect("root protocol bound fits u64");
+        let result = session
+            .execute(
+                SessionRequest {
+                    command,
+                    cwd: "/".to_owned(),
+                    shell: ShellSelection {
+                        shell: ShellKind::PosixSh,
+                        fallback: false,
+                    },
+                    login_shell: None,
+                    env: BTreeMap::new(),
+                    stdin: None,
+                    timeout: deadline,
+                    stdout_limit: output_limit,
+                    stderr_limit: output_limit,
+                },
+                cancel.clone(),
+            )
+            .await?;
+        if result.status == 78 {
+            return Err(BridgeError::new(
+                ErrorCode::RemoteCapabilityMissing,
+                "remote root identity requires compatible GNU or BSD stat",
+                false,
+            ));
+        }
+        if result.status != 0 {
+            let mut error = BridgeError::new(
+                ErrorCode::RemoteExit,
+                "remote root observation failed",
+                false,
+            );
+            error.details.exit_status = Some(result.status);
+            return Err(error);
+        }
+        if result.stdout_truncated || result.stderr_truncated {
+            return Err(BridgeError::new(
+                ErrorCode::OutputLimit,
+                "remote root observation exceeded its limit",
+                false,
+            ));
+        }
+        parse_root_observation(&result.stdout)
+    }
+
+    #[allow(dead_code)]
     async fn observe_root(
         &self,
         policy: &SshPolicy,
@@ -1340,20 +1415,14 @@ impl SshRunner {
             return self.failed_exit(-1, output, phase, host, elapsed).await;
         };
         if code == 0 {
-            return Ok(ChildOutcome {
-                status: code,
-                output,
-            });
+            return Ok(ChildOutcome { output });
         }
         if matches!(phase, Phase::Command { .. })
             && code != 255
             && code != ROOT_GUARD_EXIT
             && !(phase.remote_timeout_wrapped() && code == 124)
         {
-            return Ok(ChildOutcome {
-                status: code,
-                output,
-            });
+            return Ok(ChildOutcome { output });
         }
         self.failed_exit(code, output, phase, host, elapsed).await
     }
@@ -1424,7 +1493,6 @@ struct OperationReservation {
 }
 
 struct ChildOutcome {
-    status: i32,
     output: ChildCaptured,
 }
 
@@ -1501,16 +1569,6 @@ impl ChildCaptured {
             )),
         }
     }
-    fn into_internal(self) -> BridgeResult<InternalCapturedOutput> {
-        match self {
-            Self::Internal(output) => Ok(output),
-            Self::Public(_) => Err(BridgeError::new(
-                ErrorCode::Io,
-                "public capture used by fixed command",
-                false,
-            )),
-        }
-    }
 }
 
 struct ChildSpec {
@@ -1523,6 +1581,7 @@ struct ChildSpec {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum Phase {
     Resolve,
     Probe,

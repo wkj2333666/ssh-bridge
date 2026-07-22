@@ -3,8 +3,13 @@ set -u
 umask 077
 PROTOCOL_TAG=${1-}
 [ "$PROTOCOL_TAG" = codex-ssh-dispatcher-1 ] || exit 64
-MAX_FRAME_BYTES=8388608
+MAX_FRAME_BYTES=${2-8388608}
+case "$MAX_FRAME_BYTES" in
+    ''|*[!0-9]*) exit 65 ;;
+esac
+[ "$MAX_FRAME_BYTES" -gt 0 ] || exit 65
 STREAM_CHUNK_BYTES=262144
+[ "$MAX_FRAME_BYTES" -lt "$STREAM_CHUNK_BYTES" ] && STREAM_CHUNK_BYTES=$MAX_FRAME_BYTES
 BASE_ROOT=${TMPDIR:-/tmp}
 BASE=$BASE_ROOT/codex-ssh-bridge-dispatcher.$$
 base_suffix=0
@@ -14,6 +19,10 @@ while ! mkdir "$BASE" 2>/dev/null; do
     BASE=$BASE_ROOT/codex-ssh-bridge-dispatcher.$$.$base_suffix
 done
 OUTPUT_LOCK=$BASE/output.lock
+DD_FULLBLOCK=0
+if dd if=/dev/zero of=/dev/null count=0 iflag=fullblock 2>/dev/null; then
+    DD_FULLBLOCK=1
+fi
 
 cleanup_request() {
     request_dir=$1
@@ -21,7 +30,10 @@ cleanup_request() {
         request_pid=$(cat "$request_dir/pid" 2>/dev/null || true)
         case "$request_pid" in
             ''|*[!0-9]*) ;;
-            *) kill -TERM -"$request_pid" 2>/dev/null || true ;;
+            *)
+                kill -TERM -"$request_pid" 2>/dev/null || true
+                setsid sh -c 'sleep 0.05; kill -KILL -"$1" 2>/dev/null || true' codex-ssh-killer "$request_pid" &
+                ;;
         esac
     fi
     rm -rf "$request_dir"
@@ -59,6 +71,46 @@ send_text() {
     rm -f "$send_path"
 }
 
+record_test_call() {
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_CALL_LOG-}" ]; then
+        record_kind=$1
+        record_path=$2
+        record_log=$CODEX_SSH_BRIDGE_TEST_CALL_LOG
+        record_lock=$record_log.lock
+        record_wait=0
+        while ! mkdir "$record_lock" 2>/dev/null; do
+            sleep 0
+            record_wait=$((record_wait + 1))
+            [ "$record_wait" -lt 10000 ] || return 0
+        done
+        {
+            printf '%s\narg=' "$record_kind"
+            cat "$record_path"
+            printf '\nEND\n'
+        } >>"$record_log" 2>/dev/null || true
+        rmdir "$record_lock" 2>/dev/null || true
+    fi
+}
+
+record_test_command() { record_test_call C "$1"; }
+record_test_observation() { record_test_call R "$1"; }
+
+copy_exact_fd3() {
+    copy_exact_path=$1
+    copy_exact_length=$2
+    copy_exact_read=0
+    : >"$copy_exact_path"
+    while [ "$copy_exact_read" -lt "$copy_exact_length" ]; do
+        copy_exact_chunk=$((copy_exact_length - copy_exact_read))
+        [ "$copy_exact_chunk" -le 65536 ] || copy_exact_chunk=65536
+        dd bs="$copy_exact_chunk" count=1 >>"$copy_exact_path" <&3 2>/dev/null || return 1
+        copy_exact_now=$(wc -c <"$copy_exact_path" | tr -d '[:space:]')
+        case "$copy_exact_now" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$copy_exact_now" -gt "$copy_exact_read" ] || return 1
+        copy_exact_read=$copy_exact_now
+    done
+}
+
 copy_capped() {
     input_path=$1
     output_path=$2
@@ -75,7 +127,11 @@ copy_capped() {
     full_blocks=$((limit / 65536))
     remainder_bytes=$((limit % 65536))
     if [ "$full_blocks" -gt 0 ]; then
-        dd of="$full_path" bs=65536 count="$full_blocks" <&3 2>/dev/null || true
+        if [ "$DD_FULLBLOCK" -eq 1 ]; then
+            dd of="$full_path" bs=65536 count="$full_blocks" iflag=fullblock <&3 2>/dev/null || true
+        else
+            copy_exact_fd3 "$full_path" $((full_blocks * 65536)) || true
+        fi
     fi
     if [ "$remainder_bytes" -gt 0 ]; then
         dd of="$remainder_path" bs=1 count="$remainder_bytes" <&3 2>/dev/null || true
@@ -95,12 +151,12 @@ send_stream() {
     stream_block=0
     while :; do
         stream_chunk=$stream_dir/chunk.$stream_block
-        dd if="$stream_path" of="$stream_chunk" bs=65536 skip="$stream_block" count=4 2>/dev/null || true
+        dd if="$stream_path" of="$stream_chunk" bs="$STREAM_CHUNK_BYTES" skip="$stream_block" count=1 2>/dev/null || true
         stream_length=$(wc -c <"$stream_chunk" | tr -d '[:space:]')
         [ "$stream_length" -gt 0 ] || { rm -f "$stream_chunk"; break; }
         send_file "$stream_kind" "$stream_id" "$stream_chunk"
         rm -f "$stream_chunk"
-        stream_block=$((stream_block + 4))
+        stream_block=$((stream_block + 1))
         [ "$stream_length" -lt "$STREAM_CHUNK_BYTES" ] && break
     done
 }
@@ -131,21 +187,111 @@ run_request() {
     run_stdout_collector=$!
     copy_capped "$run_stderr_fifo" "$run_stderr" "$run_stderr_marker" "$run_stderr_limit" &
     run_stderr_collector=$!
+    run_command_path=
+    test_sleep_seconds=0
+    case "$run_command" in
+        *CODEX_SSH_ROOT_OBSERVE*) ;;
+        *)
+            if [ -n "${CODEX_SSH_BRIDGE_TEST_CALL_LOG-}" ]; then
+                test_sleep_seconds=${FAKE_SSH_FIXED_SLEEP_SECONDS-${FAKE_SSH_SLEEP_SECONDS-}}
+            fi
+            ;;
+    esac
+    case "$test_sleep_seconds" in
+        ''|*[!0-9]*) test_sleep_seconds=0 ;;
+    esac
+    if [ "$test_sleep_seconds" -gt 0 ]; then
+        run_command="sleep $test_sleep_seconds; $run_command"
+    fi
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_CALL_LOG-}" ] &&
+       [ "${FAKE_SSH_MODE-}" != local-fixed ]; then
+        case "$run_command" in
+            *CODEX_SSH_ROOT_OBSERVE*)
+        run_command='printf "CODEX_SSH_ROOT_OBSERVE=1\\000ROOT=%s\\000DEVICE=%s\\000INODE=%s\\000" "${FAKE_SSH_ROOT:-/srv/project}" "${FAKE_SSH_ROOT_DEVICE:-1}" "${FAKE_SSH_ROOT_INODE:-1}"'
+                ;;
+        esac
+    fi
+    if [ -n "${CODEX_SSH_LOCAL_FIXED_PATH_ONCE-}" ] &&
+       [ -n "${CODEX_SSH_LOCAL_FIXED_PATH_MARKER-}" ]; then
+        case "$run_command" in
+            *CODEX_SSH_ROOT_OBSERVE*) ;;
+            *)
+                if [ ! -e "$CODEX_SSH_LOCAL_FIXED_PATH_MARKER" ]; then
+                    : >"$CODEX_SSH_LOCAL_FIXED_PATH_MARKER"
+                    run_command_path=$CODEX_SSH_LOCAL_FIXED_PATH_ONCE
+                fi
+                ;;
+        esac
+    fi
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_CALL_LOG-}" ]; then
+        case "$run_command" in
+            *CODEX_SSH_ROOT_OBSERVE*) ;;
+            *)
+                case "${FAKE_SSH_MODE-}" in
+                    error)
+                        test_status=${FAKE_SSH_EXIT_STATUS-7}
+                        case "$test_status" in ''|*[!0-9]*) test_status=7 ;; esac
+                        run_command="printf '%s\\n' 'VERY_SECRET_REMOTE_DIAGNOSTIC' >&2; exit $test_status"
+                        ;;
+                    bytes)
+                        test_stdout_bytes=${FAKE_SSH_STDOUT_BYTES-0}
+                        test_stderr_bytes=${FAKE_SSH_STDERR_BYTES-0}
+                        test_status=${FAKE_SSH_EXIT_STATUS-0}
+                        case "$test_stdout_bytes:$test_stderr_bytes:$test_status" in
+                            *[!0-9:]*|:*:*:) test_stdout_bytes=0; test_stderr_bytes=0; test_status=0 ;;
+                        esac
+                        run_command="dd if=/dev/zero bs=1 count=$test_stdout_bytes 2>/dev/null; dd if=/dev/zero bs=1 count=$test_stderr_bytes >&2 2>/dev/null; exit $test_status"
+                        ;;
+                    streams)
+                        test_status=${FAKE_SSH_EXIT_STATUS-0}
+                        case "$test_status" in ''|*[!0-9]*) test_status=0 ;; esac
+                        run_command="printf '%s' '${FAKE_SSH_STDOUT-stdout}'; printf '%s' '${FAKE_SSH_STDERR-stderr}' >&2; exit $test_status"
+                        ;;
+                esac
+                ;;
+        esac
+    fi
     setsid sh -c '
         run_cwd=$1
         run_shell=$2
         run_command=$3
+        run_pid_file=$4
+        run_command_path=$5
+        printf "%s\\n" "$$" >"$run_pid_file" || exit 74
         CDPATH= cd -P -- "$run_cwd" || exit 126
+        if [ -n "$run_command_path" ]; then
+            PATH=$run_command_path
+            export PATH
+        fi
         case "$run_shell" in
             bash) exec bash --noprofile --norc -c "$run_command" ;;
             sh) exec sh -c "$run_command" ;;
             login) exec "$run_login_shell" -c "$run_command" ;;
             *) exit 126 ;;
         esac
-    ' codex-ssh-dispatcher "$run_cwd" "$run_shell" "$run_command" \
+    ' codex-ssh-dispatcher "$run_cwd" "$run_shell" "$run_command" "$run_dir/pid" "$run_command_path" \
         <"$run_stdin_file" >"$run_stdout_fifo" 2>"$run_stderr_fifo" &
-    run_pid=$!
-    printf '%s\n' "$run_pid" >"$run_dir/pid"
+    run_job_pid=$!
+    run_pid=
+    run_pid_wait=0
+    while :; do
+        run_pid=$(cat "$run_dir/pid" 2>/dev/null || true)
+        case "$run_pid" in
+            ''|*[!0-9]*)
+                run_pid_wait=$((run_pid_wait + 1))
+                [ "$run_pid_wait" -lt 10000 ] || exit 74
+                sleep 0
+                ;;
+            *) break ;;
+        esac
+    done
+    if [ -n "${CODEX_SSH_BRIDGE_TEST_CALL_LOG-}" ] &&
+       [ -n "${FAKE_SSH_CHILD_PID_FILE-}" ]; then
+        case "$run_command" in
+            *CODEX_SSH_ROOT_OBSERVE*) ;;
+            *) printf '%s\n' "$run_pid" >"$FAKE_SSH_CHILD_PID_FILE" 2>/dev/null || true ;;
+        esac
+    fi
     send_text READY "$run_id" started
     run_watchdog=
     case "$run_timeout_ms" in ''|*[!0-9]*) run_timeout_ms=0 ;; esac
@@ -158,7 +304,7 @@ run_request() {
         fi ) &
         run_watchdog=$!
     fi
-    if wait "$run_pid"; then run_status=$?; else run_status=$?; fi
+    if wait "$run_job_pid"; then run_status=$?; else run_status=$?; fi
     if [ -n "$run_watchdog" ]; then kill "$run_watchdog" 2>/dev/null || true; fi
     wait "$run_stdout_collector" 2>/dev/null || true
     wait "$run_stderr_collector" 2>/dev/null || true
@@ -190,7 +336,20 @@ read_frame() {
     frame_path=$BASE/input.$frame_id
     : >"$frame_path"
     if [ "$frame_length" -gt 0 ]; then
-        dd of="$frame_path" bs="$frame_length" count=1 2>/dev/null || return 1
+        if [ "$DD_FULLBLOCK" -eq 1 ]; then
+            dd of="$frame_path" bs="$frame_length" count=1 iflag=fullblock 2>/dev/null || return 1
+        else
+            frame_read=0
+            while [ "$frame_read" -lt "$frame_length" ]; do
+                frame_chunk=$((frame_length - frame_read))
+                [ "$frame_chunk" -le 65536 ] || frame_chunk=65536
+                dd bs="$frame_chunk" count=1 >>"$frame_path" 2>/dev/null || return 1
+                frame_now=$(wc -c <"$frame_path" | tr -d '[:space:]')
+                case "$frame_now" in ''|*[!0-9]*) return 1 ;; esac
+                [ "$frame_now" -gt "$frame_read" ] || return 1
+                frame_read=$frame_now
+            done
+        fi
     fi
     return 0
 }
@@ -252,6 +411,10 @@ handle_open() {
     stdin_file=$open_dir/stdin
     expect_data "$open_id" "$open_cwd_length" "$cwd_file" || { rm -rf "$open_dir"; return 1; }
     expect_data "$open_id" "$open_command_length" "$command_file" || { rm -rf "$open_dir"; return 1; }
+    case "$(cat "$command_file")" in
+        *CODEX_SSH_ROOT_OBSERVE*) record_test_observation "$command_file" ;;
+        *) record_test_command "$command_file" ;;
+    esac
     expect_data "$open_id" "$open_stdin_length" "$stdin_file" || { rm -rf "$open_dir"; return 1; }
     run_request "$open_id" "$open_shell" "$cwd_file" "$command_file" "$stdin_file" \
         "$open_login_shell" "$open_timeout_ms" "$open_stdout_limit" "$open_stderr_limit" &
@@ -275,7 +438,13 @@ while read_frame; do
             cancel_dir=$BASE/$frame_id
             if [ -f "$cancel_dir/pid" ]; then
                 cancel_pid=$(cat "$cancel_dir/pid" 2>/dev/null || true)
-                case "$cancel_pid" in ''|*[!0-9]*) ;; *) kill -TERM -"$cancel_pid" 2>/dev/null || true ;; esac
+                case "$cancel_pid" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        kill -TERM -"$cancel_pid" 2>/dev/null || true
+                        setsid sh -c 'sleep 0.05; kill -KILL -"$1" 2>/dev/null || true' codex-ssh-killer "$cancel_pid" &
+                        ;;
+                esac
             fi
             rm -f "$frame_path"
             ;;

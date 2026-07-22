@@ -541,18 +541,13 @@ enum ToolStream {
 }
 
 #[allow(dead_code, reason = "Task 7 consumes the typed arguments")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ToolRunShell {
+    #[default]
     Bash,
     Sh,
     Login,
-}
-
-impl Default for ToolRunShell {
-    fn default() -> Self {
-        Self::Bash
-    }
 }
 
 #[allow(dead_code, reason = "Task 7 consumes the typed arguments")]

@@ -103,3 +103,22 @@ async fn independent_session_requests_complete_concurrently() {
     assert_eq!(String::from_utf8_lossy(&fast.output.stdout.head), "fast");
     assert_eq!(String::from_utf8_lossy(&slow.output.stdout.head), "slow");
 }
+
+#[tokio::test]
+async fn session_preserves_large_binary_stdin_across_pipe_short_reads() {
+    let base = TempDir::new().unwrap();
+    let log = base.path().join("ssh.log");
+    let runner = session_runner(&base, &log);
+    let stdin = vec![0xA5; 512 * 1024 + 123];
+    let mut request = request("wc -c");
+    request.stdin = Some(stdin.clone());
+    let result = runner
+        .execute(request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.status, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&result.output.stdout.head),
+        format!("{}\n", stdin.len())
+    );
+}

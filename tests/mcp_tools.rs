@@ -2226,7 +2226,7 @@ async fn task8_cancel_process_mcp_reaches_group_under_250ms_and_service_recovers
     assert_eq!(
         error.details.remote_process_may_continue,
         Some(true),
-        "MCP suppression must not erase direct bridge cancellation truth"
+        "forced cancellation must preserve unknown remote-process state"
     );
     eprintln!(
         "MCP cancellation release sample: total={cancel_elapsed:?} process_poll={process_elapsed:?}"

@@ -121,7 +121,10 @@ done
 case "$remote_command" in
     *codex-ssh-dispatcher-1*)
         log_call S "$@"
-        exec "${FAKE_SSH_ACCOUNT_SHELL:-/bin/sh}" -c "$remote_command"
+        CODEX_SSH_BRIDGE_TEST_CALL_LOG=${FAKE_SSH_LOG-} \
+        CODEX_SSH_LOCAL_FIXED_PATH_ONCE=${FAKE_SSH_LOCAL_FIXED_PATH_ONCE-} \
+        CODEX_SSH_LOCAL_FIXED_PATH_MARKER=${FAKE_SSH_LOCAL_FIXED_PATH_MARKER-} \
+            exec /bin/sh -c "$remote_command"
         ;;
 esac
 

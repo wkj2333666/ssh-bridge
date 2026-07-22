@@ -19,6 +19,8 @@ The configured remote root is a routing boundary, not a security sandbox. Remote
 
 No Codex credential, binary, plugin, MCP server, or persistent helper is placed on a server. All SSH authentication occurs in the local OpenSSH client.
 
+Operational work uses one local-owned SSH child per configured alias. The bridge streams a bounded POSIX dispatcher as the remote command and keeps it only for that SSH session; it does not write a helper into the remote filesystem. Each request is framed as data, starts a separate process group, and has independent stdout/stderr limits, timeout, and cancellation. A dispatcher startup failure is terminal for that request; there is no silent one-shot fallback.
+
 ## OpenSSH policy
 
 Every operational SSH call forces separate `-o` arguments for:
@@ -46,13 +48,17 @@ The local Unix user and that user's OpenSSH configuration remain trusted executi
 
 ## Command and shell handling
 
+The public shell contract is explicit: omitted `remote_run.shell` means Bash, `sh` is an explicit retry choice, and `auto` is not accepted.
+
 MCP paths, queries, globs, patch bodies, file content, stdin, and configured roots are transported as data. Fixed remote programs use static scripts plus positional parameters. The direct human CLI converts each argv word with the bridge's bounded shell encoder.
 
-`remote_run` intentionally accepts a shell command string. The bridge safely binds the whole string into the selected remote shell, but syntax inside it still has that shell's meaning. `auto` records Bash or a visible POSIX-sh fallback; explicit Bash fails closed if unavailable. Explicit `login` obtains the account shell from a strict, unique `getent passwd UID` record, or from one unique `/etc/passwd` record only when `getent` is absent. It rejects malformed, relative, oversized, non-regular, or non-executable paths, treats an empty passwd shell as `/bin/sh` like OpenSSH, and never trusts `$SHELL`. A fixed POSIX guard pins the root before it executes that resolved shell with the payload as data. Results and errors preserve the actual shell metadata.
+`remote_run` intentionally accepts a shell command string. The bridge safely binds the whole string into the selected remote shell, but syntax inside it still has that shell's meaning. Omitted shell and explicit `bash` both require Bash; an unavailable Bash is a capability error that the caller may explicitly retry with `sh`. Explicit `login` obtains the account shell from a strict, unique `getent passwd UID` record, or from one unique `/etc/passwd` record only when `getent` is absent. It rejects malformed, relative, oversized, non-regular, or non-executable paths, treats an empty passwd shell as `/bin/sh` like OpenSSH, and never trusts `$SHELL`. A fixed POSIX guard pins the root before it executes that resolved shell with the payload as data. Results and errors preserve the actual shell metadata.
 
 Local `LC_ALL=C` is forced only for bridge protocol and SSH-diagnostic phases. Raw `remote_run` does not add that override, so the bridge does not itself cause an `LC_*` `SendEnv` rule to change the user's command locale.
 
-All command tools are treated as mutating. A local timeout sends TERM and then KILL to the entire local SSH process group. A detached or ambiguous remote child can survive, so results expose process-continuation and mutation uncertainty instead of claiming rollback.
+Session note: the dispatcher is always POSIX sh and never parses a user command as its own control language. A timeout or cancellation sends a request-level cancel first; if termination is not confirmed, the persistent session is closed and pending mutations are reported unknown rather than retried.
+
+All command tools are treated as mutating. A local timeout sends a request-level cancel, then terminates the entire persistent SSH process group when the dispatcher cannot confirm completion. A detached or ambiguous remote child can survive, so results expose process-continuation and mutation uncertainty instead of claiming rollback.
 
 ## Files, output, and protocol limits
 
@@ -101,13 +107,20 @@ Even with transport hardening, FUSE/SFTP behavior differs from a native filesyst
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --lib ssh::frame::tests
+cargo test --lib ssh::session::tests
+cargo test --test dispatcher --test session --test mcp_tools -- --nocapture
+cargo test --test mcp_protocol --test packaging --test cli -- --nocapture
+cargo build --release
 cargo test --release --test mcp_protocol task7_adversarial_ -- --nocapture
 cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
-cargo test --test cli
-cargo test --release --test performance_acceptance -- --nocapture
 CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
 
-Final acceptance also runs the predictable-temp symlink regression, 16 MiB stdout+stderr serialization case, oversized-frame recovery, SSHFS policy/race tests, CRLF OpenSSH diagnostic classification, and an isolated real-OpenSSH fixture. The recorded real fixture ran successfully without a skip.
+The pre-session `remote_ops` and `performance_acceptance` fake fixtures still
+assume one-shot SSH and are not acceptance gates for the persistent dispatcher;
+their migration is tracked separately. Final focused acceptance also runs the
+predictable-temp symlink regression, 16 MiB stdout+stderr serialization case,
+oversized-frame recovery, SSHFS policy/race tests, CRLF OpenSSH diagnostic
+classification, and an isolated real-OpenSSH fixture.

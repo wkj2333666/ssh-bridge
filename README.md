@@ -14,7 +14,7 @@ remote sshd ── files, compilers, tests, services
 optional, human-only: local SSHFS mount over SFTP
 ```
 
-The server receives fixed POSIX scripts and user commands through ordinary SSH. It receives no Codex binary, session, API key, plugin, or persistent helper.
+The server receives fixed POSIX scripts and user commands through ordinary SSH. The bridge keeps one local-owned SSH session per alias and streams a bounded POSIX dispatcher over it; the dispatcher is transient and is never installed on the server. The server receives no Codex binary, API key, plugin, or persistent bridge installation.
 
 ## Why this design
 
@@ -22,7 +22,7 @@ The server receives fixed POSIX scripts and user commands through ordinary SSH. 
 |---|---|---|---|
 | Raw `ssh` | Universal and minimal | Leaves target selection, quoting, limits, shell detection, cancellation, and output handling to the Agent | Transport below the bridge |
 | SSHFS | Convenient human browsing | Makes remote files look local while commands still run locally; adds FUSE/SFTP latency and reconnect semantics | Explicit optional CLI only |
-| Native local MCP | Closed schemas, allowlisted hosts, bounded I/O, shared policy, visible Bash/sh fallback | Non-interactive by design | Default Agent interface |
+| Native local MCP | Closed schemas, allowlisted hosts, bounded I/O, shared policy, explicit Bash/sh choice | Non-interactive by design | Default Agent interface |
 | Official Codex SSH Remote | Native remote project experience | Currently starts Codex remotely and requires remote installation/authentication | Deliberately not used |
 
 The bridge is Rust rather than a Bash program because strict MCP framing, bounded parsing, async concurrency, process-group cancellation, and spool quotas need one auditable state machine. Bash and POSIX sh remain supported as the *remote command shells*; the result always reports which shell actually ran.
@@ -151,7 +151,9 @@ The nine MCP tools are:
 
 The default flow is bounded search/read → unified patch → remote verification. Calls are synchronous. Oversized detail is retained under an opaque `output_ref` and paged with `remote_output_read`, so the Agent never needs to reconstruct transport logic.
 
-`remote_run` accepts one command string plus `shell: auto|bash|sh|login`. Prefer POSIX syntax. `auto` may fall back to sh; request Bash explicitly for Bash-only syntax. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
+`remote_run` accepts one command string plus `shell: bash|sh|login`; omission means `bash`. Prefer POSIX syntax. Bash is never silently changed to sh: if Bash is unavailable, the model receives a capability error and may explicitly retry with `shell:"sh"`. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
+
+Operational requests are multiplexed over one persistent SSH session per alias and can run concurrently up to configured capacity. Each request has an independent process group and cancellation; mutations are not implicitly serialized, so concurrent same-path calls have no ordering guarantee. If cancellation cannot be confirmed, the session is closed and the result is explicitly marked unknown rather than retried.
 
 ## Human direct CLI
 
@@ -159,7 +161,7 @@ The direct CLI accepts argv and handles shell-word encoding inside the bridge:
 
 ```bash
 ./target/release/codex-ssh-bridge hosts list
-./target/release/codex-ssh-bridge run devbox --cwd . --shell auto -- git status --short
+./target/release/codex-ssh-bridge run devbox --cwd . --shell bash -- git status --short
 ```
 
 This is convenient for a person or a diagnostic. Model-driven work should use MCP so results remain structured and approvals follow tool annotations.
