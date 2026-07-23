@@ -87,11 +87,11 @@ bounded by the configured quota rather than treated as an exact count.
 
 ## Rust, Bash, and SSHFS
 
-The native Rust bridge removes interpreter startup from every MCP frame and keeps validation, scheduling, cancellation, quotas, and serialization in one process. A persistent SSH dispatcher removes repeated remote shell setup for warm operations. Replacing the bridge with Bash would move JSON correctness, frame bounds, and concurrent process ownership into shell text without improving the dominant SSH/network latency.
+The native Rust bridge removes interpreter startup from every MCP frame and keeps validation, scheduling, cancellation, quotas, and serialization in one process. On supported Linux hosts, the static Rust helper additionally removes per-request remote shell setup, request temp files, FIFOs, and `dd`/`wc` output staging; the helper upload is paid once during cold session startup. Unsupported hosts retain the persistent shell dispatcher. Replacing the bridge with Bash would move JSON correctness, frame bounds, and concurrent process ownership into shell text without improving the dominant SSH/network latency.
 
 The bridge still uses the remote Bash or POSIX sh selected by capability probing because commands must execute where the server's tools and data live. Omitted `remote_run.shell` means Bash; `sh` is an explicit retry choice after a Bash capability error. There is no hidden fallback.
 
-The persistent session adds a fixed startup cost once per alias, then multiplexes independent request frames. A long command does not block another request until the configured per-host capacity is exhausted; a session transport failure invalidates all pending requests and is not automatically retried.
+The persistent session adds a fixed startup cost once per alias. Acceptance measurements must therefore report `helper_cold`/`helper_warm` separately from `shell_cold`/`shell_warm` on the same fixture. A long command does not block another request until the configured per-host capacity is exhausted; a session transport failure invalidates all pending requests and is not automatically retried.
 
 SSHFS is optional because repository walks and builds can turn many small filesystem calls into network round trips. The structured tools batch list/stat/read/search work remotely and return bounded results, which reduces both latency and Agent-side context pressure.
 

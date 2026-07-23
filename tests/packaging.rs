@@ -109,6 +109,25 @@ fn source_package_requires_local_build_and_ignores_user_mcp_config() {
 }
 
 #[test]
+fn release_workflow_builds_and_packages_all_static_helper_targets() {
+    let workflow = read_text(".github/workflows/release.yml");
+    for target in [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "armv7-unknown-linux-musleabihf",
+        "riscv64gc-unknown-linux-musl",
+        "powerpc64le-unknown-linux-musl",
+        "s390x-unknown-linux-musl",
+    ] {
+        assert!(workflow.contains(target), "release workflow omits {target}");
+    }
+    assert!(workflow.contains("name: helper-${{ matrix.target }}"));
+    assert!(workflow.contains("remote-helpers/$helper"));
+    assert!(workflow.contains("--bin codex-ssh-bridge-helper"));
+    assert!(workflow.contains("statically linked|musl"));
+}
+
+#[test]
 fn installed_chain_has_no_python_runtime_or_legacy_module_references() {
     let root = repository_root();
     let mut files = Vec::new();

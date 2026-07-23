@@ -14,7 +14,7 @@ remote sshd ── files, compilers, tests, services
 optional, human-only: local SSHFS mount over SFTP
 ```
 
-The server receives fixed POSIX scripts and user commands through ordinary SSH. The bridge keeps one local-owned SSH session per alias and streams a bounded POSIX dispatcher over it; the dispatcher is transient and is never installed on the server. The server receives no Codex binary, API key, plugin, or persistent bridge installation.
+The bridge keeps one local-owned SSH session per alias. On supported Linux architectures it uploads a precompiled Rust helper once for that session; unsupported hosts use the complete transient POSIX dispatcher fallback. Neither path installs a persistent package: the server receives no Codex binary, API key, plugin, or bridge installation.
 
 ## Why this design
 
@@ -71,6 +71,14 @@ The release workflow publishes Linux binaries and SHA-256 files for:
 - `armv7-unknown-linux-gnueabihf`
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
+
+Each archive also contains `remote-helpers/` with static helpers for
+`x86_64`, `aarch64`, `armv7l`, `riscv64`, `ppc64le`, and `s390x` Linux hosts.
+Keep that directory beside the bridge binary. The bridge probes `uname -s` and
+`uname -m`, uploads the matching helper once per SSH session, and automatically
+uses the POSIX dispatcher when the host or artifact is unsupported. For local
+development or a custom package, set `CODEX_SSH_BRIDGE_HELPERS_DIR` to a
+private directory containing files named by their Rust target triple.
 
 Download the archive matching the local Codex host, extract the binary to a
 private path, and put that absolute path in `.mcp.json.example` before

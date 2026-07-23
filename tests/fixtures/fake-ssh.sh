@@ -119,7 +119,7 @@ for argument do
 done
 
 case "$remote_command" in
-    *codex-ssh-dispatcher-1*)
+	*codex-ssh-dispatcher-1*)
         log_call S "$@"
         CODEX_SSH_BRIDGE_TEST_MODE=1 \
         CODEX_SSH_BRIDGE_TEST_CALL_LOG=${FAKE_SSH_LOG-} \
@@ -127,6 +127,10 @@ case "$remote_command" in
         CODEX_SSH_LOCAL_FIXED_PATH_MARKER=${FAKE_SSH_LOCAL_FIXED_PATH_MARKER-} \
             exec /bin/sh -c "$remote_command"
         ;;
+	*codex-ssh-helper-bootstrap-1*)
+		log_call S "$@"
+		exec /bin/sh -c "$remote_command"
+		;;
 esac
 
 if [ -n "${FAKE_SSH_PHASE_LOG:-}" ]; then
@@ -161,6 +165,12 @@ case "$remote_command" in
         printf 'ROOT=%s\0' "$fake_root"
         printf 'ROOT_DEVICE=%s\0' "${FAKE_SSH_ROOT_DEVICE:-1}"
         printf 'ROOT_INODE=%s\0' "${FAKE_SSH_ROOT_INODE:-1}"
+        if [ -n "${FAKE_SSH_KERNEL_NAME:-}" ]; then
+            printf 'KERNEL_NAME=%s\0' "$FAKE_SSH_KERNEL_NAME"
+        fi
+        if [ -n "${FAKE_SSH_MACHINE_ARCH:-}" ]; then
+            printf 'MACHINE_ARCH=%s\0' "$FAKE_SSH_MACHINE_ARCH"
+        fi
         printf 'SHELL_KIND=%s\0' "$fake_shell"
         printf 'BASH_VERSION=%s\0' "$bash_version"
         printf 'LOGIN_SHELL=%s\0' "${FAKE_SSH_LOGIN_SHELL-/bin/sh}"

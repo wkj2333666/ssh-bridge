@@ -63,6 +63,7 @@ pub(crate) struct HostSession {
 
 struct SessionInner {
     host: String,
+    helper: bool,
     max_payload: usize,
     max_output_bytes: u64,
     tx: mpsc::Sender<Outbound>,
@@ -234,6 +235,16 @@ impl HostSession {
             .take()
             .ok_or_else(|| BridgeError::io("SSH session stderr pipe is missing"))?;
         tokio::spawn(drain_stderr(stderr));
+        let helper_bootstrap_profile = helper.as_ref().map(|_| {
+            crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                phase: "helper_bootstrap",
+                host: Some(host.as_str()),
+                request_id: None,
+                class: Some("cold"),
+                elapsed_us: 0,
+                bytes: None,
+            })
+        });
         if let Some((_, bytes)) = helper {
             let stdin = child
                 .stdin
@@ -250,6 +261,7 @@ impl HostSession {
                 return Err(startup_error(&host, &error.to_string()));
             }
         }
+        drop(helper_bootstrap_profile);
         let mut output = BufReader::new(stdout);
         let hello = tokio::select! {
             biased;
@@ -302,6 +314,7 @@ impl HostSession {
         let (tx, rx) = mpsc::channel(64);
         let inner = Arc::new(SessionInner {
             host,
+            helper: helper_arch.is_some(),
             max_payload: limits.max_frame_bytes,
             max_output_bytes: limits.max_output_bytes,
             tx,
@@ -370,10 +383,24 @@ impl HostSession {
             sender,
         };
         self.inner.pending.lock().await.insert(request_id, pending);
+        let helper_command_profile = if self.inner.helper {
+            Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                phase: "helper_command_spawn",
+                host: Some(self.inner.host.as_str()),
+                request_id: Some(request_id),
+                class: None,
+                elapsed_us: 0,
+                bytes: None,
+            }))
+        } else {
+            None
+        };
         if let Err(error) = self.inner.send(Outbound { frames }).await {
+            drop(helper_command_profile);
             self.inner.pending.lock().await.remove(&request_id);
             return Err(error);
         }
+        drop(helper_command_profile);
 
         let deadline = tokio::time::sleep(request.timeout);
         tokio::pin!(deadline);
@@ -505,7 +532,22 @@ async fn writer_loop(
     };
     while let Some(outbound) = receiver.recv().await {
         for frame in outbound.frames {
-            let max_payload = inner.upgrade().map_or(0, |inner| inner.max_payload);
+            let upgraded = inner.upgrade();
+            let max_payload = upgraded.as_ref().map_or(0, |inner| inner.max_payload);
+            let _frame_profile = upgraded.as_ref().and_then(|inner| {
+                if inner.helper {
+                    Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                        phase: "helper_frame_write",
+                        host: Some(inner.host.as_str()),
+                        request_id: Some(frame.request_id),
+                        class: None,
+                        elapsed_us: 0,
+                        bytes: Some(frame.payload.len() as u64),
+                    }))
+                } else {
+                    None
+                }
+            });
             if max_payload == 0 || write_frame(&mut stdin, &frame, max_payload).await.is_err() {
                 if let Some(inner) = inner.upgrade() {
                     inner
@@ -586,6 +628,18 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                 protocol_error(&inner.host, "dispatcher returned an unknown request ID")
             })?;
             if frame.kind == FrameKind::Stdout {
+                let _output_profile = if inner.helper {
+                    Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                        phase: "helper_output_drain",
+                        host: Some(inner.host.as_str()),
+                        request_id: Some(frame.request_id),
+                        class: None,
+                        elapsed_us: 0,
+                        bytes: Some(frame.payload.len() as u64),
+                    }))
+                } else {
+                    None
+                };
                 let aggregate_used =
                     request.stdout_seen.saturating_add(request.stderr_seen) as usize;
                 let remaining = request
@@ -610,6 +664,18 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                     .stdout_seen
                     .saturating_add(frame.payload.len() as u64);
             } else {
+                let _output_profile = if inner.helper {
+                    Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                        phase: "helper_output_drain",
+                        host: Some(inner.host.as_str()),
+                        request_id: Some(frame.request_id),
+                        class: None,
+                        elapsed_us: 0,
+                        bytes: Some(frame.payload.len() as u64),
+                    }))
+                } else {
+                    None
+                };
                 let aggregate_used =
                     request.stdout_seen.saturating_add(request.stderr_seen) as usize;
                 let remaining = request
@@ -637,6 +703,18 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
             Ok(())
         }
         FrameKind::Exit => {
+            let _exit_profile = if inner.helper {
+                Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                    phase: "helper_exit",
+                    host: Some(inner.host.as_str()),
+                    request_id: Some(frame.request_id),
+                    class: None,
+                    elapsed_us: 0,
+                    bytes: Some(frame.payload.len() as u64),
+                }))
+            } else {
+                None
+            };
             let (status, stdout_truncated, stderr_truncated) = parse_exit(&frame.payload)
                 .map_err(|message| protocol_error(&inner.host, &message))?;
             let request = inner

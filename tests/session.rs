@@ -5,6 +5,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,4 +122,67 @@ async fn session_preserves_large_binary_stdin_across_pipe_short_reads() {
         String::from_utf8_lossy(&result.output.stdout.head),
         format!("{}\n", stdin.len())
     );
+}
+
+#[tokio::test]
+async fn supported_linux_architecture_uses_uploaded_helper_once_per_session() {
+    let helper_source = std::env::var("CARGO_BIN_EXE_codex-ssh-bridge-helper")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/debug/codex-ssh-bridge-helper")
+        });
+    if !helper_source.is_file() {
+        eprintln!("helper integration binary is not available; skipping");
+        return;
+    }
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-musl",
+        "aarch64" => "aarch64-unknown-linux-musl",
+        "arm" => "armv7-unknown-linux-musleabihf",
+        _ => {
+            eprintln!("unsupported test architecture; skipping");
+            return;
+        }
+    };
+    let test_binary_parent = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let helper_directory = test_binary_parent.join("remote-helpers");
+    fs::create_dir_all(&helper_directory).unwrap();
+    let helper_path = helper_directory.join(target);
+    fs::copy(&helper_source, &helper_path).unwrap();
+    fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let base = TempDir::new().unwrap();
+    let log = base.path().join("ssh.log");
+    let runner = session_runner(&base, &log);
+    let first = runner
+        .execute(request("printf helper-first"), CancellationToken::new())
+        .await
+        .unwrap();
+    let second = runner
+        .execute(request("printf helper-second"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&first.output.stdout.head),
+        "helper-first"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&second.output.stdout.head),
+        "helper-second"
+    );
+    let log_text = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        log_text.lines().filter(|line| *line == "S").count(),
+        1,
+        "{log_text}"
+    );
+    drop(runner);
+    let _ = fs::remove_file(helper_path);
+    let _ = fs::remove_dir(&helper_directory);
 }
