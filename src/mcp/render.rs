@@ -840,6 +840,7 @@ fn error_retention_provenance(details: &ErrorDetails) -> Option<RetentionProvena
             version: shell.version.clone(),
             fallback: shell.fallback,
         },
+        helper_mode: None,
     }))
 }
 
@@ -919,6 +920,12 @@ fn with_context(context: &RemoteContext, fields: Value) -> Value {
         serde_json::to_value(present_shell(&context.shell))
             .expect("shell metadata is serializable"),
     );
+    if let Some(helper_mode) = context.helper_mode {
+        fields.insert(
+            "helper_mode".to_owned(),
+            Value::String(helper_mode.as_str().to_owned()),
+        );
+    }
     Value::Object(fields)
 }
 
@@ -1337,6 +1344,7 @@ mod tests {
                 version: None,
                 fallback: false,
             },
+            helper_mode: None,
         }
     }
 
@@ -1355,6 +1363,44 @@ mod tests {
             mtime_seconds: 1,
             mtime_nanoseconds: 2,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn helper_mode_is_rendered_in_remote_run_metadata() {
+        let (_runtime, bridge) = bridge_fixture();
+        let mut remote_context = context();
+        remote_context.helper_mode = Some(crate::ssh::HelperMode::Persistent);
+        let rendered = result_value(
+            run(
+                bridge,
+                Ok(RemoteRunResult {
+                    context: remote_context,
+                    exit_status: 0,
+                    elapsed_ms: 1,
+                    stdout: EncodedOutputPreview {
+                        head: encoded("ok"),
+                        tail: encoded("ok"),
+                        raw_bytes: 2,
+                        truncated: false,
+                    },
+                    stderr: EncodedOutputPreview {
+                        head: encoded(""),
+                        tail: encoded(""),
+                        raw_bytes: 0,
+                        truncated: false,
+                    },
+                    aggregate_bytes: 2,
+                    output_ref: None,
+                    remote_process_may_continue: false,
+                    warnings: Vec::new(),
+                }),
+                roomy_budget(),
+                CancellationToken::new(),
+            )
+            .await,
+        );
+        assert_eq!(rendered["structuredContent"]["helper_mode"], "persistent");
+        assert!(!rendered.to_string().contains("/home/"));
     }
 
     #[test]

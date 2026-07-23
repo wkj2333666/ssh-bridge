@@ -17,7 +17,7 @@ use crate::output::{
     OutputProvenance, OutputReference, StoredAggregateKind, StoredProvenance, StreamKind,
 };
 use crate::path::RemotePath;
-use crate::ssh::{FixedRunRequest, FixedRunResult, SshRunner};
+use crate::ssh::{FixedRunRequest, FixedRunResult, HelperMode, SshRunner};
 
 mod metadata;
 mod patch;
@@ -241,6 +241,7 @@ impl RemoteBridge {
                 host: provenance.host,
                 physical_root: provenance.physical_root,
                 shell: protocol::shell_selection_metadata(&provenance.shell),
+                helper_mode: Some(provenance.helper_mode),
             }),
             StoredProvenance::Aggregate { kind, source_count } => RetentionProvenance::Aggregate {
                 kind: match kind {
@@ -339,6 +340,7 @@ impl RemoteBridge {
                     host: canonical_host,
                     physical_root: capability.physical_root.clone(),
                     shell,
+                    helper_mode: context.helper_mode.unwrap_or(HelperMode::Shell),
                 })
             }
             RetentionProvenance::Aggregate { kind, source_count } => StoredProvenance::Aggregate {
@@ -740,6 +742,8 @@ pub struct RemoteContext {
     pub host: String,
     pub physical_root: String,
     pub shell: ShellMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub helper_mode: Option<HelperMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

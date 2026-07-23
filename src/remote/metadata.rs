@@ -283,6 +283,7 @@ pub(super) async fn list(
             request.host,
             result.capability.physical_root.clone(),
             &result.shell,
+            result.helper_mode,
         ),
         actual_path: encode_bytes(root),
         relative_path: encode_bytes(request.path.relative().as_bytes()),
@@ -409,6 +410,7 @@ pub(super) async fn stat(
             request.host,
             result.capability.physical_root.clone(),
             &result.shell,
+            result.helper_mode,
         ),
         entries,
     })

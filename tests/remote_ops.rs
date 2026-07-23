@@ -176,6 +176,7 @@ fn context() -> RemoteContext {
             version: None,
             fallback: false,
         },
+        helper_mode: None,
     }
 }
 

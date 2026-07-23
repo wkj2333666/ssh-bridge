@@ -133,6 +133,7 @@ pub(super) async fn read(
                 request.host.clone(),
                 result.capability.physical_root.clone(),
                 &result.shell,
+                result.helper_mode,
             ));
         }
         let attach = |error| attach_fixed_result_context(error, &request.host, &result);
@@ -262,6 +263,7 @@ mod tests {
                 version: None,
                 fallback: false,
             },
+            helper_mode: None,
         };
         let error = super::read_cancelled_error(Some(&context));
         assert_eq!(error.code, ErrorCode::Cancelled);
@@ -281,6 +283,7 @@ mod tests {
                 version: None,
                 fallback: false,
             },
+            helper_mode: None,
         };
         let error = super::super::attach_optional_remote_context(
             crate::BridgeError::new(ErrorCode::CommandTimeout, "timeout", false),

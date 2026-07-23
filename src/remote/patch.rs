@@ -1090,6 +1090,7 @@ async fn snapshot_file(
         host.to_owned(),
         result.capability.physical_root.clone(),
         &result.shell,
+        result.helper_mode,
     );
     let attach = |error| attach_fixed_result_context(error, host, &result);
     let stderr = read_small_stream(&result.output, StreamKind::Stderr, SNAPSHOT_PROTOCOL_BYTES)
@@ -1540,6 +1541,7 @@ mod tests {
                 version: None,
                 fallback: false,
             },
+            helper_mode: None,
         };
         let error = super::attach_mutation_progress_context(
             BridgeError::new(ErrorCode::Cancelled, "cancelled", false),

@@ -1031,6 +1031,7 @@ pub(super) async fn execute_preflighted_write_at_root(
                 resolved.host,
                 result.capability.physical_root.clone(),
                 &result.shell,
+                result.helper_mode,
             ),
             actual_path: encode_bytes(resolved.path.absolute().as_bytes()),
             relative_path: encode_bytes(resolved.path.relative().as_bytes()),
@@ -1120,6 +1121,7 @@ pub(super) async fn execute_preflighted_delete_at_root(
                 resolved.host,
                 result.capability.physical_root.clone(),
                 &result.shell,
+                result.helper_mode,
             ),
         )),
         DeleteProtocol::Domain(code) => Err(attach_fixed_result_context(

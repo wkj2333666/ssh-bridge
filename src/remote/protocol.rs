@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crate::capability::{ShellKind, ShellSelection};
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalCapturedOutput, StreamKind};
-use crate::ssh::FixedRunResult;
+use crate::ssh::{FixedRunResult, HelperMode};
 
 use super::{
     EncodedValue, EntryError, EntryErrorCode, RemoteContext, RemoteFileKind, ShellMetadata,
@@ -73,12 +73,14 @@ pub(super) fn context(
     host: String,
     physical_root: String,
     shell: &ShellSelection,
+    helper_mode: HelperMode,
 ) -> RemoteContext {
     RemoteContext {
         remote: true,
         host,
         physical_root,
         shell: shell_selection_metadata(shell),
+        helper_mode: Some(helper_mode),
     }
 }
 
