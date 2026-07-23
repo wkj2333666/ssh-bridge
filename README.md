@@ -71,12 +71,15 @@ The release workflow publishes Linux binaries and SHA-256 files for:
 - `armv7-unknown-linux-gnueabihf`
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
+- `riscv64gc-unknown-linux-gnu`
+- `powerpc64le-unknown-linux-gnu`
+- `s390x-unknown-linux-gnu`
 
-Each archive also contains `remote-helpers/` with static helpers for
-`x86_64`, `aarch64`, and `armv7l` Linux release packages. Other Linux
-architectures, including `riscv64`, `ppc64le`, and `s390x`, remain fully
-supported through the shell dispatcher fallback until a matching static
-helper toolchain is available.
+Each archive also contains `remote-helpers/` with helpers for all six
+supported Linux architectures: static musl helpers for `x86_64`, `aarch64`,
+and `armv7l`, plus GNU-target helpers for `riscv64`, `ppc64le`, and `s390x`.
+When a GNU helper cannot run because the remote loader or libc is incompatible,
+the bridge reports the startup fallback and uses the POSIX dispatcher.
 Keep that directory beside the bridge binary. The bridge probes `uname -s` and
 `uname -m`, uploads the matching helper once per SSH session, and automatically
 uses the POSIX dispatcher when the host or artifact is unsupported. For local

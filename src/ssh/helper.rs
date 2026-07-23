@@ -72,9 +72,9 @@ fn helper_target_for_arch(machine_arch: &str) -> Option<(&'static str, &'static 
         "x86_64" => Some(("x86_64-unknown-linux-musl", "x86_64")),
         "aarch64" => Some(("aarch64-unknown-linux-musl", "aarch64")),
         "armv7l" | "armv7" => Some(("armv7-unknown-linux-musleabihf", "armv7l")),
-        "riscv64" => Some(("riscv64gc-unknown-linux-musl", "riscv64")),
-        "ppc64le" => Some(("powerpc64le-unknown-linux-musl", "ppc64le")),
-        "s390x" => Some(("s390x-unknown-linux-musl", "s390x")),
+        "riscv64" => Some(("riscv64gc-unknown-linux-gnu", "riscv64")),
+        "ppc64le" => Some(("powerpc64le-unknown-linux-gnu", "ppc64le")),
+        "s390x" => Some(("s390x-unknown-linux-gnu", "s390x")),
         _ => None,
     }
 }
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_architectures_map_to_static_helper_targets() {
+    fn supported_architectures_map_to_helper_targets() {
         for (arch, target) in [
             ("x86_64", "x86_64-unknown-linux-musl"),
             ("aarch64", "aarch64-unknown-linux-musl"),
