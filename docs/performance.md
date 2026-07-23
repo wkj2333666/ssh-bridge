@@ -106,7 +106,7 @@ bounded by the configured quota rather than treated as an exact count.
 
 ## Rust, Bash, and SSHFS
 
-The native Rust bridge removes interpreter startup from every MCP frame and keeps validation, scheduling, cancellation, quotas, and serialization in one process. On supported Linux hosts, the static Rust helper additionally removes per-request remote shell setup, request temp files, FIFOs, and `dd`/`wc` output staging; the helper upload is paid once during cold session startup. Unsupported hosts retain the persistent shell dispatcher. Replacing the bridge with Bash would move JSON correctness, frame bounds, and concurrent process ownership into shell text without improving the dominant SSH/network latency.
+The native Rust bridge removes interpreter startup from every MCP frame and keeps validation, scheduling, cancellation, quotas, and serialization in one process. On supported Linux hosts, the Rust helper additionally removes per-request remote shell setup, request temp files, FIFOs, and `dd`/`wc` output staging; the helper upload is paid once during cold session startup. GNU helper startup can fall back to the persistent shell dispatcher when the remote loader or libc is incompatible. Replacing the bridge with Bash would move JSON correctness, frame bounds, and concurrent process ownership into shell text without improving the dominant SSH/network latency.
 
 The bridge still uses the remote Bash or POSIX sh selected by capability probing because commands must execute where the server's tools and data live. Omitted `remote_run.shell` means Bash; `sh` is an explicit retry choice after a Bash capability error. There is no hidden fallback.
 
