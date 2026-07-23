@@ -249,7 +249,7 @@ pub fn request_too_large_response() -> Value {
 }
 
 pub fn server_busy_response(id: RequestId) -> Value {
-    id_error_response(id, -32000, "Server busy")
+    id_error_response(id, -32000, "MCP task queue full")
 }
 
 fn null_id_error_response(code: i64, message: &'static str) -> Value {

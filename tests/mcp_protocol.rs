@@ -334,7 +334,7 @@ fn task7_protocol_constructors_are_fixed_and_preserve_trusted_ids() {
     );
     assert_eq!(
         server_busy_response(RequestId::try_from(json!(11)).unwrap()),
-        json!({"jsonrpc":"2.0","id":11,"error":{"code":-32000,"message":"Server busy"}})
+        json!({"jsonrpc":"2.0","id":11,"error":{"code":-32000,"message":"MCP task queue full"}})
     );
     assert_eq!(
         result_response(
@@ -488,6 +488,23 @@ fn lifecycle_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+fn control_definitions() -> Vec<ToolDefinition> {
+    let mut definitions = lifecycle_definitions();
+    definitions.push(ToolDefinition {
+        name: "remote_hosts".into(),
+        title: "remote_hosts".into(),
+        description: "return cached remote host metadata".into(),
+        input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+        annotations: ToolAnnotations {
+            read_only_hint: true,
+            destructive_hint: false,
+            idempotent_hint: true,
+            open_world_hint: false,
+        },
+    });
+    definitions
+}
+
 #[derive(Clone)]
 struct StubTools {
     definitions: Arc<Vec<ToolDefinition>>,
@@ -588,6 +605,33 @@ impl ToolService for StubTools {
             }
             unreachable!("the lifecycle owner rejects unknown names")
         })
+    }
+}
+
+struct ControlTools {
+    definitions: Arc<Vec<ToolDefinition>>,
+    stub: StubTools,
+}
+
+impl ControlTools {
+    fn new() -> Self {
+        Self {
+            definitions: Arc::new(control_definitions()),
+            stub: StubTools::new(),
+        }
+    }
+}
+
+impl ToolService for ControlTools {
+    fn definitions(&self) -> &[ToolDefinition] {
+        self.definitions.as_slice()
+    }
+
+    fn call(&self, name: String, arguments: Value, context: ToolCallContext) -> ToolFuture {
+        if name == "remote_hosts" {
+            return Box::pin(async { CallToolResult::text("cached hosts") });
+        }
+        self.stub.call(name, arguments, context)
     }
 }
 
@@ -1534,7 +1578,7 @@ async fn task7_dispatch_completes_out_of_order_and_propagates_exact_context() {
 }
 
 #[tokio::test]
-async fn task7_inflight_rejects_duplicate_before_shape_and_saturation() {
+async fn task8_duplicate_validation_precedes_task_queue_admission() {
     timeout(Duration::from_secs(5), async {
         let tools = Arc::new(StubTools::new());
         let mut session = Session::start(McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap()).await;
@@ -1545,20 +1589,20 @@ async fn task7_inflight_rejects_duplicate_before_shape_and_saturation() {
         assert_eq!(session.recv().await, json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Duplicate request id"}}));
         session.send(&json!({"jsonrpc":"2.0","id":1.0,"method":"tools/call","params":{"name":"block","arguments":{}}})).await;
         assert_eq!(session.recv().await, invalid_request_response());
-        session.send(&json!({"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"echo","arguments":{"text":"x"}}})).await;
-        let busy = session.recv().await;
-        assert_eq!(busy["id"], "1");
-        assert_eq!(busy["error"]["code"], -32000);
-        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 1);
-        tools.release.add_permits(1);
-        assert_eq!(session.recv().await["id"], 1);
+        session.send(&json!({"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"block","arguments":{}}})).await;
+        tools.wait_for_polls(2).await;
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 2);
+        tools.release.add_permits(2);
+        let first = session.recv().await["id"].clone();
+        let second = session.recv().await["id"].clone();
+        assert!(matches!((first, second), (a, b) if (a == json!(1) && b == json!("1")) || (a == json!("1") && b == json!(1))));
         assert!(session.close().await.is_ok());
     }).await.expect("test must complete");
 }
 
 #[tokio::test]
-async fn task7_inflight_id_and_permit_release_before_response_backlog() {
+async fn task8_task_registry_releases_before_response_backlog() {
     timeout(Duration::from_secs(5), async {
         let tools = Arc::new(StubTools::new());
         let mut session = Session::start_with_output_capacity(McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap(), 1).await;
@@ -1606,7 +1650,54 @@ async fn task8_runner_contention_is_not_mcp_server_busy() {
 }
 
 #[tokio::test]
-async fn task7_inflight_oversized_flood_reaps_one_completion_and_releases_id() {
+async fn task8_pending_window_returns_queue_full_only_at_local_bound() {
+    timeout(Duration::from_secs(5), async {
+        let tools = Arc::new(StubTools::new());
+        let mut session = Session::start(McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap()).await;
+        session.ready().await;
+        for id in 1..=9 {
+            session.send(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"block","arguments":{}}})).await;
+        }
+        tools.wait_for_polls(9).await;
+        session.send(&json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"echo","arguments":{"text":"queue"}}})).await;
+        assert_eq!(
+            session.recv().await,
+            json!({"jsonrpc":"2.0","id":10,"error":{"code":-32000,"message":"MCP task queue full"}})
+        );
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 9);
+        tools.release.add_permits(9);
+        for _ in 0..9 {
+            assert_eq!(session.recv().await["result"]["content"][0]["text"], "released");
+        }
+        assert!(session.close().await.is_ok());
+    }).await.expect("test must complete");
+}
+
+#[tokio::test]
+async fn task8_remote_hosts_control_lane_survives_full_remote_task_window() {
+    timeout(Duration::from_secs(5), async {
+        let tools = Arc::new(ControlTools::new());
+        let mut session = Session::start(McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 1).unwrap()).await;
+        session.ready().await;
+        for id in 1..=9 {
+            session.send(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"block","arguments":{}}})).await;
+        }
+        tools.stub.wait_for_polls(9).await;
+        session.send(&json!({"jsonrpc":"2.0","id":"hosts","method":"tools/call","params":{"name":"remote_hosts","arguments":{}}})).await;
+        let hosts = session.recv().await;
+        assert_eq!(hosts["id"], "hosts");
+        assert_eq!(hosts["result"]["content"][0]["text"], "cached hosts");
+        assert_eq!(tools.stub.synchronous_calls.load(Ordering::SeqCst), 9);
+        tools.stub.release.add_permits(9);
+        for _ in 0..9 {
+            assert_eq!(session.recv().await["result"]["content"][0]["text"], "released");
+        }
+        assert!(session.close().await.is_ok());
+    }).await.expect("test must complete");
+}
+
+#[tokio::test]
+async fn task8_task_registry_oversized_flood_reaps_one_completion_and_releases_id() {
     timeout(Duration::from_secs(5), async {
         let tools = Arc::new(StubTools::new());
         let mut session = Session::start_with_capacities(
@@ -1639,7 +1730,7 @@ async fn task7_inflight_oversized_flood_reaps_one_completion_and_releases_id() {
                 saw_second = true;
             }
         }
-        assert!(saw_second, "the completed ID and permit must be reusable");
+        assert!(saw_second, "the completed ID and task capacity must be reusable");
         assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 2);
         assert!(session.close().await.is_ok());
     })
@@ -1767,7 +1858,7 @@ async fn task7_cancellation_buffered_frame_wins_over_ready_completion() {
         session.ready().await;
         session.send(&json!({"jsonrpc":"2.0","id":"race","method":"tools/call","params":{"name":"block","arguments":{}}})).await;
         tools.wait_for_polls(1).await;
-        // On the current-thread runtime the buffered frame and durable permit
+        // On the current-thread runtime the buffered frame and durable task
         // are both ready before the owner is scheduled again.
         session.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"race"}})).await;
         tools.release.add_permits(1);
@@ -2393,7 +2484,7 @@ async fn run_closing_matrix_case(source: ClosingSource, active_kind: ClosingActi
             .await
             .unwrap();
             writer_state.wait_until_blocked().await;
-            for id in 101..=109 {
+            for id in 101..=117 {
                 send_closing_frame(
                     &mut input,
                     json!({"jsonrpc":"2.0","id":id,"method":"ping","params":{}}),
@@ -2407,14 +2498,13 @@ async fn run_closing_matrix_case(source: ClosingSource, active_kind: ClosingActi
             )
             .await
             .unwrap();
+            let _ = send_closing_frame(
+                &mut input,
+                json!({"jsonrpc":"2.0","id":118,"method":"ping","params":{}}),
+            )
+            .await;
             if active_kind == ClosingActiveKind::AlreadyReady {
                 task_state.gate.add_permits(1);
-            } else {
-                let _ = send_closing_frame(
-                    &mut input,
-                    json!({"jsonrpc":"2.0","id":110,"method":"ping","params":{}}),
-                )
-                .await;
             }
         }
         ClosingSource::WriterWriteZero | ClosingSource::WriterPanic => {

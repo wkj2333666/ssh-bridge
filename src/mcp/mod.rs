@@ -19,7 +19,7 @@ use crate::error::{BridgeError, BridgeResult};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 
 const MCP_TASK_CLEANUP_GRACE: Duration = Duration::from_millis(250);
@@ -61,7 +61,6 @@ struct BorrowedCallResponse<'a> {
 struct InFlight {
     cancel: tokio_util::sync::CancellationToken,
     cancelled_by_client: bool,
-    _permit: OwnedSemaphorePermit,
 }
 
 struct CompletedCall {
@@ -79,8 +78,15 @@ enum OwnerEvent {
 pub struct McpServer<S> {
     service: Arc<S>,
     max_frame_bytes: usize,
-    max_inflight: usize,
+    max_pending: usize,
     compact_fallback_result_bytes: usize,
+}
+
+const MCP_PENDING_WINDOW_EXTRA: usize = 8;
+const CONTROL_TOOL_REMOTE_HOSTS: &str = "remote_hosts";
+
+fn is_control_tool(name: &str) -> bool {
+    name == CONTROL_TOOL_REMOTE_HOSTS
 }
 
 impl<S: ToolService> McpServer<S> {
@@ -102,10 +108,13 @@ impl<S: ToolService> McpServer<S> {
                 "MCP in-flight bound is invalid",
             ));
         }
+        let max_pending = max_inflight
+            .checked_add(MCP_PENDING_WINDOW_EXTRA)
+            .ok_or_else(|| BridgeError::invalid_argument("MCP pending bound is invalid"))?;
         Ok(Self {
             service,
             max_frame_bytes,
-            max_inflight,
+            max_pending,
             compact_fallback_result_bytes,
         })
     }
@@ -115,7 +124,7 @@ impl<S: ToolService> McpServer<S> {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let channel_capacity = self.max_inflight + 8;
+        let channel_capacity = self.max_pending + MCP_PENDING_WINDOW_EXTRA;
         let (sender, receiver) = mpsc::channel(channel_capacity);
         let suppress_call_responses = Arc::new(AtomicBool::new(false));
         let writer_suppression = Arc::clone(&suppress_call_responses);
@@ -126,7 +135,6 @@ impl<S: ToolService> McpServer<S> {
         let mut frames = FrameReader::new(BufReader::new(reader), self.max_frame_bytes);
         let mut state = ProtocolState::AwaitInitialize;
         let mut shape = None;
-        let permits = Arc::new(Semaphore::new(self.max_inflight));
         let mut active = HashMap::<RequestId, InFlight>::new();
         let mut task_ids = HashMap::<Id, RequestId>::new();
         let mut join_set = JoinSet::<CompletedCall>::new();
@@ -185,7 +193,6 @@ impl<S: ToolService> McpServer<S> {
                         &frame,
                         &mut state,
                         &mut shape,
-                        &permits,
                         &mut active,
                         &mut task_ids,
                         &mut join_set,
@@ -308,7 +315,6 @@ impl<S: ToolService> McpServer<S> {
         frame: &[u8],
         state: &mut ProtocolState,
         negotiated_shape: &mut Option<ProtocolShape>,
-        permits: &Arc<Semaphore>,
         active: &mut HashMap<RequestId, InFlight>,
         task_ids: &mut HashMap<Id, RequestId>,
         join_set: &mut JoinSet<CompletedCall>,
@@ -444,9 +450,9 @@ impl<S: ToolService> McpServer<S> {
                 {
                     return Some(invalid_params_response(id));
                 }
-                let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+                if !is_control_tool(name) && active.len() >= self.max_pending {
                     return Some(server_busy_response(id));
-                };
+                }
                 let Some(wire_budget) = WireBudget::for_response(
                     self.max_frame_bytes,
                     &id,
@@ -464,7 +470,6 @@ impl<S: ToolService> McpServer<S> {
                     InFlight {
                         cancel,
                         cancelled_by_client: false,
-                        _permit: permit,
                     },
                 );
                 let name = name.to_owned();
@@ -527,6 +532,8 @@ fn process_completion(
             if associated_id != completed.id {
                 return Err(());
             }
+            // Removing the registry entry is the task-capacity release point;
+            // the writer loop must not control admission.
             let Some(inflight) = active.remove(&completed.id) else {
                 return Err(());
             };

@@ -46,6 +46,8 @@ async fn main() {
 async fn run_mcp() -> BridgeResult<()> {
     let loaded = Config::load_default()?;
     let max_frame_bytes = loaded.config.limits.max_frame_bytes;
+    // McpServer uses this remote concurrency value to derive its bounded
+    // pending-task window; runner capacity remains the execution limiter.
     let max_inflight = loaded.config.limits.global_concurrency;
     let global_spool_quota_bytes = loaded.config.limits.global_spool_quota_bytes;
     let retention_serialization_jobs = loaded.config.limits.retention_serialization_jobs;
