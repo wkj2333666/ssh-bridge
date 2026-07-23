@@ -1586,23 +1586,21 @@ async fn task7_inflight_id_and_permit_release_before_response_backlog() {
 }
 
 #[tokio::test]
-async fn task7_inflight_third_unique_known_call_is_busy_at_bound_two() {
+async fn task8_runner_contention_is_not_mcp_server_busy() {
     timeout(Duration::from_secs(5), async {
         let tools = Arc::new(StubTools::new());
         let mut session = Session::start(McpServer::new(Arc::clone(&tools), MIN_MCP_FRAME_BYTES, 2).unwrap()).await;
         session.ready().await;
-        for id in [1, 2] {
+        for id in [1, 2, 3] {
             session.send(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"block","arguments":{}}})).await;
         }
-        tools.wait_for_polls(2).await;
-        session.send(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"busy"}}})).await;
-        assert_eq!(session.recv().await, json!({"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"Server busy"}}));
-        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 2);
-        tools.release.add_permits(2);
-        let first = session.recv().await["id"].clone();
-        let second = session.recv().await["id"].clone();
-        assert!(matches!((first.as_i64(), second.as_i64()), (Some(1), Some(2)) | (Some(2), Some(1))));
+        tools.wait_for_polls(3).await;
+        assert_eq!(tools.synchronous_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(tools.first_polls.load(Ordering::SeqCst), 3);
+        tools.release.add_permits(3);
+        let mut ids = [session.recv().await["id"].clone(), session.recv().await["id"].clone(), session.recv().await["id"].clone()];
+        ids.sort_by_key(Value::to_string);
+        assert_eq!(ids, [json!(1), json!(2), json!(3)]);
         assert!(session.close().await.is_ok());
     }).await.expect("test must complete");
 }
