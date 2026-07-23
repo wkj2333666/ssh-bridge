@@ -67,6 +67,23 @@ measurements across the actual network to a target server.
 | Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
 | Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 
+The release helper profile below was measured locally on 2026-07-23 (not on the
+Raspberry Pi measurement host above) with eight cold process starts and 32
+requests in one warm process. Values are p50 / p95:
+
+| Direct remote executor | Observed |
+|---|---:|
+| Rust helper cold startup | 835 µs / 1.47 ms |
+| POSIX shell dispatcher cold startup | 7.12 ms / 10.62 ms |
+| Rust helper warm request | 1.57 ms / 2.25 ms |
+| POSIX shell dispatcher warm request | 52.56 ms / 61.87 ms |
+
+This isolates process and protocol overhead only; it excludes SSH handshake,
+network latency, capability probing, and remote command work. Reproduce it with
+`CODEX_SSH_BRIDGE_PROFILE=1 cargo test --release --features profile --test
+performance_acceptance task12_release_helper_and_shell_cold_warm_profile --
+--nocapture`.
+
 The complete fake-SSH p95 includes the bounded remote command process and output capture. The first request for an alias pays local identity resolution, capability probing, and SSH session startup; warm commands reuse one persistent dispatcher session and send one request frame, so they do not pay another SSH handshake, `ssh -G`, or root observation. Capability root metadata is connection-time diagnostic context, not a warm authorization round trip. The five-host test demonstrates absence of cross-host head-of-line blocking at the stated concurrency, not capacity beyond configured limits.
 
 MCP admission and remote execution are separate measurements. The bridge admits at most `global_concurrency + 8` ordinary tasks; tasks beyond the configured global or per-host runner slots wait cancellably in local Rust state. Queue bookkeeping is not evidence of SSH latency, and `MCP task queue full` means only that this bounded local window is exhausted. Warm latency measurements should report local queue wait, persistent-session transport, and remote command time separately.

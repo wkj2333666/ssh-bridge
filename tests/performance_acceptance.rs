@@ -317,6 +317,28 @@ fn task12_release_helper_and_shell_cold_warm_profile() {
         close_profile_child(child, writer);
     }
 
+    let mut shell = Command::new("/bin/sh")
+        .args(["-c", &dispatcher, "--", "codex-ssh-dispatcher-1", "65536"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut shell_writer = shell.stdin.take().unwrap();
+    let mut shell_reader = BufReader::new(shell.stdout.take().unwrap());
+    assert_eq!(
+        read_frame(&mut shell_reader, 65536).unwrap().unwrap().kind,
+        FrameKind::HelloAck
+    );
+    let mut shell_warm = Vec::new();
+    for request_id in 1..=32 {
+        let started = Instant::now();
+        send_profile_request(&mut shell_writer, request_id);
+        wait_profile_exit(&mut shell_reader, request_id);
+        shell_warm.push(started.elapsed());
+    }
+    close_profile_child(shell, shell_writer);
+
     let mut helper = Command::new(&helper_path)
         .args(["--max-frame", "65536"])
         .stdin(std::process::Stdio::piped())
@@ -338,9 +360,10 @@ fn task12_release_helper_and_shell_cold_warm_profile() {
 
     let (helper_cold_p50, helper_cold_p95, _) = short_duration_percentiles(&mut helper_cold);
     let (shell_cold_p50, shell_cold_p95, _) = short_duration_percentiles(&mut shell_cold);
+    let (shell_warm_p50, shell_warm_p95, _) = short_duration_percentiles(&mut shell_warm);
     let (helper_warm_p50, helper_warm_p95, _) = short_duration_percentiles(&mut helper_warm);
     eprintln!(
-        "Task12 helper/shell cold/warm: helper_cold={helper_cold_p50:?}/{helper_cold_p95:?}, shell_cold={shell_cold_p50:?}/{shell_cold_p95:?}, helper_warm={helper_warm_p50:?}/{helper_warm_p95:?}"
+        "Task12 helper/shell cold/warm: helper_cold={helper_cold_p50:?}/{helper_cold_p95:?}, shell_cold={shell_cold_p50:?}/{shell_cold_p95:?}, helper_warm={helper_warm_p50:?}/{helper_warm_p95:?}, shell_warm={shell_warm_p50:?}/{shell_warm_p95:?}"
     );
 }
 
