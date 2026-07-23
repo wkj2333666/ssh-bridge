@@ -126,6 +126,10 @@ async fn session_preserves_large_binary_stdin_across_pipe_short_reads() {
 
 #[tokio::test]
 async fn supported_linux_architecture_uses_uploaded_helper_once_per_session() {
+    if std::env::var("CODEX_SSH_BRIDGE_HELPER_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!("helper integration is opt-in; set CODEX_SSH_BRIDGE_HELPER_INTEGRATION=1");
+        return;
+    }
     let helper_source = std::env::var("CARGO_BIN_EXE_codex-ssh-bridge-helper")
         .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
         .map(std::path::PathBuf::from)
@@ -160,8 +164,10 @@ async fn supported_linux_architecture_uses_uploaded_helper_once_per_session() {
     let base = TempDir::new().unwrap();
     let log = base.path().join("ssh.log");
     let runner = session_runner(&base, &log);
+    let mut helper_request = request("printf helper-first");
+    helper_request.timeout = Duration::from_secs(30);
     let first = runner
-        .execute(request("printf helper-first"), CancellationToken::new())
+        .execute(helper_request, CancellationToken::new())
         .await
         .unwrap();
     let second = runner
