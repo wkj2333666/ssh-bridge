@@ -5,6 +5,7 @@ pub mod error;
 pub mod mcp;
 pub mod output;
 pub mod path;
+pub mod profile;
 pub mod quote;
 pub mod remote;
 pub mod ssh;

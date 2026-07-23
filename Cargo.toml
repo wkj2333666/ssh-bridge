@@ -4,6 +4,10 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.91.1"
 
+[features]
+default = []
+profile = []
+
 [dependencies]
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
