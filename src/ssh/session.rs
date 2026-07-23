@@ -321,6 +321,16 @@ impl HostSession {
                 bytes: None,
             })
         });
+        let helper_probe_profile = matches!(start, ConnectionStart::Persistent { .. }).then(|| {
+            crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                phase: "helper_install_probe",
+                host: Some(host.as_str()),
+                request_id: None,
+                class: Some("cold"),
+                elapsed_us: 0,
+                bytes: None,
+            })
+        });
         match &start {
             ConnectionStart::Persistent { bytes, .. } => {
                 let status = tokio::select! {
@@ -351,16 +361,38 @@ impl HostSession {
                         }
                     }
                 };
+                drop(helper_probe_profile);
                 if status == BootstrapStatus::Need {
+                    let helper_upload_profile =
+                        crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                            phase: "helper_install_upload",
+                            host: Some(host.as_str()),
+                            request_id: None,
+                            class: Some("cold"),
+                            elapsed_us: 0,
+                            bytes: Some(bytes.len() as u64),
+                        });
                     write_helper_bytes(&mut child, &host, bytes).await?;
+                    drop(helper_upload_profile);
                 }
             }
             ConnectionStart::Temporary { bytes, .. } => {
+                drop(helper_probe_profile);
                 write_helper_bytes(&mut child, &host, bytes).await?;
             }
-            ConnectionStart::Shell => {}
+            ConnectionStart::Shell => drop(helper_probe_profile),
         }
         drop(helper_bootstrap_profile);
+        let helper_handshake_profile = (!matches!(start, ConnectionStart::Shell)).then(|| {
+            crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                phase: "helper_handshake",
+                host: Some(host.as_str()),
+                request_id: None,
+                class: Some("cold"),
+                elapsed_us: 0,
+                bytes: None,
+            })
+        });
         let hello = tokio::select! {
             biased;
             () = cancel.cancelled() => {
@@ -388,6 +420,7 @@ impl HostSession {
                 }
             }
         };
+        drop(helper_handshake_profile);
         if hello.kind == FrameKind::Error {
             let _ = child.kill().await;
             let _ = child.wait().await;

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::hint::black_box;
 use std::io::{BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +46,8 @@ struct FakeFixture {
     _runtime_base: TempDir,
     tools: RemoteMcpTools,
     log: std::path::PathBuf,
+    install_log: PathBuf,
+    helper_bytes_log: PathBuf,
 }
 
 fn fake_fixture(hosts: &[&str], environment: &[(&str, OsString)]) -> FakeFixture {
@@ -84,10 +88,70 @@ fn fake_fixture(hosts: &[&str], environment: &[(&str, OsString)]) -> FakeFixture
         .unwrap(),
     );
     let bridge = Arc::new(RemoteBridge::new(runner));
+    let install_log = runtime_base.path().join("install.log");
+    let helper_bytes_log = runtime_base.path().join("helper-bytes.log");
     FakeFixture {
         _runtime_base: runtime_base,
         tools: RemoteMcpTools::new(bridge),
         log,
+        install_log,
+        helper_bytes_log,
+    }
+}
+
+fn persistent_fake_fixture(remote_home: &Path) -> FakeFixture {
+    let runtime_base = TempDir::new().unwrap();
+    let runtime = RuntimePaths::ensure_from_base(runtime_base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let mut config = Config::default();
+    config.limits.global_concurrency = 8;
+    config.limits.per_host_concurrency = 2;
+    config.hosts.insert(
+        "dev".to_owned(),
+        codex_ssh_bridge::config::HostProfile {
+            root: "/tmp".to_owned(),
+            description: None,
+            read_only: false,
+            limits: HostLimitOverrides::default(),
+        },
+    );
+    let log = runtime_base.path().join("ssh.log");
+    let install_log = runtime_base.path().join("install.log");
+    let helper_bytes_log = runtime_base.path().join("helper-bytes.log");
+    let fixed_environment = BTreeMap::from([
+        (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("local-fixed"),
+        ),
+        (OsString::from("FAKE_SSH_ROOT"), OsString::from("/tmp")),
+        (OsString::from("FAKE_SSH_SHELL"), OsString::from("sh")),
+        (
+            OsString::from("FAKE_SSH_INSTALL_LOG"),
+            install_log.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("FAKE_SSH_HELPER_BYTES_LOG"),
+            helper_bytes_log.as_os_str().to_owned(),
+        ),
+        (OsString::from("HOME"), remote_home.as_os_str().to_owned()),
+    ]);
+    let runner = Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config),
+            runtime,
+            store,
+            support::fake_ssh_path(),
+            fixed_environment,
+        )
+        .unwrap(),
+    );
+    FakeFixture {
+        _runtime_base: runtime_base,
+        tools: RemoteMcpTools::new(Arc::new(RemoteBridge::new(runner))),
+        log,
+        install_log,
+        helper_bytes_log,
     }
 }
 
@@ -246,6 +310,141 @@ fn wait_profile_exit(reader: &mut BufReader<impl std::io::Read>, request_id: u64
             return;
         }
     }
+}
+
+fn install_release_helper_fixture() -> Option<PathBuf> {
+    let source = helper_release_path();
+    if !source.is_file() {
+        return None;
+    }
+    let target_name = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-musl",
+        "aarch64" => "aarch64-unknown-linux-musl",
+        "arm" => "armv7-unknown-linux-musleabihf",
+        _ => return None,
+    };
+    let directory = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("remote-helpers");
+    std::fs::create_dir_all(&directory).ok()?;
+    let target = directory.join(target_name);
+    std::fs::copy(source, &target).ok()?;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).ok()?;
+    Some(target)
+}
+
+fn recorded_lines(path: &Path) -> Vec<u64> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.parse().ok())
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task12_release_persistent_helper_cold_reuse_warm_profile() {
+    if cfg!(debug_assertions) {
+        eprintln!("Task12 persistent helper profile is release-only");
+        return;
+    }
+    let Some(helper_path) = install_release_helper_fixture() else {
+        eprintln!("Task12 persistent helper profile skipped: release helper unavailable");
+        return;
+    };
+
+    let mut install_samples = Vec::new();
+    for _ in 0..3 {
+        let remote_home = TempDir::new().unwrap();
+        let fixture = persistent_fake_fixture(remote_home.path());
+        let started = Instant::now();
+        let result = call_json(
+            &fixture.tools,
+            "remote_run",
+            json!({"host":"dev","command":"printf install","shell":"sh"}),
+        )
+        .await;
+        assert_eq!(result["isError"], Value::Null, "{result}");
+        install_samples.push(started.elapsed());
+        assert!(
+            recorded_lines(&fixture.helper_bytes_log)
+                .first()
+                .is_some_and(|n| *n > 0)
+        );
+    }
+
+    let remote_home = TempDir::new().unwrap();
+    let first = persistent_fake_fixture(remote_home.path());
+    let started = Instant::now();
+    let result = call_json(
+        &first.tools,
+        "remote_run",
+        json!({"host":"dev","command":"printf first","shell":"sh"}),
+    )
+    .await;
+    assert_eq!(result["isError"], Value::Null, "{result}");
+    let install_cold = started.elapsed();
+    drop(first);
+
+    let reuse = persistent_fake_fixture(remote_home.path());
+    let started = Instant::now();
+    let result = call_json(
+        &reuse.tools,
+        "remote_run",
+        json!({"host":"dev","command":"printf reuse","shell":"sh"}),
+    )
+    .await;
+    assert_eq!(result["isError"], Value::Null, "{result}");
+    let reuse_cold = started.elapsed();
+    assert_eq!(
+        std::fs::read_to_string(&reuse.install_log).unwrap(),
+        "HIT\n"
+    );
+    assert_eq!(recorded_lines(&reuse.helper_bytes_log), vec![0]);
+
+    let mut persistent_warm = Vec::new();
+    for _ in 0..32 {
+        let started = Instant::now();
+        let result = call_json(
+            &reuse.tools,
+            "remote_run",
+            json!({"host":"dev","command":"printf warm","shell":"sh"}),
+        )
+        .await;
+        assert_eq!(result["isError"], Value::Null, "{result}");
+        persistent_warm.push(started.elapsed());
+    }
+    assert_eq!(recorded_lines(&reuse.helper_bytes_log), vec![0]);
+
+    let shell = fake_fixture(
+        &["dev"],
+        &[
+            ("FAKE_SSH_MODE", OsString::from("streams")),
+            ("FAKE_SSH_STDOUT", OsString::from("shell-warm")),
+            ("FAKE_SSH_STDERR", OsString::new()),
+        ],
+    );
+    let mut shell_warm = Vec::new();
+    for _ in 0..32 {
+        let started = Instant::now();
+        let result = call_json(
+            &shell.tools,
+            "remote_run",
+            json!({"host":"dev","command":":","shell":"sh"}),
+        )
+        .await;
+        assert_eq!(result["isError"], Value::Null, "{result}");
+        shell_warm.push(started.elapsed());
+    }
+    let (install_p50, install_p95, _) = short_duration_percentiles(&mut install_samples);
+    let mut reuse_samples = [reuse_cold];
+    let (reuse_p50, reuse_p95, _) = short_duration_percentiles(&mut reuse_samples);
+    let (persistent_p50, persistent_p95, _) = short_duration_percentiles(&mut persistent_warm);
+    let (shell_p50, shell_p95, _) = short_duration_percentiles(&mut shell_warm);
+    eprintln!(
+        "Task12 persistent profile: persistent_install_cold={install_p50:?}/{install_p95:?} first_install={install_cold:?} persistent_reuse_cold={reuse_p50:?}/{reuse_p95:?} persistent_warm={persistent_p50:?}/{persistent_p95:?} shell_warm={shell_p50:?}/{shell_p95:?} warm_persistent_upload_bytes=0"
+    );
+    let _ = std::fs::remove_file(helper_path);
 }
 
 fn close_profile_child(mut child: std::process::Child, mut writer: impl Write) {

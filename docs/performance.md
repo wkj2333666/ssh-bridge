@@ -22,7 +22,9 @@ cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture
 cargo test --release --test performance_acceptance -- --nocapture
+cargo test --release --test performance_acceptance task12_release_persistent_helper_cold_reuse_warm_profile -- --nocapture
 env CODEX_SSH_BRIDGE_PROFILE=1 cargo test --release --features profile --test performance_acceptance task12_release_helper_and_shell_cold_warm_profile -- --nocapture
+env CODEX_SSH_BRIDGE_PROFILE=1 cargo test --release --features profile --test performance_acceptance task12_release_persistent_helper_cold_reuse_warm_profile -- --nocapture 2>persistent-profile.jsonl
 CODEX_SSH_BRIDGE_HELPER_INTEGRATION=1 cargo test --test session supported_linux_architecture_uses_uploaded_helper_once_per_session -- --nocapture
 CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
@@ -42,9 +44,13 @@ CODEX_SSH_BRIDGE_PROFILE=1 \
 The normal release build does not include the profile feature or emit profile
 events. Events contain only phase, host alias, request id, cold/warm class,
 elapsed microseconds, and byte counts; credentials, commands, paths, and
-remote output are never recorded. The cold sample includes local policy and
-capability setup plus the first SSH session; the warm sample reuses the
-persistent session. Preparation, session, and capture spans intentionally
+remote output are never recorded. Persistent cold setup additionally emits
+`helper_install_probe`, `helper_install_upload` (only for a first install), and
+`helper_handshake`. A persistent-file cold reuse emits the probe and handshake
+but no upload; warm requests emit none of the `helper_install_*` phases. The
+cold sample includes local policy and capability setup plus the first SSH
+session; the warm sample reuses the persistent session. Preparation, session,
+and capture spans intentionally
 overlap while the remote process and output drains run concurrently, so their
 durations must not be added together. GitHub CI stores the profile and RSS
 logs as a diagnostic artifact, but its timings are not a substitute for

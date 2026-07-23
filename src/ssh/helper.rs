@@ -88,6 +88,11 @@ record_status() {
         printf '%s\n' "$1" >>"$FAKE_SSH_INSTALL_LOG"
     fi
 }
+record_bytes() {
+    if [ -n "${FAKE_SSH_HELPER_BYTES_LOG-}" ]; then
+        printf '%s\n' "$1" >>"$FAKE_SSH_HELPER_BYTES_LOG"
+    fi
+}
 mkdir -p "$target_root" 2>/dev/null || exit 74
 for directory in "$root" "$data_root" "$bridge_root" "$helpers_root" "$version_root" "$target_root"; do
     [ -d "$directory" ] || exit 74
@@ -125,6 +130,7 @@ stale_lock() {
 wait_count=0
 while ! mkdir "$lock" 2>/dev/null; do
     if valid_helper; then
+        record_bytes 0
         record_status HIT
         printf '%s\n' 'CXSB-INSTALL-1 HIT'
         exec "$helper" --max-frame "$max_frame"
@@ -142,6 +148,7 @@ if valid_helper; then
     rm -f -- "$lock/pid" 2>/dev/null || exit 74
     rmdir "$lock" 2>/dev/null || exit 74
     lock_owned=0
+    record_bytes 0
     record_status HIT
     printf '%s\n' 'CXSB-INSTALL-1 HIT'
     exec "$helper" --max-frame "$max_frame"
@@ -162,6 +169,7 @@ while [ "$read_bytes" -lt "$helper_length" ]; do
     read_bytes=$now
 done
 [ "$read_bytes" -eq "$helper_length" ] || exit 74
+record_bytes "$read_bytes"
 digest=$(sha256sum "$temporary" 2>/dev/null) || exit 74
 digest=${digest%% *}
 [ "$digest" = "$helper_sha256" ] || exit 74
