@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedOperationKind, FixedRunRequest, RootIdentity, RootedPathInputs};
+use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs};
 
 use super::protocol::{context, nul_fields, parse_u64, read_small_stream, utf8};
 use super::{
@@ -1041,9 +1041,8 @@ async fn snapshot_file(
     host: &str,
     resolved: &ResolvedFilePatch,
     maximum_bytes: usize,
-    expected_root: Option<RootIdentity>,
     cancel: CancellationToken,
-) -> BridgeResult<(FileSnapshot, RemoteContext, RootIdentity)> {
+) -> BridgeResult<(FileSnapshot, RemoteContext)> {
     let limits = bridge.runner.config().host(host)?.limits;
     let desired_stdout_limit = u64::try_from(maximum_bytes)
         .ok()
@@ -1077,7 +1076,6 @@ async fn snapshot_file(
                     argument_indices: &[0],
                     stdin_nul_paths: false,
                 },
-                expected_root,
                 required_capabilities: &["safe_write"],
                 stdout_limit,
                 stderr_limit: SNAPSHOT_CAPTURE_METADATA_BYTES as u64,
@@ -1116,7 +1114,7 @@ async fn snapshot_file(
         .map_err(&attach)?;
     let snapshot = parse_snapshot_protocol(&stderr, stdout, snapshot_maximum).map_err(&attach)?;
     drop(owner);
-    Ok((snapshot, operation_context, result.root_identity.clone()))
+    Ok((snapshot, operation_context))
 }
 
 fn snapshot_runner_error(mut error: BridgeError) -> BridgeError {
@@ -1312,7 +1310,6 @@ pub(super) async fn apply_patch(
     let mut snapshots = Vec::with_capacity(resolved.len());
     let mut remaining_base_bytes = maximum_bytes;
     let mut operation_context: Option<RemoteContext> = None;
-    let mut operation_root: Option<RootIdentity> = None;
     for file in &resolved {
         if cancel.is_cancelled() {
             let error = attach_preparation_progress(
@@ -1325,24 +1322,17 @@ pub(super) async fn apply_patch(
                 None => error,
             });
         }
-        let (snapshot, snapshot_context, snapshot_root) = snapshot_file(
-            bridge,
-            &host,
-            file,
-            remaining_base_bytes,
-            operation_root.clone(),
-            cancel.clone(),
-        )
-        .await
-        .map_err(|error| {
-            attach_optional_remote_context(
-                attach_preparation_progress(error, Some(&file.patch.path), &all_paths),
-                operation_context.as_ref(),
-            )
-        })?;
+        let (snapshot, snapshot_context) =
+            snapshot_file(bridge, &host, file, remaining_base_bytes, cancel.clone())
+                .await
+                .map_err(|error| {
+                    attach_optional_remote_context(
+                        attach_preparation_progress(error, Some(&file.patch.path), &all_paths),
+                        operation_context.as_ref(),
+                    )
+                })?;
         if let Some(context) = &operation_context
-            && (context.host != snapshot_context.host
-                || operation_root.as_ref() != Some(&snapshot_root))
+            && context.host != snapshot_context.host
         {
             return Err(attach_remote_context(
                 attach_preparation_progress(
@@ -1370,7 +1360,6 @@ pub(super) async fn apply_patch(
         }
         if operation_context.is_none() {
             operation_context = Some(snapshot_context);
-            operation_root = Some(snapshot_root);
         }
         snapshots.push(snapshot);
     }
@@ -1382,7 +1371,6 @@ pub(super) async fn apply_patch(
             &all_paths,
         )
     })?;
-    let operation_root = operation_root.expect("patch context always has a root identity");
     let attach_after_snapshots = |error, failed_path: Option<String>| {
         attach_remote_context(
             attach_preparation_progress(error, failed_path.as_deref(), &all_paths),
@@ -1471,35 +1459,18 @@ pub(super) async fn apply_patch(
             ));
         }
         let result = match prepared {
-            PreparedMutation::Write(resolved) => super::write::execute_preflighted_write_at_root(
-                bridge,
-                *resolved,
-                Some(operation_root.clone()),
-                cancel.clone(),
-            )
-            .await
-            .map(|result| result.context),
-            PreparedMutation::Delete(resolved) => super::write::execute_preflighted_delete_at_root(
-                bridge,
-                *resolved,
-                Some(operation_root.clone()),
-                cancel.clone(),
-            )
-            .await
-            .map(|(_result, context)| context),
+            PreparedMutation::Write(resolved) => {
+                super::write::execute_preflighted_write_at_root(bridge, *resolved, cancel.clone())
+                    .await
+                    .map(|result| result.context)
+            }
+            PreparedMutation::Delete(resolved) => {
+                super::write::execute_preflighted_delete_at_root(bridge, *resolved, cancel.clone())
+                    .await
+                    .map(|(_result, context)| context)
+            }
         };
         match result {
-            Ok(context)
-                if context.host != operation_context.host
-                    || context.physical_root != operation_context.physical_root =>
-            {
-                return Err(attach_mutation_progress_context(
-                    BridgeError::mutation_outcome_unknown(),
-                    index,
-                    &all_paths,
-                    &context,
-                ));
-            }
             Ok(_) => changed_paths.push(all_paths[index].clone()),
             Err(error) => {
                 return Err(attach_mutation_progress_context(

@@ -17,11 +17,6 @@ pub(crate) struct PreparedShellWord<'a> {
     length: usize,
 }
 
-pub(crate) struct PreparedShellWordParts<'a, const N: usize> {
-    values: [&'a str; N],
-    length: usize,
-}
-
 impl<'a> PreparedShellWord<'a> {
     pub(crate) fn new(value: &'a str) -> BridgeResult<Self> {
         Ok(Self {
@@ -39,43 +34,6 @@ impl<'a> PreparedShellWord<'a> {
             return Err(quote_too_large());
         }
         push_prevalidated_shell_word(encoded, self.value);
-        Ok(())
-    }
-}
-
-impl<'a, const N: usize> PreparedShellWordParts<'a, N> {
-    pub(crate) fn new(values: [&'a str; N]) -> BridgeResult<Self> {
-        let (value_length, quote_count) =
-            values
-                .iter()
-                .try_fold((0usize, 0usize), |(value_length, quote_count), value| {
-                    let (next_length, next_quotes) = checked_shell_value_stats(value)?;
-                    Ok::<_, BridgeError>((
-                        value_length
-                            .checked_add(next_length)
-                            .ok_or_else(quote_too_large)?,
-                        quote_count
-                            .checked_add(next_quotes)
-                            .ok_or_else(quote_too_large)?,
-                    ))
-                })?;
-        let length = checked_shell_word_len_from_stats(value_length, quote_count)?;
-        Ok(Self { values, length })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.length
-    }
-
-    pub(crate) fn push_to(&self, encoded: &mut String) -> BridgeResult<()> {
-        if encoded.capacity().saturating_sub(encoded.len()) < self.length {
-            return Err(quote_too_large());
-        }
-        encoded.push('\'');
-        for value in self.values {
-            push_prevalidated_shell_value(encoded, value);
-        }
-        encoded.push('\'');
         Ok(())
     }
 }
@@ -148,7 +106,7 @@ pub fn fixed_command(script: &str, args: &[&str]) -> BridgeResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedShellWord, PreparedShellWordParts, shell_word};
+    use super::{PreparedShellWord, shell_word};
 
     #[test]
     fn task78_shell_word_exact_length_and_bounded_append_match_the_public_encoder() {
@@ -169,15 +127,5 @@ mod tests {
             }
         }
         assert!(PreparedShellWord::new("bad\0word").is_err());
-    }
-
-    #[test]
-    fn segmented_shell_word_matches_quoting_the_concatenated_value() {
-        let expected = shell_word("prefix'payload\nsuffix").unwrap();
-        let word = PreparedShellWordParts::new(["prefix'", "payload\n", "suffix"]).unwrap();
-        assert_eq!(word.len(), expected.len());
-        let mut rendered = String::with_capacity(word.len());
-        word.push_to(&mut rendered).unwrap();
-        assert_eq!(rendered, expected);
     }
 }

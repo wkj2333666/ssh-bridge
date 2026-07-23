@@ -629,23 +629,21 @@ async fn real_localhost_sshd_covers_transport_shell_files_mutation_and_cancellat
     assert_eq!(explicit_sh.context.shell.kind, ShellName::Sh);
     assert!(!explicit_sh.context.shell.fallback);
     assert_eq!(utf8(&explicit_sh.stdout.head), "sh");
-    let automatic_sh = bridge
+    let bash_error = bridge
         .run(
             RemoteRunRequest {
                 host: SH_ONLY_HOST.to_owned(),
-                command: "printf auto".to_owned(),
+                command: "printf bash".to_owned(),
                 cwd: None,
-                shell: RunShell::Auto,
+                shell: RunShell::Bash,
                 timeout_ms: Some(2_000),
                 stdin: None,
             },
             CancellationToken::new(),
         )
         .await
-        .expect("automatic sh fallback on no-Bash fixture");
-    assert_eq!(automatic_sh.context.shell.kind, ShellName::Sh);
-    assert!(automatic_sh.context.shell.fallback);
-    assert_eq!(utf8(&automatic_sh.stdout.head), "auto");
+        .expect_err("Bash request must fail on no-Bash fixture");
+    assert_eq!(bash_error.code, ErrorCode::RemoteCapabilityMissing);
 
     let write = bridge
         .write(

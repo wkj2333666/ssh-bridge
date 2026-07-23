@@ -24,13 +24,13 @@ Host devbox
 
 ```bash
 ssh devbox
-./bin/codex-ssh-bridge hosts add devbox --root /srv/project
-./bin/codex-ssh-bridge doctor devbox
+./target/release/codex-ssh-bridge hosts add devbox --root /srv/project
+./target/release/codex-ssh-bridge doctor devbox
 ```
 
 Add future servers the same way. The bridge accepts concrete OpenSSH aliases and stores no credentials. The default bridge config is `~/.config/codex-ssh-bridge/config.toml`; set `CODEX_SSH_BRIDGE_CONFIG` only as trusted local execution-authority input.
 
-The first network operation probes the remote POSIX environment automatically. No remote bridge helper or Codex installation is used.
+The first operation performs local SSH identity checks and a bounded capability probe. User commands and fixed read/write operations then reuse one persistent SSH session per alias; warm requests send one framed request without another `ssh -G` or root observation. The remote dispatcher is streamed over that SSH connection and is never installed on disk. No remote bridge helper or Codex installation is used. The configured root is a lexical routing boundary; remote filesystem retargeting follows ordinary server semantics.
 
 ## MCP tool shapes
 
@@ -54,16 +54,21 @@ Search queries are case-sensitive fixed strings, not regular expressions. Unifie
 
 ## Shell behavior
 
-`remote_run.command` is a shell command string. The bridge safely binds it through OpenSSH; do not wrap it in another `ssh` or add `bash -c`. Shell syntax inside the string still follows the selected remote shell.
+`remote_run.command` is a shell command string. The bridge safely binds it through the persistent session; do not wrap it in another `ssh` or add `bash -c`. Shell syntax inside the string still follows the selected remote shell.
 
-- `auto`: use Bash when available, otherwise fall back to POSIX sh.
-- `bash`: require Bash; fail before the command if unavailable.
-- `sh`: explicitly use POSIX sh.
+- omitted or `bash`: require Bash; fail before the command if unavailable.
+- `sh`: explicitly use POSIX sh; this is the model-visible fallback after a Bash capability error.
 - `login`: use the remote account's login shell.
 
-Prefer POSIX syntax. Request Bash for arrays, `[[ ... ]]`, `source`, `pipefail`, or Bash substitutions. Always inspect result `shell.kind`, `shell.fallback`, and `warnings`; a fallback is intentionally visible to the Agent.
+There is no `auto` value and the bridge never silently changes Bash into sh. The result or error carries the selected shell and fallback flag. The remote dispatcher itself is POSIX sh and is separate from the user shell; it never interprets the command payload as dispatcher code.
 
-Timeout and cancellation terminate the local SSH process group, but a detached or ambiguous remote process can remain. Check `remote_process_may_continue` before retrying.
+The SSH account's login shell must be able to launch the POSIX dispatcher command. If the dispatcher handshake fails (including a non-POSIX forced/login shell), the bridge returns a hard transport/capability error and does not retry through a one-shot command path.
+
+Prefer POSIX syntax. Request Bash for arrays, `[[ ... ]]`, `source`, `pipefail`, or Bash substitutions. Always inspect result `shell.kind`, `shell.fallback`, and `warnings`.
+
+Requests are independent and concurrent up to global/per-host limits. There is no mutation lock and no ordering guarantee for simultaneous writes to the same path. Atomic replace and expected-hash checks remain the protection for individual mutations.
+
+Timeout and cancellation send a request-level `CANCEL` first. If the dispatcher does not produce an exit result within the grace period, the bridge terminates the whole session and reports `remote_process_may_continue: true`; never retry a mutation with unknown outcome.
 
 ## Retained output
 
@@ -82,11 +87,11 @@ Use `stream:"stderr"` for retained stderr. Advance by the returned byte offset u
 The human CLI accepts argv after `--` and performs the shell-word encoding inside the bridge:
 
 ```bash
-./bin/codex-ssh-bridge hosts list
-./bin/codex-ssh-bridge hosts show devbox
-./bin/codex-ssh-bridge doctor devbox
-./bin/codex-ssh-bridge doctor devbox --verbose-ssh
-./bin/codex-ssh-bridge run devbox --cwd . --shell auto -- git status --short
+./target/release/codex-ssh-bridge hosts list
+./target/release/codex-ssh-bridge hosts show devbox
+./target/release/codex-ssh-bridge doctor devbox
+./target/release/codex-ssh-bridge doctor devbox --verbose-ssh
+./target/release/codex-ssh-bridge run devbox --cwd . --shell bash -- git status --short
 ```
 
 The JSON result reports the physical remote root, actual shell, exit status, warnings, duration, output limits, and any retained output reference. Verbose SSH diagnostics are bounded and redact identity paths, agent sockets, commands, and credential-like values.
@@ -96,9 +101,9 @@ The JSON result reports the physical remote root, actual shell, exit status, war
 SSHFS is optional local software and a human-only convenience:
 
 ```bash
-./bin/codex-ssh-bridge mount devbox /absolute/local/mountpoint --remote-path .
-./bin/codex-ssh-bridge mount-status /absolute/local/mountpoint
-./bin/codex-ssh-bridge unmount /absolute/local/mountpoint
+./target/release/codex-ssh-bridge mount devbox /absolute/local/mountpoint --remote-path .
+./target/release/codex-ssh-bridge mount-status /absolute/local/mountpoint
+./target/release/codex-ssh-bridge unmount /absolute/local/mountpoint
 ```
 
 The CLI refuses relative, symlinked, foreign-owned, and nonempty mountpoints by default. `--allow-nonempty` is an explicit human override. Read-only profiles force `ro`; the bridge never adds `allow_other`.

@@ -670,9 +670,12 @@ fn task78_physical_root_byte_bound_bash_version_and_spoofed_values_are_enforced(
 
 #[tokio::test]
 async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() {
-    let root = format!("/{}a", "é".repeat(32_767));
+    // Keep the integration command below well under execve's aggregate argv
+    // limit on GitHub-hosted runners; the exact 64 KiB parser boundary is
+    // covered by the direct probe tests immediately above.
+    let root = format!("/{}a", "é".repeat(16_383));
     let version = format!("{}aa", "é".repeat(127));
-    assert_eq!(root.len(), 65_536);
+    assert_eq!(root.len(), 32_768);
     assert_eq!(version.len(), 256);
 
     let base = TempDir::new().unwrap();
@@ -702,9 +705,17 @@ async fn task78_exact_root_and_bash_version_survive_the_real_capability_cache() 
     .unwrap();
 
     for _ in 0..2 {
-        let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(2));
+        let mut run = request("dev", ShellRequest::Auto, Duration::from_secs(10));
         run.cwd = root.clone();
-        let result = runner.execute(run, CancellationToken::new()).await.unwrap();
+        let result = runner
+            .execute(run, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "boundary cache execution failed: code={:?}, message={}",
+                    error.code, error.message
+                )
+            });
         assert_eq!(result.physical_root, root);
         assert_eq!(
             result.shell.shell,
@@ -1233,7 +1244,7 @@ fn capability_probe_rejects_each_incompatible_exact_behavior() {
         (
             "safe_write",
             "chmod",
-            "case \" $* \" in *codex-probe-safe-write*chmod-link*) exit 64;; esac\nexec /usr/bin/chmod \"$@\"\n",
+            "case \" $* \" in */proc/self/fd/*) exit 64;; esac\nexec /usr/bin/chmod \"$@\"\n",
         ),
         (
             "guarded_delete",
@@ -1503,6 +1514,45 @@ fn request(host: &str, shell: ShellRequest, timeout: Duration) -> RunRequest {
 }
 
 #[tokio::test]
+async fn warm_requests_use_one_persistent_command_without_identity_or_root_roundtrips() {
+    let controls = tempfile::TempDir::new().unwrap();
+    let log = controls.path().join("ssh.log");
+    let fixture = task3_runner(
+        &["dev"],
+        Limits::default(),
+        Duration::from_secs(600),
+        &[
+            ("FAKE_SSH_MODE", "echo-command".to_owned()),
+            ("FAKE_SSH_LOG", log.display().to_string()),
+        ],
+    );
+    for _ in 0..102 {
+        let result = fixture
+            .runner
+            .execute(
+                request("dev", ShellRequest::Sh, Duration::from_secs(2)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let phases =
+            result.timing.preparation_ms + result.timing.session_ms + result.timing.capture_ms;
+        assert!(
+            phases <= result.elapsed_ms.saturating_add(3),
+            "phase timing must fit inside the operation: timing={:?} elapsed_ms={}",
+            result.timing,
+            result.elapsed_ms
+        );
+    }
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
+    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 0);
+    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 102);
+}
+
+#[tokio::test]
 async fn task78_run_cwd_is_encoded_as_data_and_never_executed() {
     let filesystem = TempDir::new().unwrap();
     let sentinel = filesystem.path().join("cwd-injection");
@@ -1614,7 +1664,7 @@ fn force_kill_process(pid: u32) {
 }
 
 #[tokio::test]
-async fn runner_revalidates_each_operation_probes_once_and_uses_hardened_ssh_g() {
+async fn runner_caches_policy_probes_once_and_uses_hardened_ssh_g() {
     let log_dir = TempDir::new().unwrap();
     let log = log_dir.path().join("calls.log");
     let fixture = task3_runner(
@@ -1639,9 +1689,9 @@ async fn runner_revalidates_each_operation_probes_once_and_uses_hardened_ssh_g()
     }
 
     let calls = fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 2);
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
     assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
-    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 2);
+    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 0);
     assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
     for option in [
         "BatchMode=yes",
@@ -1655,7 +1705,10 @@ async fn runner_revalidates_each_operation_probes_once_and_uses_hardened_ssh_g()
         "ServerAliveInterval=15",
         "ServerAliveCountMax=3",
     ] {
-        for call in calls.split("END\n").filter(|call| !call.is_empty()) {
+        for call in calls
+            .split("END\n")
+            .filter(|call| !call.is_empty() && (call.starts_with("G\n") || call.starts_with("P\n")))
+        {
             assert_eq!(
                 call.lines()
                     .filter(|line| *line == format!("arg={option}"))
@@ -1672,7 +1725,7 @@ async fn runner_revalidates_each_operation_probes_once_and_uses_hardened_ssh_g()
 }
 
 #[tokio::test]
-async fn resolved_identity_drift_is_rejected_before_remote_business_execution() {
+async fn resolved_identity_is_cached_for_warm_remote_execution() {
     let files = TempDir::new().unwrap();
     let identity_file = files.path().join("resolved-identity");
     let log = files.path().join("calls.log");
@@ -1706,7 +1759,7 @@ async fn resolved_identity_drift_is_rejected_before_remote_business_execution() 
     let before = fs::read_to_string(&log).unwrap();
     assert_eq!(before.lines().filter(|line| *line == "G").count(), 1);
     assert_eq!(before.lines().filter(|line| *line == "P").count(), 1);
-    assert_eq!(before.lines().filter(|line| *line == "R").count(), 1);
+    assert_eq!(before.lines().filter(|line| *line == "R").count(), 0);
     assert_eq!(before.lines().filter(|line| *line == "C").count(), 1);
 
     fs::write(
@@ -1714,24 +1767,20 @@ async fn resolved_identity_drift_is_rejected_before_remote_business_execution() 
         b"hostname replacement.internal\nuser fixture\nport 22\n",
     )
     .unwrap();
-    let error = fixture
+    fixture
         .runner
         .execute(
             request("dev", ShellRequest::Auto, Duration::from_secs(2)),
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidConfig);
-    assert!(!error.retryable);
-    assert!(error.message.contains("verify the alias"), "{error:?}");
-    assert!(error.message.contains("restart the bridge"), "{error:?}");
+        .unwrap();
 
     let after = fs::read_to_string(log).unwrap();
-    assert_eq!(after.lines().filter(|line| *line == "G").count(), 2);
+    assert_eq!(after.lines().filter(|line| *line == "G").count(), 1);
     assert_eq!(after.lines().filter(|line| *line == "P").count(), 1);
-    assert_eq!(after.lines().filter(|line| *line == "R").count(), 1);
-    assert_eq!(after.lines().filter(|line| *line == "C").count(), 1);
+    assert_eq!(after.lines().filter(|line| *line == "R").count(), 0);
+    assert_eq!(after.lines().filter(|line| *line == "C").count(), 2);
 }
 
 #[tokio::test]
@@ -1782,10 +1831,13 @@ async fn cached_host_reconnect_command_still_carries_configured_connect_timeout(
     assert!(started.elapsed() < Duration::from_secs(1));
 
     let calls = fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 2);
+    assert_eq!(calls.lines().filter(|line| *line == "G").count(), 1);
     assert_eq!(calls.lines().filter(|line| *line == "P").count(), 1);
     assert_eq!(calls.lines().filter(|line| *line == "C").count(), 2);
-    for call in calls.split("END\n").filter(|call| !call.is_empty()) {
+    for call in calls
+        .split("END\n")
+        .filter(|call| !call.is_empty() && (call.starts_with("G\n") || call.starts_with("P\n")))
+    {
         assert_eq!(
             call.lines()
                 .filter(|line| *line == "arg=ConnectTimeout=2")
@@ -1903,10 +1955,12 @@ async fn selected_shell_and_remote_gnu_timeout_are_reported_and_rendered_exactly
     assert!(result.shell.fallback);
     assert!(!result.remote_process_may_continue);
     let rendered = String::from_utf8(preview_bytes(&result.output.stdout)).unwrap();
-    assert!(rendered.contains("i=$3:$4"));
+    assert!(rendered.contains("[ \"$#\" -eq 3 ]"));
+    assert!(rendered.contains("cd -P -- \"$1\" || exit 126"));
     assert!(rendered.contains("timeout --signal=TERM --kill-after=1s"));
+    assert!(rendered.contains("exec sh -c \"$2\""));
     assert!(rendered.contains("printf safe"));
-    assert!(rendered.contains("'/srv/project'"));
+    assert!(rendered.contains("'.'"));
 }
 
 #[test]
@@ -2016,7 +2070,7 @@ async fn unresolved_login_shell_fails_before_command_while_auto_and_sh_remain_av
 }
 
 #[tokio::test]
-async fn root_observation_consumes_the_single_command_timeout_budget() {
+async fn command_timeout_consumes_only_the_remote_command_budget() {
     let controls = TempDir::new().unwrap();
     let log = controls.path().join("ssh.log");
     let fixture = task3_runner(
@@ -2025,7 +2079,7 @@ async fn root_observation_consumes_the_single_command_timeout_budget() {
         Duration::from_secs(600),
         &[
             ("FAKE_SSH_MODE", "streams".to_owned()),
-            ("FAKE_SSH_ROOT_OBSERVE_SLEEP_SECONDS", "1".to_owned()),
+            ("FAKE_SSH_FIXED_SLEEP_SECONDS", "1".to_owned()),
             ("FAKE_SSH_LOG", log.display().to_string()),
         ],
     );
@@ -2039,12 +2093,12 @@ async fn root_observation_consumes_the_single_command_timeout_budget() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::CommandTimeout, "{error:?}");
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
     assert_eq!(error.details.mutation_may_have_applied, None);
     assert!(started.elapsed() < Duration::from_millis(500));
     let calls = std::fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 1);
-    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 0);
+    assert_eq!(calls.lines().filter(|line| *line == "R").count(), 0);
+    assert_eq!(calls.lines().filter(|line| *line == "C").count(), 1);
 }
 
 #[tokio::test]
@@ -2212,24 +2266,22 @@ async fn command_phase_exit_255_canonical_lines_are_nonretryable_remote_exit() {
                     ("FAKE_SSH_SHELL", reported_shell.to_owned()),
                 ],
             );
-            let error = fixture
+            let result = fixture
                 .runner
                 .execute(
                     request("dev", request_shell, Duration::from_secs(2)),
                     CancellationToken::new(),
                 )
                 .await
-                .unwrap_err();
+                .unwrap();
             assert_eq!(
-                error.code,
-                ErrorCode::RemoteExit,
+                result.status, 255,
                 "shell={request_shell:?} diagnostic={diagnostic}"
             );
-            assert!(!error.retryable);
-            assert_eq!(error.details.exit_status, Some(255));
-            assert_eq!(error.details.remote_process_may_continue, Some(true));
-            assert_eq!(error.message, "remote command exited unsuccessfully");
-            assert!(!error.message.contains("VERY_SECRET"));
+            let stderr_bytes = preview_bytes(&result.output.stderr);
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            assert!(!stderr.is_empty());
+            assert!(!stderr.contains("VERY_SECRET"));
         }
     }
 }
@@ -2256,17 +2308,18 @@ async fn fuzzy_or_remote_spoofed_exit_255_diagnostics_are_not_transport_failures
                 ("FAKE_SSH_DIAGNOSTIC", diagnostic.to_owned()),
             ],
         );
-        let error = fixture
+        let result = fixture
             .runner
             .execute(
                 request("dev", ShellRequest::Auto, Duration::from_secs(2)),
                 CancellationToken::new(),
             )
             .await
-            .unwrap_err();
-        assert_eq!(error.code, ErrorCode::RemoteExit, "{diagnostic:?}");
-        assert!(!error.retryable, "{diagnostic:?}");
-        assert_eq!(error.details.exit_status, Some(255), "{diagnostic:?}");
+            .unwrap();
+        assert_eq!(result.status, 255, "{diagnostic:?}");
+        assert!(
+            String::from_utf8_lossy(&preview_bytes(&result.output.stderr)).contains(diagnostic)
+        );
     }
 }
 
@@ -2309,7 +2362,7 @@ async fn local_deadline_and_gnu_timeout_status_are_command_timeouts() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::CommandTimeout);
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
 
     let remote = task3_runner(
         &["dev"],
@@ -2322,15 +2375,15 @@ async fn local_deadline_and_gnu_timeout_status_are_command_timeouts() {
             ("FAKE_SSH_HAS_TIMEOUT", "1".to_owned()),
         ],
     );
-    let error = remote
+    let result = remote
         .runner
         .execute(
             request("dev", ShellRequest::Auto, Duration::from_secs(1)),
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::CommandTimeout);
+        .unwrap();
+    assert_eq!(result.status, 124);
 }
 
 fn assert_task78_selected_context(error: &BridgeError, expected_code: ErrorCode) {
@@ -2359,15 +2412,17 @@ async fn task78_selected_remote_context_is_attached_to_exit_timeout_cancel_and_o
             ("FAKE_SSH_EXIT_STATUS", "255".to_owned()),
         ],
     );
-    let error = exited
+    let result = exited
         .runner
         .execute(
             request("dev", ShellRequest::Auto, Duration::from_secs(2)),
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert_task78_selected_context(&error, ErrorCode::RemoteExit);
+        .unwrap();
+    assert_eq!(result.status, 255);
+    assert_eq!(result.physical_root, "/srv/project");
+    assert_eq!(result.shell.shell, ShellKind::PosixSh);
 
     let timed_out = task3_runner(
         &["dev"],
@@ -2721,7 +2776,7 @@ async fn cancellation_still_kills_pipe_inheriting_descendants_after_ssh_parent_e
         }
     };
     assert_eq!(error.code, ErrorCode::Cancelled);
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
     wait_for_process_exit(pid).await;
 }
 
@@ -2773,7 +2828,7 @@ async fn deadline_still_kills_pipe_inheriting_descendants_after_ssh_parent_exit(
         }
     };
     assert_eq!(error.code, ErrorCode::CommandTimeout);
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
     wait_for_process_exit(pid).await;
 }
 
@@ -2832,7 +2887,7 @@ async fn cancellation_kills_an_orphan_stdin_holder_after_ssh_parent_exit() {
     };
     assert!(cancelled_at.elapsed() < Duration::from_millis(250));
     assert_eq!(error.code, ErrorCode::Cancelled);
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
     wait_for_process_exit(pid).await;
 }
 
@@ -2887,7 +2942,7 @@ async fn deadline_kills_an_orphan_stdin_holder_after_ssh_parent_exit() {
     };
     assert!(started.elapsed() < Duration::from_millis(330));
     assert_eq!(error.code, ErrorCode::CommandTimeout);
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
     wait_for_process_exit(pid).await;
 }
 
@@ -3453,8 +3508,8 @@ async fn first_byte_over_limit_kills_the_group_and_cleans_spool_files() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::OutputLimit);
-    assert_eq!(error.details.bytes_seen, Some(300 * 1024 + 1));
-    assert_eq!(error.details.remote_process_may_continue, Some(true));
+    assert_eq!(error.details.bytes_seen, Some(300 * 1024));
+    assert_eq!(error.details.remote_process_may_continue, Some(false));
     assert!(private_spool_files(&fixture.runtime).is_empty());
 }
 

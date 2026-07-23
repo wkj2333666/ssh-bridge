@@ -119,7 +119,6 @@ fn command_input_too_large() -> BridgeError {
 
 fn map_shell(shell: RunShell) -> ShellRequest {
     match shell {
-        RunShell::Auto => ShellRequest::Auto,
         RunShell::Bash => ShellRequest::Bash,
         RunShell::Sh => ShellRequest::Sh,
         RunShell::Login => ShellRequest::Login,
@@ -134,6 +133,7 @@ fn convert_result(host: String, result: crate::ssh::RunResult) -> RemoteRunResul
         physical_root,
         output,
         remote_process_may_continue,
+        timing: _,
     } = result;
     let CapturedOutput {
         stdout,

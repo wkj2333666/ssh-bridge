@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::BridgeResult;
 use crate::output::{InternalSpoolOwner, StreamKind};
-use crate::ssh::{FixedOperationKind, FixedRunRequest, RootIdentity, RootedPathInputs};
+use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs};
 
 use super::protocol::{
     context, encode_bytes, entry_error, nul_fields, parse_u64, protocol_error, read_small_stream,
@@ -92,7 +92,6 @@ pub(super) async fn read(
     let mut files = Vec::with_capacity(request.paths.len());
     let mut returned_raw_bytes = 0u64;
     let mut operation_context = None;
-    let mut operation_root: Option<RootIdentity> = None;
     for path in request.paths {
         if cancel.is_cancelled() {
             return Err(read_cancelled_error(operation_context.as_ref()));
@@ -119,7 +118,6 @@ pub(super) async fn read(
                         argument_indices: &[0],
                         stdin_nul_paths: false,
                     },
-                    expected_root: operation_root.clone(),
                     required_capabilities: &["read_slice", "stat_printf", "sha256sum"],
                     stdout_limit,
                     stderr_limit: 1024,
@@ -136,7 +134,6 @@ pub(super) async fn read(
                 result.capability.physical_root.clone(),
                 &result.shell,
             ));
-            operation_root = Some(result.root_identity.clone());
         }
         let attach = |error| attach_fixed_result_context(error, &request.host, &result);
         let stderr = read_small_stream(&result.output, StreamKind::Stderr, 1024)

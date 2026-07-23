@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ssh-bridge": {
+      "command": "/absolute/path/to/target/release/codex-ssh-bridge",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

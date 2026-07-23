@@ -1,0 +1,958 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
+use tokio_util::sync::CancellationToken;
+
+use super::dispatcher::dispatcher_command;
+use super::frame::{Frame, FrameKind, read_frame, write_frame};
+use super::{SshPolicy, build_ssh_argv};
+use crate::capability::{ShellKind, ShellSelection};
+use crate::config::EffectiveLimits;
+use crate::error::{BridgeError, BridgeResult, ErrorCode};
+
+const CANCEL_GRACE: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionRequest {
+    pub(crate) command: String,
+    pub(crate) cwd: String,
+    pub(crate) shell: ShellSelection,
+    pub(crate) login_shell: Option<String>,
+    pub(crate) env: std::collections::BTreeMap<String, Option<String>>,
+    pub(crate) stdin: Option<Vec<u8>>,
+    pub(crate) timeout: Duration,
+    pub(crate) stdout_limit: u64,
+    pub(crate) stderr_limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionResult {
+    pub(crate) request_id: u64,
+    pub(crate) status: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) remote_process_may_continue: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostSession {
+    inner: Arc<SessionInner>,
+}
+
+struct SessionInner {
+    host: String,
+    max_payload: usize,
+    max_output_bytes: u64,
+    tx: mpsc::Sender<Outbound>,
+    pending: Mutex<HashMap<u64, PendingRequest>>,
+    next_id: AtomicU64,
+    closed: AtomicBool,
+    process_group: AtomicI32,
+    writer_task: Mutex<Option<JoinHandle<()>>>,
+    reader_task: Mutex<Option<JoinHandle<()>>>,
+    child_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct PendingRequest {
+    started: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    aggregate_limit: usize,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    sender: oneshot::Sender<BridgeResult<SessionResult>>,
+}
+
+struct Outbound {
+    frames: Vec<Frame>,
+}
+
+impl HostSession {
+    #[allow(dead_code)]
+    pub(crate) async fn connect(
+        policy: SshPolicy,
+        host: String,
+        limits: EffectiveLimits,
+        cancel: CancellationToken,
+    ) -> BridgeResult<Self> {
+        Self::connect_with(
+            policy,
+            host,
+            limits,
+            OsString::from("/usr/bin/ssh"),
+            std::collections::BTreeMap::new(),
+            cancel,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with(
+        policy: SshPolicy,
+        host: String,
+        limits: EffectiveLimits,
+        executable: OsString,
+        environment: std::collections::BTreeMap<OsString, OsString>,
+        cancel: CancellationToken,
+    ) -> BridgeResult<Self> {
+        if limits.max_frame_bytes == 0 {
+            return Err(BridgeError::invalid_argument(
+                "SSH session frame limit must be positive",
+            ));
+        }
+        let command = dispatcher_command(limits.max_frame_bytes)?;
+        let argv = build_ssh_argv(&policy, &host, &command);
+        let mut child_command = Command::new(executable);
+        child_command
+            .args(argv)
+            .envs(environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // SAFETY: setpgid is async-signal-safe and receives no borrowed data.
+        unsafe {
+            child_command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        if cancel.is_cancelled() {
+            return Err(cancelled_error(&host, false));
+        }
+        let mut child = child_command.spawn().map_err(BridgeError::io)?;
+        let process_group = child.id().ok_or_else(|| {
+            BridgeError::new(ErrorCode::Io, "SSH session child has no process id", false)
+        })? as i32;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeError::io("SSH session stdout pipe is missing"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BridgeError::io("SSH session stderr pipe is missing"))?;
+        tokio::spawn(drain_stderr(stderr));
+        let mut output = BufReader::new(stdout);
+        let hello = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(cancelled_error(&host, false));
+            }
+            result = timeout(Duration::from_millis(limits.connect_timeout_ms.max(1)), read_frame(&mut output, limits.max_frame_bytes)) => {
+                match result {
+                    Ok(Ok(Some(frame))) => frame,
+                    Ok(Ok(None)) => {
+                        let _ = child.wait().await;
+                        return Err(startup_error(&host, "SSH dispatcher closed before handshake"));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(startup_error(&host, &error.to_string()));
+                    }
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(BridgeError::new(ErrorCode::ConnectTimeout, "SSH dispatcher handshake timed out", true));
+                    }
+                }
+            }
+        };
+        if hello.kind == FrameKind::Error {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let message = String::from_utf8_lossy(&hello.payload).into_owned();
+            if message.starts_with("DISPATCHER_CAPABILITY_MISSING=") {
+                let mut error =
+                    BridgeError::new(ErrorCode::RemoteCapabilityMissing, message, false);
+                error.details.host = Some(host);
+                return Err(error);
+            }
+            return Err(startup_error(&host, &message));
+        }
+        if hello.kind != FrameKind::HelloAck
+            || hello.request_id != 0
+            || !String::from_utf8_lossy(&hello.payload)
+                .split(';')
+                .any(|field| field == "protocol=codex-ssh-dispatcher/1")
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(startup_error(&host, "invalid SSH dispatcher handshake"));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+        let inner = Arc::new(SessionInner {
+            host,
+            max_payload: limits.max_frame_bytes,
+            max_output_bytes: limits.max_output_bytes,
+            tx,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            process_group: AtomicI32::new(process_group),
+            writer_task: Mutex::new(None),
+            reader_task: Mutex::new(None),
+            child_task: Mutex::new(None),
+        });
+        let writer_inner = Arc::downgrade(&inner);
+        let writer_task = tokio::spawn(writer_loop(rx, child.stdin.take(), writer_inner));
+        let reader_inner = Arc::downgrade(&inner);
+        let reader_task = tokio::spawn(reader_loop(output, reader_inner));
+        let child_inner = Arc::downgrade(&inner);
+        let child_task = tokio::spawn(child_loop(child, child_inner));
+        *inner.writer_task.lock().await = Some(writer_task);
+        *inner.reader_task.lock().await = Some(reader_task);
+        *inner.child_task.lock().await = Some(child_task);
+        Ok(Self { inner })
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        request: SessionRequest,
+        cancel: CancellationToken,
+    ) -> BridgeResult<SessionResult> {
+        let started = Instant::now();
+        let request_id = self.inner.next_request_id()?;
+        let frames = build_request_frames(request_id, &request, self.inner.max_payload)?;
+        let (sender, mut receiver) = oneshot::channel();
+        let pending = PendingRequest {
+            started,
+            stdout_limit: usize::try_from(request.stdout_limit)
+                .map_err(|_| BridgeError::invalid_argument("stdout limit is too large"))?,
+            stderr_limit: usize::try_from(request.stderr_limit)
+                .map_err(|_| BridgeError::invalid_argument("stderr limit is too large"))?,
+            aggregate_limit: usize::try_from(
+                request
+                    .stdout_limit
+                    .saturating_add(request.stderr_limit)
+                    .min(self.inner.max_output_bytes),
+            )
+            .map_err(|_| BridgeError::invalid_argument("output limit is too large"))?,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            sender,
+        };
+        self.inner.pending.lock().await.insert(request_id, pending);
+        if let Err(error) = self.inner.send(Outbound { frames }).await {
+            self.inner.pending.lock().await.remove(&request_id);
+            return Err(error);
+        }
+
+        let deadline = tokio::time::sleep(request.timeout);
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            result = &mut receiver => result.map_err(|_| transport_error(&self.inner.host, true))?,
+            () = cancel.cancelled() => self.abort_request(request_id, &mut receiver, false).await,
+            () = &mut deadline => self.abort_request(request_id, &mut receiver, true).await,
+        }
+    }
+
+    async fn abort_request(
+        &self,
+        request_id: u64,
+        receiver: &mut oneshot::Receiver<BridgeResult<SessionResult>>,
+        timed_out: bool,
+    ) -> BridgeResult<SessionResult> {
+        let _ = self
+            .inner
+            .send(Outbound {
+                frames: vec![Frame {
+                    kind: FrameKind::Cancel,
+                    request_id,
+                    payload: Vec::new(),
+                }],
+            })
+            .await;
+        match timeout(CANCEL_GRACE, receiver).await {
+            Ok(Ok(_result)) => Err(if timed_out {
+                timeout_error(&self.inner.host, false)
+            } else {
+                cancelled_error(&self.inner.host, false)
+            }),
+            Ok(Err(_)) | Err(_) => {
+                self.inner.shutdown().await;
+                Err(if timed_out {
+                    timeout_error(&self.inner.host, true)
+                } else {
+                    cancelled_error(&self.inner.host, true)
+                })
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn close(&self) -> BridgeResult<()> {
+        self.inner.shutdown().await;
+        Ok(())
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+}
+
+impl SessionInner {
+    fn next_request_id(&self) -> BridgeResult<u64> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            return Err(BridgeError::new(
+                ErrorCode::ProtocolError,
+                "SSH session request ID space is exhausted",
+                false,
+            ));
+        }
+        Ok(id)
+    }
+
+    async fn send(&self, outbound: Outbound) -> BridgeResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(transport_error(&self.host, true));
+        }
+        self.tx
+            .send(outbound)
+            .await
+            .map_err(|_| transport_error(&self.host, true))
+    }
+
+    async fn shutdown(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self
+            .tx
+            .send(Outbound {
+                frames: vec![Frame {
+                    kind: FrameKind::Close,
+                    request_id: 0,
+                    payload: Vec::new(),
+                }],
+            })
+            .await;
+        self.fail_all(transport_error(&self.host, true)).await;
+        terminate_process_group(self.process_group.load(Ordering::Acquire));
+    }
+
+    async fn fail_all(&self, error: BridgeError) {
+        let mut pending = self.pending.lock().await;
+        for (_, request) in pending.drain() {
+            let _ = request.sender.send(Err(error.clone()));
+        }
+    }
+
+    async fn fail_request(&self, request_id: u64, error: BridgeError) {
+        if let Some(request) = self.pending.lock().await.remove(&request_id) {
+            let _ = request.sender.send(Err(error));
+        }
+    }
+
+    async fn transport_failure(&self, error: BridgeError) {
+        self.closed.store(true, Ordering::Release);
+        self.fail_all(error).await;
+        terminate_process_group(self.process_group.load(Ordering::Acquire));
+    }
+}
+
+async fn writer_loop(
+    mut receiver: mpsc::Receiver<Outbound>,
+    stdin: Option<impl AsyncWrite + Unpin + Send + 'static>,
+    inner: Weak<SessionInner>,
+) {
+    let Some(mut stdin) = stdin else {
+        if let Some(inner) = inner.upgrade() {
+            inner
+                .transport_failure(transport_error(&inner.host, true))
+                .await;
+        }
+        return;
+    };
+    while let Some(outbound) = receiver.recv().await {
+        for frame in outbound.frames {
+            let max_payload = inner.upgrade().map_or(0, |inner| inner.max_payload);
+            if max_payload == 0 || write_frame(&mut stdin, &frame, max_payload).await.is_err() {
+                if let Some(inner) = inner.upgrade() {
+                    inner
+                        .transport_failure(transport_error(&inner.host, true))
+                        .await;
+                }
+                return;
+            }
+        }
+        if stdin.flush().await.is_err() {
+            if let Some(inner) = inner.upgrade() {
+                inner
+                    .transport_failure(transport_error(&inner.host, true))
+                    .await;
+            }
+            return;
+        }
+    }
+}
+
+async fn reader_loop<R: AsyncBufRead + Unpin>(mut reader: R, inner: Weak<SessionInner>) {
+    let max_payload = inner.upgrade().map_or(0, |inner| inner.max_payload);
+    loop {
+        let result = read_frame(&mut reader, max_payload).await;
+        match result {
+            Ok(Some(frame)) => {
+                let Some(inner) = inner.upgrade() else { return };
+                if let Err(error) = dispatch_frame(&inner, frame).await {
+                    inner.transport_failure(error).await;
+                    return;
+                }
+            }
+            Ok(None) => {
+                if let Some(inner) = inner.upgrade() {
+                    inner
+                        .transport_failure(transport_error(&inner.host, true))
+                        .await;
+                }
+                return;
+            }
+            Err(error) => {
+                if let Some(inner) = inner.upgrade() {
+                    inner
+                        .transport_failure(protocol_error(&inner.host, &error.to_string()))
+                        .await;
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn child_loop(mut child: tokio::process::Child, inner: Weak<SessionInner>) {
+    let _ = child.wait().await;
+    if let Some(inner) = inner.upgrade()
+        && !inner.closed.swap(true, Ordering::AcqRel)
+    {
+        inner.fail_all(transport_error(&inner.host, true)).await;
+    }
+}
+
+async fn drain_stderr(mut stderr: impl AsyncRead + Unpin) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult<()> {
+    match frame.kind {
+        FrameKind::Ready => Ok(()),
+        FrameKind::Stdout | FrameKind::Stderr => {
+            let mut pending = inner.pending.lock().await;
+            let request = pending.get_mut(&frame.request_id).ok_or_else(|| {
+                protocol_error(&inner.host, "dispatcher returned an unknown request ID")
+            })?;
+            let aggregate_used = request.stdout.len().saturating_add(request.stderr.len());
+            let (output, limit, truncated) = if frame.kind == FrameKind::Stdout {
+                (
+                    &mut request.stdout,
+                    request.stdout_limit,
+                    &mut request.stdout_truncated,
+                )
+            } else {
+                (
+                    &mut request.stderr,
+                    request.stderr_limit,
+                    &mut request.stderr_truncated,
+                )
+            };
+            let remaining = limit
+                .saturating_sub(output.len())
+                .min(request.aggregate_limit.saturating_sub(aggregate_used));
+            if frame.payload.len() > remaining {
+                output.extend_from_slice(&frame.payload[..remaining]);
+                *truncated = true;
+            } else {
+                output.extend_from_slice(&frame.payload);
+            }
+            Ok(())
+        }
+        FrameKind::Exit => {
+            let (status, stdout_truncated, stderr_truncated) = parse_exit(&frame.payload)
+                .map_err(|message| protocol_error(&inner.host, &message))?;
+            let request = inner
+                .pending
+                .lock()
+                .await
+                .remove(&frame.request_id)
+                .ok_or_else(|| {
+                    protocol_error(
+                        &inner.host,
+                        "dispatcher returned an unknown exit request ID",
+                    )
+                })?;
+            let result = SessionResult {
+                request_id: frame.request_id,
+                status,
+                stdout: request.stdout,
+                stderr: request.stderr,
+                stdout_truncated: request.stdout_truncated || stdout_truncated,
+                stderr_truncated: request.stderr_truncated || stderr_truncated,
+                elapsed_ms: elapsed_ms(request.started.elapsed()),
+                remote_process_may_continue: false,
+            };
+            let _ = request.sender.send(Ok(result));
+            Ok(())
+        }
+        FrameKind::Error => {
+            let message = String::from_utf8_lossy(&frame.payload).trim().to_owned();
+            let error = if message.starts_with("DISPATCHER_CAPABILITY_MISSING=") {
+                BridgeError::new(ErrorCode::RemoteCapabilityMissing, message, false)
+            } else {
+                protocol_error(&inner.host, &message)
+            };
+            if frame.request_id == 0 {
+                return Err(error);
+            }
+            inner.fail_request(frame.request_id, error).await;
+            Ok(())
+        }
+        FrameKind::HelloAck => Err(protocol_error(
+            &inner.host,
+            "unexpected SSH dispatcher handshake frame",
+        )),
+        FrameKind::Hello
+        | FrameKind::Open
+        | FrameKind::Data
+        | FrameKind::Cancel
+        | FrameKind::Close => Err(protocol_error(
+            &inner.host,
+            "unexpected SSH dispatcher frame",
+        )),
+    }
+}
+
+fn build_request_frames(
+    request_id: u64,
+    request: &SessionRequest,
+    max_payload: usize,
+) -> BridgeResult<Vec<Frame>> {
+    if !request.env.is_empty() {
+        return Err(BridgeError::invalid_argument(
+            "per-request environment overrides are not supported by this dispatcher",
+        ));
+    }
+    if request.cwd.as_bytes().contains(&0) || request.command.as_bytes().contains(&0) {
+        return Err(BridgeError::invalid_argument(
+            "NUL is not representable in a session cwd or command",
+        ));
+    }
+    let cwd = request.cwd.as_bytes();
+    let command = request.command.as_bytes();
+    let stdin = request.stdin.as_deref().unwrap_or_default();
+    for (name, bytes) in [
+        ("cwd", cwd.len()),
+        ("command", command.len()),
+        ("stdin", stdin.len()),
+    ] {
+        if bytes > max_payload {
+            return Err(BridgeError::new(
+                ErrorCode::RequestTooLarge,
+                format!("session {name} exceeds the configured frame limit"),
+                false,
+            ));
+        }
+    }
+    let (shell, login_shell) = match &request.shell.shell {
+        ShellKind::Bash { .. } => ("bash", ""),
+        ShellKind::PosixSh => ("sh", ""),
+        ShellKind::Login => {
+            let login_shell = request.login_shell.as_deref().ok_or_else(|| {
+                BridgeError::new(
+                    ErrorCode::RemoteCapabilityMissing,
+                    "remote account login shell was not supplied to the SSH session",
+                    false,
+                )
+            })?;
+            if !login_shell.starts_with('/')
+                || login_shell.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err(BridgeError::invalid_argument(
+                    "remote account login shell path is invalid",
+                ));
+            }
+            ("login", login_shell)
+        }
+    };
+    let metadata = format!(
+        "shell={shell}\ncwd_length={}\ncommand_length={}\nstdin_length={}\nlogin_shell={login_shell}\ntimeout_ms={}\nstdout_limit={}\nstderr_limit={}\n",
+        cwd.len(),
+        command.len(),
+        stdin.len(),
+        request.timeout.as_millis(),
+        request.stdout_limit,
+        request.stderr_limit,
+    );
+    if metadata.len() > max_payload {
+        return Err(BridgeError::new(
+            ErrorCode::RequestTooLarge,
+            "session metadata exceeds the configured frame limit",
+            false,
+        ));
+    }
+    let mut frames = vec![Frame {
+        kind: FrameKind::Open,
+        request_id,
+        payload: metadata.into_bytes(),
+    }];
+    frames.push(Frame {
+        kind: FrameKind::Data,
+        request_id,
+        payload: cwd.to_vec(),
+    });
+    frames.push(Frame {
+        kind: FrameKind::Data,
+        request_id,
+        payload: command.to_vec(),
+    });
+    if !stdin.is_empty() {
+        frames.push(Frame {
+            kind: FrameKind::Data,
+            request_id,
+            payload: stdin.to_vec(),
+        });
+    }
+    Ok(frames)
+}
+
+fn parse_exit(payload: &[u8]) -> Result<(i32, bool, bool), String> {
+    let text = std::str::from_utf8(payload).map_err(|_| "dispatcher EXIT payload is not UTF-8")?;
+    let mut lines = text.lines();
+    let status = lines
+        .next()
+        .ok_or("dispatcher EXIT payload is missing status")?
+        .parse::<i32>()
+        .map_err(|_| "dispatcher EXIT status is invalid")?;
+    let stdout = parse_bool(
+        lines
+            .next()
+            .ok_or("dispatcher EXIT payload is incomplete")?,
+    )?;
+    let stderr = parse_bool(
+        lines
+            .next()
+            .ok_or("dispatcher EXIT payload is incomplete")?,
+    )?;
+    if lines.next().is_some() {
+        return Err("dispatcher EXIT payload has extra fields".to_owned());
+    }
+    Ok((status, stdout, stderr))
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err("dispatcher EXIT truncation flag is invalid".to_owned()),
+    }
+}
+
+fn startup_error(host: &str, message: &str) -> BridgeError {
+    let mut error = BridgeError::new(
+        ErrorCode::ProtocolError,
+        format!("SSH dispatcher startup failed: {message}"),
+        false,
+    );
+    error.details.host = Some(host.to_owned());
+    error
+}
+
+fn protocol_error(host: &str, message: &str) -> BridgeError {
+    let mut error = BridgeError::new(
+        ErrorCode::ProtocolError,
+        format!("SSH dispatcher protocol error: {message}"),
+        false,
+    );
+    error.details.host = Some(host.to_owned());
+    error
+}
+
+fn transport_error(host: &str, may_continue: bool) -> BridgeError {
+    let mut error = BridgeError::new(
+        ErrorCode::Io,
+        "SSH dispatcher transport closed unexpectedly",
+        false,
+    );
+    error.details.host = Some(host.to_owned());
+    error.details.remote_process_may_continue = Some(may_continue);
+    error
+}
+
+fn cancelled_error(host: &str, may_continue: bool) -> BridgeError {
+    let mut error = BridgeError::new(ErrorCode::Cancelled, "SSH operation was cancelled", false);
+    error.details.host = Some(host.to_owned());
+    error.details.remote_process_may_continue = Some(may_continue);
+    error
+}
+
+fn timeout_error(host: &str, may_continue: bool) -> BridgeError {
+    let mut error = BridgeError::new(ErrorCode::CommandTimeout, "remote command timed out", false);
+    error.details.host = Some(host.to_owned());
+    error.details.remote_process_may_continue = Some(may_continue);
+    error
+}
+
+fn terminate_process_group(process_group: i32) {
+    if process_group <= 0 {
+        return;
+    }
+    // SAFETY: kill accepts a process-group ID and does not retain pointers.
+    unsafe {
+        let _ = libc::kill(-process_group, libc::SIGTERM);
+    }
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+    use tokio::time::{sleep, timeout};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{HostSession, SessionRequest, parse_exit};
+    use crate::capability::{ShellKind, ShellSelection};
+    use crate::config::EffectiveLimits;
+    use crate::ssh::SshPolicy;
+
+    #[test]
+    fn exit_payload_is_strictly_bounded() {
+        assert_eq!(parse_exit(b"7\n0\n1\n"), Ok((7, false, true)));
+        assert!(parse_exit(b"7\n0\n").is_err());
+        assert!(parse_exit(b"7\n0\n1\nextra\n").is_err());
+    }
+
+    fn limits() -> EffectiveLimits {
+        EffectiveLimits {
+            connect_timeout_ms: 2_000,
+            command_timeout_ms: 5_000,
+            max_frame_bytes: 8 * 1024 * 1024,
+            read_chunk_bytes: 64 * 1024,
+            max_read_bytes: 8 * 1024 * 1024,
+            max_write_bytes: 8 * 1024 * 1024,
+            preview_bytes: 1024,
+            max_output_bytes: 8 * 1024 * 1024,
+            global_concurrency: 8,
+            per_host_concurrency: 8,
+        }
+    }
+
+    fn request(command: &str, timeout: Duration) -> SessionRequest {
+        SessionRequest {
+            command: command.to_owned(),
+            cwd: "/tmp".to_owned(),
+            shell: ShellSelection {
+                shell: ShellKind::PosixSh,
+                fallback: false,
+            },
+            login_shell: None,
+            env: BTreeMap::new(),
+            stdin: None,
+            timeout,
+            stdout_limit: 1024,
+            stderr_limit: 1024,
+        }
+    }
+
+    fn fake_ssh(temp: &TempDir) -> PathBuf {
+        let path = temp.path().join("fake-ssh");
+        fs::write(
+            &path,
+            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\nexec /bin/sh -c \"$last\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn policy() -> SshPolicy {
+        SshPolicy {
+            options: Vec::new(),
+            control_path: PathBuf::from("/tmp/codex-ssh-session-test-control"),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_session_multiplexes_independent_requests_and_preserves_ids() {
+        let temp = TempDir::new().unwrap();
+        let session = HostSession::connect_with(
+            policy(),
+            "test-host".to_owned(),
+            limits(),
+            OsString::from(fake_ssh(&temp)),
+            BTreeMap::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let shared = Arc::new(session);
+        let first = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                shared
+                    .execute(
+                        request("sleep 0.15; printf first", Duration::from_secs(2)),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        let second = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                shared
+                    .execute(
+                        request("printf second", Duration::from_secs(2)),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_ne!(first.request_id, second.request_id);
+        assert_eq!(first.stdout, b"first");
+        assert_eq!(second.stdout, b"second");
+        shared.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_session_cancels_one_request_without_blocking_another() {
+        let temp = TempDir::new().unwrap();
+        let session = Arc::new(
+            HostSession::connect_with(
+                policy(),
+                "test-host".to_owned(),
+                limits(),
+                OsString::from(fake_ssh(&temp)),
+                BTreeMap::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let cancelled = {
+            let session = Arc::clone(&session);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                session
+                    .execute(
+                        request("sleep 5; printf late", Duration::from_secs(10)),
+                        cancel,
+                    )
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let quick = timeout(
+            Duration::from_secs(2),
+            session.execute(
+                request("printf quick", Duration::from_secs(2)),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let cancelled = cancelled.await.unwrap().unwrap_err();
+        assert_eq!(cancelled.code, crate::error::ErrorCode::Cancelled);
+        assert_eq!(quick.stdout, b"quick");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_startup_failure_is_a_hard_error() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("failing-ssh");
+        fs::write(&path, "#!/bin/sh\nexit 42\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = HostSession::connect_with(
+            policy(),
+            "test-host".to_owned(),
+            limits(),
+            OsString::from(path),
+            BTreeMap::new(),
+            CancellationToken::new(),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("dispatcher startup unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, crate::error::ErrorCode::ProtocolError);
+        assert!(error.message.contains("dispatcher"));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_chunks_streams_to_the_configured_frame_limit() {
+        let temp = TempDir::new().unwrap();
+        let mut limits = limits();
+        limits.max_frame_bytes = 4096;
+        let session = HostSession::connect_with(
+            policy(),
+            "test-host".to_owned(),
+            limits,
+            OsString::from(fake_ssh(&temp)),
+            BTreeMap::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut request = request(
+            "dd if=/dev/zero bs=4096 count=2 2>/dev/null",
+            Duration::from_secs(2),
+        );
+        request.stdout_limit = 8192;
+        request.stderr_limit = 1024;
+        let result = session
+            .execute(request, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout.len(), 8192);
+        assert!(!result.stdout_truncated);
+        session.close().await.unwrap();
+    }
+}

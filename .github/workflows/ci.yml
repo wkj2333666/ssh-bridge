@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.91.1"
+
+jobs:
+  quality:
+    name: Rust quality and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup component add rustfmt clippy --toolchain "$RUST_TOOLCHAIN"
+
+      - name: Install command-line test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+
+      - name: Check formatting
+        run: cargo +"$RUST_TOOLCHAIN" fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo +"$RUST_TOOLCHAIN" clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo +"$RUST_TOOLCHAIN" test --all-targets --all-features --locked -- --test-threads=1
+
+      - name: Build release binary
+        run: cargo +"$RUST_TOOLCHAIN" build --release --locked
+
+      - name: Validate source package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e bin/codex-ssh-bridge
+          test ! -e .mcp.json
+          test -f .mcp.json.example
+          cargo_version="$(cargo +"$RUST_TOOLCHAIN" metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          plugin_version="$(jq -r '.version' .codex-plugin/plugin.json)"
+          test "$cargo_version" = "$plugin_version"
+          jq -e '.mcpServers == null' .codex-plugin/plugin.json >/dev/null
+          jq -e '.mcpServers["ssh-bridge"].args == ["mcp"]' .mcp.json.example >/dev/null

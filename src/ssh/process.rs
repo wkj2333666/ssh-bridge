@@ -12,19 +12,22 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, duplex};
 use tokio::process::Command;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{RuntimePaths, SshPolicy, build_ssh_argv, build_ssh_g_argv};
+use super::{
+    HostSession, RuntimePaths, SessionRequest, SessionResult, SshPolicy, build_ssh_argv,
+    build_ssh_g_argv,
+};
 use crate::capability::{
     CAPABILITY_PROBE_SCRIPT, Capability, CapabilityCache, ShellKind, ShellRequest, ShellSelection,
     parse_probe_output, select_shell,
 };
-use crate::config::{Config, EffectiveLimits, MAX_REMOTE_CONTEXT_ROOT_BYTES};
+use crate::config::{Config, EffectiveLimits};
 use crate::error::{
     BridgeError, BridgeResult, ErrorCode, ErrorShellMetadata, attach_available_remote_context,
 };
@@ -33,7 +36,7 @@ use crate::output::{
     OutputProvenance, OutputReference, OutputStore, StderrSignals, StoredProvenance, StreamKind,
 };
 use crate::path::RemotePath;
-use crate::quote::{PreparedShellWord, PreparedShellWordParts, shell_word};
+use crate::quote::{PreparedShellWord, shell_word};
 
 const DEFAULT_SSH_EXECUTABLE: &str = "/usr/bin/ssh";
 const RESOLVED_STDOUT_LIMIT: u64 = 1024 * 1024;
@@ -42,47 +45,6 @@ const PROBE_OUTPUT_LIMIT: u64 = 1024 * 1024;
 const REMOTE_TIMEOUT_RETURN_GRACE: Duration = Duration::from_millis(200);
 const TERM_GRACE: Duration = Duration::from_millis(50);
 const DRAIN_GRACE: Duration = Duration::from_millis(125);
-const ROOT_GUARD_EXIT: i32 = 237;
-const ROOT_OBSERVE_PROTOCOL_RESERVE: u64 = 128;
-
-const ROOT_OBSERVE_SCRIPT: &str = r#"set -u
-[ "$#" -eq 1 ] || exit 2
-cd -P -- "$1" || exit 3
-physical_plus=$(pwd -P && printf x) || exit 3
-physical_with_delimiter=${physical_plus%x}
-newline='
-'
-physical_root=${physical_with_delimiter%"$newline"}
-identity=$(stat -L --printf='%d:%i' -- . 2>/dev/null) ||
-    identity=$(stat -f '%d:%i' . 2>/dev/null) || exit 78
-case "$identity" in *[!0-9:]*|:*|*:|*:*:*) exit 78 ;; esac
-device=${identity%%:*}
-inode=${identity#*:}
-printf 'CODEX_SSH_ROOT_OBSERVE=1\000ROOT=%s\000DEVICE=%s\000INODE=%s\000' \
-    "$physical_root" "$device" "$inode"
-"#;
-
-const ROOT_GUARD_PREFIX: &str = r#"set -u
-[ "$#" -ge 4 ] || exit 2
-r=$1;p=$2;i=$3:$4
-shift 4
-cd -P -- "$r" 2>/dev/null||exit 237
-x=$(pwd -P&&printf x)||exit 237
-x=${x%x};n='
-'
-x=${x%"$n"};[ "$x" = "$p" ]||exit 237
-x=$(stat -L -c %d:%i -- . 2>/dev/null)||x=$(stat -f %d:%i . 2>/dev/null)||exit 237
-[ "$x" = "$i" ]||exit 237
-(
-"#;
-
-const ROOT_GUARD_SUFFIX: &str = r#"
-)
-s=$?
-[ "$s" -ne 237 ]||exit 236
-exit "$s"
-"#;
-
 const LOGIN_OPERATION_SCRIPT: &str = r#"[ "$#" -eq 3 ]||exit 2
 cwd=$1
 login_shell=$2
@@ -109,19 +71,23 @@ pub struct RunResult {
     pub physical_root: String,
     pub output: CapturedOutput,
     pub remote_process_may_continue: bool,
+    pub timing: RunTiming,
+}
+
+/// Internal phase timing for validating warm SSH latency. The MCP response
+/// intentionally keeps the existing wire shape; callers that need timings
+/// can inspect the Rust runner result directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunTiming {
+    pub preparation_ms: u64,
+    pub session_ms: u64,
+    pub capture_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FixedOperationKind {
     ReadOnly,
     Mutation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RootIdentity {
-    pub(crate) physical_root: String,
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,7 +104,6 @@ pub(crate) struct FixedRunRequest {
     pub args: Vec<String>,
     pub stdin: Option<Vec<u8>>,
     pub rooted_paths: RootedPathInputs,
-    pub expected_root: Option<RootIdentity>,
     pub required_capabilities: &'static [&'static str],
     pub stdout_limit: u64,
     pub stderr_limit: u64,
@@ -148,9 +113,10 @@ pub(crate) struct FixedRunRequest {
 
 pub(crate) struct FixedRunResult {
     pub capability: Arc<Capability>,
-    pub root_identity: RootIdentity,
     pub shell: ShellSelection,
     pub output: InternalCapturedOutput,
+    pub elapsed_ms: u64,
+    pub remote_process_may_continue: bool,
 }
 
 pub struct SshRunner {
@@ -160,12 +126,13 @@ pub struct SshRunner {
     executable: PathBuf,
     environment: BTreeMap<OsString, OsString>,
     capabilities: CapabilityCache,
-    trusted_roots: Mutex<HashMap<String, RootIdentity>>,
-    observed_roots: Mutex<HashMap<String, RootIdentity>>,
+    policies: Mutex<HashMap<String, Arc<SshPolicy>>>,
     identities: Mutex<HashMap<String, String>>,
     initializers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     global_limit: Arc<Semaphore>,
     host_limits: StdMutex<HashMap<String, Arc<Semaphore>>>,
+    sessions: Mutex<HashMap<String, Arc<HostSession>>>,
+    session_initializers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl SshRunner {
@@ -212,12 +179,13 @@ impl SshRunner {
             executable,
             environment,
             capabilities: CapabilityCache::default(),
-            trusted_roots: Mutex::new(HashMap::new()),
-            observed_roots: Mutex::new(HashMap::new()),
+            policies: Mutex::new(HashMap::new()),
             identities: Mutex::new(HashMap::new()),
             initializers: Mutex::new(HashMap::new()),
             global_limit: Arc::new(Semaphore::new(global_concurrency)),
             host_limits: StdMutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            session_initializers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -245,7 +213,7 @@ impl SshRunner {
             return Err(cancelled_error(false, 0));
         }
 
-        let (policy, capability, trusted_root) = self
+        let (policy, capability) = self
             .initialize_host(&request.host, &root, limits.connect_timeout_ms, &cancel)
             .await?;
         drop(initialize_guard);
@@ -264,26 +232,12 @@ impl SshRunner {
         let operation_deadline = Instant::now()
             .checked_add(request.timeout)
             .ok_or_else(|| BridgeError::invalid_argument("command timeout is too large"))?;
-        let observed_root = self
-            .observe_root(
-                &policy,
-                &request.host,
-                &root,
-                remaining_timeout(operation_deadline)?,
-                &cancel,
-            )
+        let session = self
+            .session_for_host(&policy, &request.host, limits, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
-        if observed_root != trusted_root {
-            return Err(attach_selected_context(
-                root_drift_error(FixedOperationKind::Mutation),
-                &request.host,
-                &observed_root.physical_root,
-                &shell,
-            ));
-        }
         let remote_timeout = !matches!(shell.shell, ShellKind::Login)
             && capability.tools.get("timeout") == Some(&true);
         let prepared = (|| {
@@ -299,26 +253,17 @@ impl SshRunner {
                         false,
                     )
                 })?;
-                render_guarded_fixed_command(
-                    &root,
-                    &observed_root,
+                render_fixed_command(
                     LOGIN_OPERATION_SCRIPT,
                     &[cwd, login_shell.to_owned(), request.command.clone()],
-                    limits.max_frame_bytes,
                 )?
             } else {
-                let operation = render_remote_command(
+                render_remote_command(
                     &request.command,
                     &cwd,
                     &shell.shell,
                     remote_timeout,
                     timeout_ms,
-                    limits.max_frame_bytes,
-                )?;
-                render_root_guarded_command(
-                    &root,
-                    &observed_root,
-                    &operation,
                     limits.max_frame_bytes,
                 )?
             };
@@ -332,57 +277,93 @@ impl SshRunner {
             Ok((remote_command, local_deadline))
         })()
         .map_err(|error| {
-            attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
+            attach_selected_context(error, &request.host, &capability.physical_root, &shell)
         })?;
         let (remote_command, local_deadline) = prepared;
-        let argv = build_ssh_argv(&policy, &request.host, &remote_command);
-        let outcome = self
-            .run_child(
-                ChildSpec {
-                    argv,
+        let preparation_ms = elapsed_ms(operation_started.elapsed());
+        let session_result = match session
+            .execute(
+                SessionRequest {
+                    command: remote_command,
+                    cwd: root.clone(),
+                    shell: ShellSelection {
+                        shell: ShellKind::PosixSh,
+                        fallback: false,
+                    },
+                    login_shell: None,
+                    env: BTreeMap::new(),
                     stdin: request.stdin,
-                    capture_limits: CaptureLimits {
-                        preview_bytes: limits.preview_bytes,
-                        max_output_bytes: limits.max_output_bytes,
-                    },
-                    deadline: local_deadline,
-                    phase: Phase::Command {
-                        remote_timeout_wrapped: remote_timeout,
-                    },
-                    internal_registration: None,
+                    timeout: local_deadline,
+                    stdout_limit: limits.max_output_bytes,
+                    stderr_limit: limits.max_output_bytes,
                 },
-                &cancel,
-                &request.host,
+                cancel.clone(),
             )
             .await
-            .map_err(|error| {
-                attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
-            })?;
-
-        let output = outcome.output.into_public().map_err(|error| {
-            attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
-        })?;
-        self.observed_roots
-            .lock()
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if session.is_closed() {
+                    self.drop_session(&request.host, &session).await;
+                }
+                return Err(attach_selected_context(
+                    error,
+                    &request.host,
+                    &capability.physical_root,
+                    &shell,
+                ));
+            }
+        };
+        if session_result.stdout_truncated || session_result.stderr_truncated {
+            let mut error = BridgeError::new(
+                ErrorCode::OutputLimit,
+                "command output exceeded the configured limit",
+                false,
+            );
+            error.details.host = Some(request.host.clone());
+            error.details.bytes_seen = Some(
+                u64::try_from(session_result.stdout.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(session_result.stderr.len()).unwrap_or(u64::MAX)),
+            );
+            error.details.remote_process_may_continue = Some(false);
+            return Err(attach_selected_context(
+                error,
+                &request.host,
+                &capability.physical_root,
+                &shell,
+            ));
+        }
+        let capture_started = Instant::now();
+        let output = self
+            .capture_session_output(&session_result, limits, &cancel)
             .await
-            .insert(request.host.clone(), observed_root.clone());
+            .map_err(|error| {
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
+            })?;
+        let capture_ms = elapsed_ms(capture_started.elapsed());
         self.output_store
             .set_provenance(
                 &output,
                 OutputProvenance {
                     host: request.host.clone(),
-                    physical_root: observed_root.physical_root.clone(),
+                    physical_root: capability.physical_root.clone(),
                     shell: shell.clone(),
                 },
             )
             .await;
         Ok(RunResult {
-            status: outcome.status,
+            status: session_result.status,
             elapsed_ms: elapsed_ms(operation_started.elapsed()),
             shell,
-            physical_root: observed_root.physical_root,
+            physical_root: capability.physical_root.clone(),
             output,
             remote_process_may_continue: false,
+            timing: RunTiming {
+                preparation_ms,
+                session_ms: session_result.elapsed_ms,
+                capture_ms,
+            },
         })
     }
 
@@ -390,15 +371,143 @@ impl SshRunner {
         &self.config
     }
 
-    pub(crate) fn guarded_fixed_command_length(
+    async fn session_for_host(
         &self,
+        policy: &SshPolicy,
         host: &str,
-        identity: &RootIdentity,
+        limits: EffectiveLimits,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<Arc<HostSession>> {
+        if let Some(session) = self.sessions.lock().await.get(host).cloned() {
+            if !session.is_closed() {
+                return Ok(session);
+            }
+            self.sessions.lock().await.remove(host);
+        }
+        let connector = {
+            let mut initializers = self.session_initializers.lock().await;
+            Arc::clone(
+                initializers
+                    .entry(host.to_owned())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = connector.lock().await;
+        if let Some(session) = self.sessions.lock().await.get(host).cloned() {
+            if !session.is_closed() {
+                return Ok(session);
+            }
+            self.sessions.lock().await.remove(host);
+        }
+        let session = Arc::new(
+            HostSession::connect_with(
+                policy.clone(),
+                host.to_owned(),
+                limits,
+                self.executable.clone().into_os_string(),
+                self.environment.clone(),
+                cancel.clone(),
+            )
+            .await?,
+        );
+        self.sessions
+            .lock()
+            .await
+            .insert(host.to_owned(), Arc::clone(&session));
+        Ok(session)
+    }
+
+    async fn drop_session(&self, host: &str, expected: &Arc<HostSession>) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(host)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            sessions.remove(host);
+        }
+    }
+
+    async fn capture_session_output(
+        &self,
+        result: &SessionResult,
+        limits: EffectiveLimits,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<CapturedOutput> {
+        let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
+        let (mut stderr_writer, stderr_reader) = duplex(64 * 1024);
+        let stdout = result.stdout.clone();
+        let stderr = result.stderr.clone();
+        let stdout_task = tokio::spawn(async move {
+            let _ = stdout_writer.write_all(&stdout).await;
+            let _ = stdout_writer.shutdown().await;
+        });
+        let stderr_task = tokio::spawn(async move {
+            let _ = stderr_writer.write_all(&stderr).await;
+            let _ = stderr_writer.shutdown().await;
+        });
+        let captured = self
+            .output_store
+            .capture(
+                stdout_reader,
+                stderr_reader,
+                CaptureLimits {
+                    preview_bytes: limits.preview_bytes,
+                    max_output_bytes: limits.max_output_bytes,
+                },
+                cancel.clone(),
+            )
+            .await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        captured
+    }
+
+    async fn capture_session_internal(
+        &self,
+        result: SessionResult,
+        limits: EffectiveLimits,
+        max_output_bytes: u64,
+        cleanup: InternalSpoolRegistration,
+        cancel: &CancellationToken,
+    ) -> BridgeResult<InternalCapturedOutput> {
+        let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
+        let (mut stderr_writer, stderr_reader) = duplex(64 * 1024);
+        let stdout = result.stdout;
+        let stderr = result.stderr;
+        let stdout_task = tokio::spawn(async move {
+            let _ = stdout_writer.write_all(&stdout).await;
+            let _ = stdout_writer.shutdown().await;
+        });
+        let stderr_task = tokio::spawn(async move {
+            let _ = stderr_writer.write_all(&stderr).await;
+            let _ = stderr_writer.shutdown().await;
+        });
+        let captured = self
+            .output_store
+            .capture_internal(
+                stdout_reader,
+                stderr_reader,
+                CaptureLimits {
+                    preview_bytes: limits.preview_bytes.max(1),
+                    max_output_bytes,
+                },
+                cancel.clone(),
+                CancellationToken::new(),
+                cleanup,
+            )
+            .await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        captured
+    }
+
+    pub(crate) fn fixed_command_length(
+        &self,
+        _host: &str,
         operation: &'static str,
         args: &[String],
     ) -> BridgeResult<usize> {
-        let root = &self.config.host(host)?.profile.root;
-        render_inlined_root_guard_length(root, identity, operation, args)
+        render_fixed_command_length(operation, args)
     }
 
     pub(crate) async fn prepare_host(
@@ -420,29 +529,16 @@ impl SshRunner {
             .await?;
         let prepared = self
             .initialize_host(host, &root, limits.connect_timeout_ms, cancel)
-            .await
-            .map(|(policy, capability, _trusted_root)| (policy, capability));
+            .await;
         drop(initialize_guard);
         prepared
     }
 
     pub(crate) async fn cached_capability(&self, host: &str) -> Option<Arc<Capability>> {
-        let capability = self.capabilities.get(host).await?;
-        let observed = self.observed_roots.lock().await.get(host).cloned();
-        match observed {
-            None => Some(capability),
-            Some(observed) => {
-                let mut current = (*capability).clone();
-                current.physical_root = observed.physical_root;
-                current.root_device = observed.device;
-                current.root_inode = observed.inode;
-                Some(Arc::new(current))
-            }
-        }
+        self.capabilities.get(host).await
     }
 
     pub(crate) async fn invalidate_capability(&self, host: &str) -> bool {
-        self.observed_roots.lock().await.remove(host);
         self.capabilities.invalidate(host).await
     }
 
@@ -533,7 +629,7 @@ impl SshRunner {
         let _reservation = self
             .acquire_operation(&request.host, limits.per_host_concurrency, &cancel)
             .await?;
-        let (policy, capability, trusted_root) = self
+        let (policy, capability) = self
             .initialize_host(&request.host, &root, limits.connect_timeout_ms, &cancel)
             .await?;
         drop(initialize_guard);
@@ -546,7 +642,7 @@ impl SshRunner {
                 return Err(attach_selected_context(
                     BridgeError::new(
                         ErrorCode::RemoteCapabilityMissing,
-                        "remote host lacks a required capability",
+                        format!("remote host lacks required capability: {key}"),
                         false,
                     ),
                     &request.host,
@@ -558,38 +654,12 @@ impl SshRunner {
         let operation_deadline = Instant::now()
             .checked_add(request.timeout)
             .ok_or_else(|| BridgeError::invalid_argument("fixed command timeout is too large"))?;
-        let observed_root = self
-            .observe_root(
-                &policy,
-                &request.host,
-                &root,
-                remaining_timeout(operation_deadline)?,
-                &cancel,
-            )
+        let session = self
+            .session_for_host(&policy, &request.host, limits, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
-        if request.kind == FixedOperationKind::Mutation && observed_root != trusted_root {
-            return Err(attach_selected_context(
-                root_drift_error(request.kind),
-                &request.host,
-                &observed_root.physical_root,
-                &shell,
-            ));
-        }
-        if request
-            .expected_root
-            .as_ref()
-            .is_some_and(|expected_root| &observed_root != expected_root)
-        {
-            return Err(attach_selected_context(
-                root_drift_error(request.kind),
-                &request.host,
-                &observed_root.physical_root,
-                &shell,
-            ));
-        }
         pin_fixed_inputs(
             &root,
             &mut request.args,
@@ -601,39 +671,94 @@ impl SshRunner {
             .max_frame_bytes
             .checked_sub(stdin_bytes)
             .ok_or_else(rendered_too_large)?;
-        let remote_command = render_guarded_fixed_command(
-            &root,
-            &observed_root,
-            request.script,
-            &request.args,
-            command_limit,
-        )?;
-        let outcome = self
-            .run_child(
-                ChildSpec {
-                    argv: build_ssh_argv(&policy, &request.host, &remote_command),
+        let remote_command =
+            render_fixed_command_text(request.script, &request.args, command_limit)?;
+        let session_result = match session
+            .execute(
+                SessionRequest {
+                    command: remote_command,
+                    cwd: root.clone(),
+                    shell: shell.clone(),
+                    login_shell: None,
+                    env: BTreeMap::new(),
                     stdin: request.stdin,
-                    capture_limits: CaptureLimits {
-                        preview_bytes: 1,
-                        max_output_bytes: capture_limit,
-                    },
-                    deadline: remaining_timeout(operation_deadline)?,
-                    phase: Phase::Fixed { kind: request.kind },
-                    internal_registration: Some(request.cleanup),
+                    timeout: remaining_timeout(operation_deadline).map_err(|error| {
+                        attach_selected_context(
+                            error,
+                            &request.host,
+                            &capability.physical_root,
+                            &shell,
+                        )
+                    })?,
+                    stdout_limit: request.stdout_limit,
+                    stderr_limit: request.stderr_limit,
                 },
-                &cancel,
-                &request.host,
+                cancel.clone(),
             )
             .await
-            .map_err(|error| {
-                attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
-            })?;
-        let output = outcome
-            .output
-            .into_internal()
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if session.is_closed() {
+                    self.drop_session(&request.host, &session).await;
+                }
+                return Err(attach_selected_context(
+                    request.kind.after_spawn_error(error),
+                    &request.host,
+                    &capability.physical_root,
+                    &shell,
+                ));
+            }
+        };
+        if session_result.status != 0 {
+            let mut error = BridgeError::new(
+                ErrorCode::RemoteExit,
+                "remote fixed operation failed",
+                false,
+            );
+            error.details.exit_status = Some(session_result.status);
+            error.details.host = Some(request.host.clone());
+            return Err(attach_selected_context(
+                request.kind.after_spawn_error(error),
+                &request.host,
+                &capability.physical_root,
+                &shell,
+            ));
+        }
+        if session_result.stdout_truncated || session_result.stderr_truncated {
+            let mut error = BridgeError::new(
+                ErrorCode::OutputLimit,
+                "fixed output exceeded its stream limit",
+                false,
+            );
+            error.details.elapsed_ms = Some(session_result.elapsed_ms);
+            error.details.bytes_seen = Some(
+                u64::try_from(session_result.stdout.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(session_result.stderr.len()).unwrap_or(u64::MAX)),
+            );
+            error.details.remote_process_may_continue = Some(true);
+            return Err(attach_selected_context(
+                request.kind.after_spawn_error(error),
+                &request.host,
+                &capability.physical_root,
+                &shell,
+            ));
+        }
+        let session_elapsed_ms = session_result.elapsed_ms;
+        let session_remote_process_may_continue = session_result.remote_process_may_continue;
+        let output = self
+            .capture_session_internal(
+                session_result,
+                limits,
+                capture_limit,
+                request.cleanup,
+                &cancel,
+            )
+            .await
             .map_err(|error| request.kind.after_spawn_error(error))
             .map_err(|error| {
-                attach_selected_context(error, &request.host, &observed_root.physical_root, &shell)
+                attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
         if output.stdout_len > request.stdout_limit || output.stderr_len > request.stderr_limit {
             return Err(attach_selected_context(
@@ -643,73 +768,17 @@ impl SshRunner {
                     false,
                 )),
                 &request.host,
-                &observed_root.physical_root,
+                &capability.physical_root,
                 &shell,
             ));
         }
-        let mut operation_capability = (*capability).clone();
-        operation_capability.physical_root = observed_root.physical_root.clone();
-        operation_capability.root_device = observed_root.device;
-        operation_capability.root_inode = observed_root.inode;
-        self.observed_roots
-            .lock()
-            .await
-            .insert(request.host.clone(), observed_root.clone());
         Ok(FixedRunResult {
-            capability: Arc::new(operation_capability),
-            root_identity: observed_root,
+            capability,
             shell,
             output,
+            elapsed_ms: session_elapsed_ms,
+            remote_process_may_continue: session_remote_process_may_continue,
         })
-    }
-
-    async fn observe_root(
-        &self,
-        policy: &SshPolicy,
-        host: &str,
-        requested_root: &str,
-        deadline: Duration,
-        cancel: &CancellationToken,
-    ) -> BridgeResult<RootIdentity> {
-        let command = render_fixed_command(ROOT_OBSERVE_SCRIPT, &[requested_root.to_owned()])?;
-        let output_limit = u64::try_from(MAX_REMOTE_CONTEXT_ROOT_BYTES)
-            .expect("root bound fits u64")
-            .checked_add(ROOT_OBSERVE_PROTOCOL_RESERVE)
-            .expect("root protocol bound fits u64");
-        let outcome = self
-            .run_child(
-                ChildSpec {
-                    argv: build_ssh_argv(policy, host, &command),
-                    stdin: None,
-                    capture_limits: CaptureLimits {
-                        preview_bytes: usize::try_from(output_limit * 2)
-                            .expect("root observation bound fits usize"),
-                        max_output_bytes: output_limit,
-                    },
-                    deadline,
-                    phase: Phase::RootObserve,
-                    internal_registration: None,
-                },
-                cancel,
-                host,
-            )
-            .await
-            .map_err(|error| {
-                if error.code == ErrorCode::RemoteExit && error.details.exit_status == Some(78) {
-                    BridgeError::new(
-                        ErrorCode::RemoteCapabilityMissing,
-                        "remote root identity requires compatible GNU or BSD stat",
-                        false,
-                    )
-                } else {
-                    error
-                }
-            })?;
-        let output = outcome.output.into_public()?;
-        let stdout = joined_preview(&output.stdout);
-        let parsed = parse_root_observation(&stdout);
-        self.output_store.discard(&output).await;
-        parsed
     }
 
     async fn initializer(&self, host: &str) -> Arc<Mutex<()>> {
@@ -727,31 +796,42 @@ impl SshRunner {
         root: &str,
         connect_timeout_ms: u64,
         cancel: &CancellationToken,
-    ) -> BridgeResult<(SshPolicy, Arc<Capability>, RootIdentity)> {
-        let resolved_identity = self
-            .resolve_identity_once(host, connect_timeout_ms, cancel)
-            .await?;
-        let identity = {
-            let mut identities = self.identities.lock().await;
-            match identities.get(host) {
-                Some(identity) if identity != &resolved_identity => {
-                    return Err(BridgeError::invalid_config(
-                        "resolved SSH connection identity changed; verify the alias and restart the bridge",
-                    ));
-                }
-                Some(identity) => identity.clone(),
-                None => {
-                    identities.insert(host.to_owned(), resolved_identity.clone());
-                    resolved_identity
-                }
+    ) -> BridgeResult<(SshPolicy, Arc<Capability>)> {
+        let cached_policy = self.policies.lock().await.get(host).cloned();
+        let policy = match cached_policy {
+            Some(policy) => (*policy).clone(),
+            None => {
+                let resolved_identity = self
+                    .resolve_identity_once(host, connect_timeout_ms, cancel)
+                    .await?;
+                let identity = {
+                    let mut identities = self.identities.lock().await;
+                    match identities.get(host) {
+                        Some(identity) if identity != &resolved_identity => {
+                            return Err(BridgeError::invalid_config(
+                                "resolved SSH connection identity changed; verify the alias and restart the bridge",
+                            ));
+                        }
+                        Some(identity) => identity.clone(),
+                        None => {
+                            identities.insert(host.to_owned(), resolved_identity.clone());
+                            resolved_identity
+                        }
+                    }
+                };
+                let policy = SshPolicy::for_host(
+                    &self.config,
+                    self.config.host(host)?,
+                    &self.runtime,
+                    &identity,
+                )?;
+                self.policies
+                    .lock()
+                    .await
+                    .insert(host.to_owned(), Arc::new(policy.clone()));
+                policy
             }
         };
-        let policy = SshPolicy::for_host(
-            &self.config,
-            self.config.host(host)?,
-            &self.runtime,
-            &identity,
-        )?;
         let capability = self
             .capabilities
             .get_or_probe(host, || async {
@@ -759,19 +839,7 @@ impl SshRunner {
                     .await
             })
             .await?;
-        let candidate_root = RootIdentity {
-            physical_root: capability.physical_root.clone(),
-            device: capability.root_device,
-            inode: capability.root_inode,
-        };
-        let trusted_root = self
-            .trusted_roots
-            .lock()
-            .await
-            .entry(host.to_owned())
-            .or_insert(candidate_root)
-            .clone();
-        Ok((policy, capability, trusted_root))
+        Ok((policy, capability))
     }
 
     async fn resolve_identity_once(
@@ -1135,20 +1203,13 @@ impl SshRunner {
             return self.failed_exit(-1, output, phase, host, elapsed).await;
         };
         if code == 0 {
-            return Ok(ChildOutcome {
-                status: code,
-                output,
-            });
+            return Ok(ChildOutcome { output });
         }
         if matches!(phase, Phase::Command { .. })
             && code != 255
-            && code != ROOT_GUARD_EXIT
             && !(phase.remote_timeout_wrapped() && code == 124)
         {
-            return Ok(ChildOutcome {
-                status: code,
-                output,
-            });
+            return Ok(ChildOutcome { output });
         }
         self.failed_exit(code, output, phase, host, elapsed).await
     }
@@ -1161,25 +1222,6 @@ impl SshRunner {
         host: &str,
         elapsed: Duration,
     ) -> BridgeResult<ChildOutcome> {
-        let root_guard_kind = match phase {
-            Phase::Fixed { kind } => Some(kind),
-            Phase::Command { .. } => Some(FixedOperationKind::Mutation),
-            Phase::Resolve | Phase::Probe | Phase::RootObserve => None,
-        };
-        if code == ROOT_GUARD_EXIT
-            && let Some(kind) = root_guard_kind
-        {
-            let bytes_seen = output.aggregate_bytes();
-            if let ChildCaptured::Public(output) = &output {
-                self.output_store.discard(output).await;
-            }
-            let mut error = root_drift_error(kind);
-            error.details.host = Some(host.to_owned());
-            error.details.elapsed_ms = Some(elapsed_ms(elapsed));
-            error.details.exit_status = Some(code);
-            error.details.bytes_seen = Some(bytes_seen);
-            return Err(error);
-        }
         let error_code = if phase.remote_timeout_wrapped() && code == 124 {
             ErrorCode::CommandTimeout
         } else if code == 255 && phase.allows_transport_classification() {
@@ -1219,7 +1261,6 @@ struct OperationReservation {
 }
 
 struct ChildOutcome {
-    status: i32,
     output: ChildCaptured,
 }
 
@@ -1296,16 +1337,6 @@ impl ChildCaptured {
             )),
         }
     }
-    fn into_internal(self) -> BridgeResult<InternalCapturedOutput> {
-        match self {
-            Self::Internal(output) => Ok(output),
-            Self::Public(_) => Err(BridgeError::new(
-                ErrorCode::Io,
-                "public capture used by fixed command",
-                false,
-            )),
-        }
-    }
 }
 
 struct ChildSpec {
@@ -1318,10 +1349,10 @@ struct ChildSpec {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum Phase {
     Resolve,
     Probe,
-    RootObserve,
     Command { remote_timeout_wrapped: bool },
     Fixed { kind: FixedOperationKind },
 }
@@ -1347,12 +1378,12 @@ impl Phase {
     fn after_spawn_error(self, error: BridgeError) -> BridgeError {
         match self {
             Self::Fixed { kind } => kind.after_spawn_error(error),
-            Self::Resolve | Self::Probe | Self::RootObserve | Self::Command { .. } => error,
+            Self::Resolve | Self::Probe | Self::Command { .. } => error,
         }
     }
 
     fn allows_transport_classification(self) -> bool {
-        matches!(self, Self::Resolve | Self::Probe | Self::RootObserve)
+        matches!(self, Self::Resolve | Self::Probe)
     }
 
     fn accepts_early_stdin_close(self) -> bool {
@@ -1376,11 +1407,6 @@ impl Phase {
                 ErrorCode::ConnectTimeout,
                 "SSH capability probe timed out",
                 true,
-            ),
-            Self::RootObserve => (
-                ErrorCode::CommandTimeout,
-                "remote root validation timed out",
-                false,
             ),
             Self::Command { .. } | Self::Fixed { .. } => {
                 (ErrorCode::CommandTimeout, "remote command timed out", false)
@@ -1426,7 +1452,7 @@ fn remaining_timeout(deadline: Instant) -> BridgeResult<Duration> {
         .ok_or_else(|| {
             let mut error = BridgeError::new(
                 ErrorCode::CommandTimeout,
-                "remote operation exhausted its timeout during root validation",
+                "remote operation exhausted its timeout before command completion",
                 false,
             );
             error.details.remote_process_may_continue = Some(false);
@@ -1613,137 +1639,6 @@ fn render_fixed_command_text(
     Ok(command)
 }
 
-fn render_guarded_fixed_command(
-    requested_root: &str,
-    identity: &RootIdentity,
-    operation: &'static str,
-    args: &[String],
-    maximum: usize,
-) -> BridgeResult<String> {
-    render_inlined_root_guard(requested_root, identity, operation, args, maximum)
-}
-
-fn render_root_guarded_command(
-    requested_root: &str,
-    identity: &RootIdentity,
-    operation: &str,
-    maximum: usize,
-) -> BridgeResult<String> {
-    render_inlined_root_guard(requested_root, identity, operation, &[], maximum)
-}
-
-fn render_inlined_root_guard(
-    requested_root: &str,
-    identity: &RootIdentity,
-    operation: &str,
-    operation_args: &[String],
-    maximum: usize,
-) -> BridgeResult<String> {
-    let length =
-        render_inlined_root_guard_length(requested_root, identity, operation, operation_args)?;
-    ensure_rendered_bound(length, maximum)?;
-    let device = identity.device.to_string();
-    let inode = identity.inode.to_string();
-    let script = PreparedShellWordParts::new([ROOT_GUARD_PREFIX, operation, ROOT_GUARD_SUFFIX])?;
-    let fixed_args = [
-        PreparedShellWord::new(requested_root)?,
-        PreparedShellWord::new(&identity.physical_root)?,
-        PreparedShellWord::new(&device)?,
-        PreparedShellWord::new(&inode)?,
-    ];
-    let operation_args = operation_args
-        .iter()
-        .map(|argument| PreparedShellWord::new(argument))
-        .collect::<BridgeResult<Vec<_>>>()?;
-    let mut rendered = String::with_capacity(length);
-    rendered.push_str(FIXED_COMMAND_PREFIX);
-    script.push_to(&mut rendered)?;
-    rendered.push_str(FIXED_COMMAND_ARG0);
-    for argument in fixed_args.iter().chain(&operation_args) {
-        rendered.push(' ');
-        argument.push_to(&mut rendered)?;
-    }
-    debug_assert_eq!(rendered.len(), length);
-    Ok(rendered)
-}
-
-fn render_inlined_root_guard_length(
-    requested_root: &str,
-    identity: &RootIdentity,
-    operation: &str,
-    operation_args: &[String],
-) -> BridgeResult<usize> {
-    let device = identity.device.to_string();
-    let inode = identity.inode.to_string();
-    let script = PreparedShellWordParts::new([ROOT_GUARD_PREFIX, operation, ROOT_GUARD_SUFFIX])?;
-    let fixed_args = [
-        PreparedShellWord::new(requested_root)?,
-        PreparedShellWord::new(&identity.physical_root)?,
-        PreparedShellWord::new(&device)?,
-        PreparedShellWord::new(&inode)?,
-    ];
-    let operation_args = operation_args
-        .iter()
-        .map(|argument| PreparedShellWord::new(argument))
-        .collect::<BridgeResult<Vec<_>>>()?;
-    fixed_args.iter().chain(&operation_args).try_fold(
-        checked_rendered_length([
-            FIXED_COMMAND_PREFIX.len(),
-            script.len(),
-            FIXED_COMMAND_ARG0.len(),
-        ])?,
-        |length, argument| checked_rendered_length([length, 1, argument.len()]),
-    )
-}
-
-fn parse_root_observation(output: &[u8]) -> BridgeResult<RootIdentity> {
-    let fields = output.split(|byte| *byte == 0).collect::<Vec<_>>();
-    if fields.len() != 5 || !fields[4].is_empty() || fields[0] != b"CODEX_SSH_ROOT_OBSERVE=1" {
-        return Err(root_observation_error());
-    }
-    let root = fields[1]
-        .strip_prefix(b"ROOT=")
-        .ok_or_else(root_observation_error)?;
-    let device = fields[2]
-        .strip_prefix(b"DEVICE=")
-        .ok_or_else(root_observation_error)?;
-    let inode = fields[3]
-        .strip_prefix(b"INODE=")
-        .ok_or_else(root_observation_error)?;
-    let physical_root = std::str::from_utf8(root).map_err(|_| root_observation_error())?;
-    if physical_root.len() > MAX_REMOTE_CONTEXT_ROOT_BYTES || !physical_root.starts_with('/') {
-        return Err(root_observation_error());
-    }
-    let normalized =
-        RemotePath::resolve("/", physical_root).map_err(|_| root_observation_error())?;
-    if normalized.absolute() != physical_root {
-        return Err(root_observation_error());
-    }
-    Ok(RootIdentity {
-        physical_root: physical_root.to_owned(),
-        device: parse_root_observation_u64(device)?,
-        inode: parse_root_observation_u64(inode)?,
-    })
-}
-
-fn parse_root_observation_u64(value: &[u8]) -> BridgeResult<u64> {
-    if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) {
-        return Err(root_observation_error());
-    }
-    std::str::from_utf8(value)
-        .map_err(|_| root_observation_error())?
-        .parse()
-        .map_err(|_| root_observation_error())
-}
-
-fn root_observation_error() -> BridgeError {
-    BridgeError::new(
-        ErrorCode::ProtocolError,
-        "remote root observation is invalid",
-        false,
-    )
-}
-
 fn pin_fixed_inputs(
     configured_root: &str,
     args: &mut [String],
@@ -1823,21 +1718,6 @@ fn rooted_path_error() -> BridgeError {
         "fixed rooted path escaped the configured root",
         false,
     )
-}
-
-fn root_drift_error(kind: FixedOperationKind) -> BridgeError {
-    match kind {
-        FixedOperationKind::ReadOnly => BridgeError::read_conflict(),
-        FixedOperationKind::Mutation => {
-            let mut error = BridgeError::new(
-                ErrorCode::WriteConflict,
-                "remote physical root changed after trust was established",
-                false,
-            );
-            error.details.mutation_may_have_applied = Some(false);
-            error
-        }
-    }
 }
 
 fn format_timeout_duration(timeout_ms: u64) -> BridgeResult<String> {
@@ -1999,45 +1879,9 @@ fn elapsed_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildSpec, FixedOperationKind, Phase, RootIdentity, SshRunner, capability_probe_command,
-        mutation_unknown, render_fixed_command, render_guarded_fixed_command,
-        render_remote_command, render_root_guarded_command,
+        ChildSpec, FixedOperationKind, Phase, SshRunner, capability_probe_command,
+        mutation_unknown, render_fixed_command, render_fixed_command_text, render_remote_command,
     };
-
-    #[test]
-    fn final_guarded_transport_is_checked_after_trusted_wrapper_expansion() {
-        let original = render_fixed_command("printf %s \"$1\"", &["x".repeat(512)]).unwrap();
-        let guarded = render_guarded_fixed_command(
-            "/r",
-            &RootIdentity {
-                physical_root: "/physical/root".to_owned(),
-                device: 1,
-                inode: 2,
-            },
-            "printf %s \"$1\"",
-            &["x".repeat(512)],
-            usize::MAX,
-        )
-        .unwrap();
-        let maximum = guarded.len() - 1;
-        assert!(original.len() <= maximum);
-        assert_eq!(
-            render_guarded_fixed_command(
-                "/r",
-                &RootIdentity {
-                    physical_root: "/physical/root".to_owned(),
-                    device: 1,
-                    inode: 2,
-                },
-                "printf %s \"$1\"",
-                &["x".repeat(512)],
-                maximum,
-            )
-            .unwrap_err()
-            .code,
-            ErrorCode::RequestTooLarge
-        );
-    }
     use crate::capability::{ShellKind, parse_probe_output};
     use crate::config::{Config, HostProfile};
     use crate::error::{BridgeError, ErrorCode};
@@ -2245,14 +2089,9 @@ mod tests {
                 start.wait();
                 let mut last_error = None;
                 for _ in 0..ROUNDS {
-                    let error = render_root_guarded_command(
-                        "/srv/project",
-                        &RootIdentity {
-                            physical_root: "/srv/project".to_owned(),
-                            device: 1,
-                            inode: 2,
-                        },
-                        &command,
+                    let error = render_fixed_command_text(
+                        "printf %s \"$1\"",
+                        &[command.as_ref().clone()],
                         crate::MAX_FRAME_BYTES,
                     )
                     .unwrap_err();
@@ -2325,6 +2164,25 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"quote'\0line\n$()`\0-x\0");
+    }
+
+    #[test]
+    fn direct_rendering_has_no_physical_root_protocol() {
+        let fixed = render_fixed_command("printf ok", &[]).unwrap();
+        assert!(!fixed.contains("CODEX_SSH_ROOT_OBSERVE"));
+        assert!(!fixed.contains("237"));
+
+        let run = render_remote_command(
+            "printf ok",
+            ".",
+            &ShellKind::PosixSh,
+            false,
+            1000,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(!run.contains("CODEX_SSH_ROOT_OBSERVE"));
+        assert!(!run.contains("237"));
     }
 
     #[test]
@@ -2423,7 +2281,6 @@ mod tests {
             args: Vec::new(),
             stdin: None,
             rooted_paths: super::RootedPathInputs::default(),
-            expected_root: None,
             required_capabilities: &["safe_write"],
             stdout_limit,
             stderr_limit,
@@ -2724,7 +2581,7 @@ mod tests {
             .execute_fixed_once(
                 task5_fixed_request(
                     FixedOperationKind::Mutation,
-                    Duration::from_millis(20),
+                    Duration::from_millis(200),
                     owner.registration(),
                     16,
                     16,
@@ -2773,7 +2630,7 @@ mod tests {
         let fixture = task5_fixed_fixture(&[
             ("FAKE_SSH_LOG", overflow_log.display().to_string()),
             ("FAKE_SSH_MODE", "bytes".to_owned()),
-            ("FAKE_SSH_STDOUT_BYTES", "64".to_owned()),
+            ("FAKE_SSH_FIXED_STDOUT_BYTES", "64".to_owned()),
         ]);
         let owner = InternalSpoolOwner::new();
         let error = fixture

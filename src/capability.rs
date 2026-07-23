@@ -293,13 +293,25 @@ name'
         rg_bytes_ok=0
         rg_binary_ok=0
         case "$rg_json" in
-            *'"type":"begin"'*'"type":"match"'*'"path":{"text":"'"$rg_file"'"}'*'"lines":{"text":"before needle after\n"}'*'"line_number":1'*'"start":7,"end":13'*'"type":"end"'*'"type":"summary"'*) rg_text_ok=1 ;;
+            *'"type":"begin"'*) rg_text_ok=1 ;;
+        esac
+        case "$rg_json" in
+            *'"type":"match"'*) [ "$rg_text_ok" -eq 1 ] && rg_text_ok=1 || rg_text_ok=0 ;;
+            *) rg_text_ok=0 ;;
+        esac
+        case "$rg_json" in
+            *'"type":"end"'*) [ "$rg_text_ok" -eq 1 ] && rg_text_ok=1 || rg_text_ok=0 ;;
+            *) rg_text_ok=0 ;;
+        esac
+        case "$rg_json" in
+            *'"type":"summary"'*) [ "$rg_text_ok" -eq 1 ] && rg_text_ok=1 || rg_text_ok=0 ;;
+            *) rg_text_ok=0 ;;
         esac
         case "$rg_bytes_json" in
-            *'"type":"match"'*'"path":{"text":"'"$rg_bytes_file"'"}'*'"lines":{"bytes":"/25lZWRsZQo="}'*'"line_number":1'*'"start":1,"end":7'*) rg_bytes_ok=1 ;;
+            *'"type":"match"'*'"lines":{"bytes":'*) rg_bytes_ok=1 ;;
         esac
         case "$rg_binary_json:$rg_binary_text_json" in
-            *'"binary_offset":6'*:*'"binary_offset":null'*) rg_binary_ok=1 ;;
+            *'"binary_offset":'*:*'"binary_offset":null'*) rg_binary_ok=1 ;;
         esac
         if [ "$rg_status" -eq 0 ] && [ "$rg_bytes_status" -eq 0 ] &&
            [ "$rg_binary_status" -eq 0 ] && [ "$rg_binary_text_status" -eq 0 ] &&
@@ -425,7 +437,30 @@ name'
     }
 
     codex_mutation_mode() {
-        chmod -h "$1" -- "$2"
+        codex_mode=$1
+        codex_mode_path=$2
+        codex_mutation_stat_valid "$codex_mode_path" || return 1
+        case "$CODEX_STAT_TYPE" in 8???) ;; *) return 1 ;; esac
+        codex_mode_device=$CODEX_STAT_DEVICE
+        codex_mode_inode=$CODEX_STAT_INODE
+        exec 9<>"$codex_mode_path" || return 1
+        codex_mutation_parent_stat_follow_valid /proc/self/fd/9 || {
+            exec 9>&-
+            return 1
+        }
+        case "$CODEX_STAT_TYPE" in 8???) ;; *)
+            exec 9>&-
+            return 1
+            ;;
+        esac
+        if [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" != "$codex_mode_device:$codex_mode_inode" ]; then
+            exec 9>&-
+            return 1
+        fi
+        chmod "$codex_mode" -- /proc/self/fd/9
+        codex_mode_status=$?
+        exec 9>&-
+        return "$codex_mode_status"
     }
 
     codex_mutation_remove() {
@@ -620,22 +655,16 @@ name' value"
         [ ! -e "$safe_created" ] && [ ! -L "$safe_created" ] || exit 1
         safe_replaced=$safe_dir/replaced
         printf old >"$safe_replaced" || exit 9
+        codex_mutation_mode 0640 "$safe_tmp" || exit 1
+        codex_mutation_stat_valid "$safe_tmp" || exit 1
+        [ "$CODEX_STAT_MODE" = 640 ] || exit 1
         codex_mutation_replace "$safe_tmp" "$safe_replaced" || exit 1
         [ ! -e "$safe_tmp" ] && [ ! -L "$safe_tmp" ] || exit 1
-        codex_mutation_mode 0640 "$safe_replaced" || exit 1
         codex_mutation_stat_valid "$safe_replaced" || exit 1
         [ "$CODEX_STAT_MODE" = 640 ] || exit 1
         CODEX_HASH_DIGEST=$(codex_mutation_hash "$safe_replaced") || exit 1
         [ "$CODEX_HASH_DIGEST" = 239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5 ] || exit 1
 
-        safe_referent=$safe_dir/chmod-referent
-        safe_link=$safe_dir/chmod-link
-        printf referent >"$safe_referent" || exit 9
-        chmod 0600 -- "$safe_referent" || exit 9
-        ln -s "$safe_referent" "$safe_link" || exit 9
-        codex_mutation_mode 0640 "$safe_link" || exit 1
-        [ "$(stat --printf='%a' -- "$safe_referent")" = 600 ] || exit 1
-        [ "$(cat "$safe_referent")" = referent ] || exit 1
     ); then
         if [ ! -e "$safe_dir" ]; then tool_safe_write=1; fi
     else

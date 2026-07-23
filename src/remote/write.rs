@@ -9,8 +9,7 @@ use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
 use crate::path::RemotePath;
 use crate::ssh::{
-    FixedOperationKind, FixedRunRequest, FixedRunResult, RootIdentity, RootedPathInputs,
-    render_fixed_command,
+    FixedOperationKind, FixedRunRequest, FixedRunResult, RootedPathInputs, render_fixed_command,
 };
 
 use super::protocol::{context, encode_bytes, read_small_stream};
@@ -67,7 +66,30 @@ codex_mutation_replace() {
 }
 
 codex_mutation_mode() {
-    chmod -h "$1" -- "$2"
+    codex_mode=$1
+    codex_mode_path=$2
+    codex_mutation_stat_valid "$codex_mode_path" || return 1
+    case "$CODEX_STAT_TYPE" in 8???) ;; *) return 1 ;; esac
+    codex_mode_device=$CODEX_STAT_DEVICE
+    codex_mode_inode=$CODEX_STAT_INODE
+    exec 9<>"$codex_mode_path" || return 1
+    codex_mutation_parent_stat_follow_valid /proc/self/fd/9 || {
+        exec 9>&-
+        return 1
+    }
+    case "$CODEX_STAT_TYPE" in 8???) ;; *)
+        exec 9>&-
+        return 1
+        ;;
+    esac
+    if [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" != "$codex_mode_device:$codex_mode_inode" ]; then
+        exec 9>&-
+        return 1
+    fi
+    chmod "$codex_mode" -- /proc/self/fd/9
+    codex_mode_status=$?
+    exec 9>&-
+    return "$codex_mode_status"
 }
 
 codex_mutation_remove() {
@@ -275,10 +297,7 @@ codex_safe_write_sentinel() (
     codex_sentinel_hash_status=0
     codex_sentinel_hash=$(codex_mutation_hash "$codex_sentinel_link") || codex_sentinel_hash_status=$?
     [ "$codex_sentinel_hash_status" -eq 9 ] || exit 1
-    codex_mutation_mode 0640 "$codex_sentinel_link" || exit 9
-    codex_sentinel_outside_mode=$(stat --printf='%a' -- "$codex_sentinel_outside") || exit 9
     codex_sentinel_outside_content=$(cat "$codex_sentinel_outside") || exit 9
-    [ "$codex_sentinel_outside_mode" = 600 ] || exit 1
     [ "$codex_sentinel_outside_content" = OUTSIDE ] || exit 1
 
     cleanup_codex_sentinel || exit 9
@@ -511,6 +530,13 @@ if [ "$expected_hash_present" = 1 ]; then
     [ "$target_hash" = "$expected_target_hash" ] || emit_one WRITE_CONFLICT
 fi
 
+# Apply mode before exposing the staged inode at the target path.  This keeps
+# chmod from ever following an attacker-replaced target symlink.
+codex_mutation_mode "$target_mode" "$tmp" || exit 5
+codex_mutation_stat_valid "$tmp" || exit 5
+case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
+[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_device:$stage_inode:$target_mode:$expected_size:1" ] || exit 5
+
 codex_mutation_replace "$tmp" "$target" || exit 5
 [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
 tmp=
@@ -518,15 +544,8 @@ tmp=
 codex_mutation_stat_valid "$target" || exit 5
 case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
 [ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
-[ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:600:$expected_size:1" ] || exit 5
-target_hash=$(codex_mutation_hash "$target") || exit 5
-[ "$target_hash" = "$expected_content_hash" ] || exit 5
-
-codex_mutation_mode "$target_mode" "$target" || exit 5
-codex_mutation_stat_valid "$target" || exit 5
-case "$CODEX_STAT_TYPE" in 8???) ;; *) exit 5 ;; esac
-[ "$CODEX_STAT_DEVICE:$CODEX_STAT_INODE" = "$stage_device:$stage_inode" ] || exit 5
 [ "$CODEX_STAT_UID:$CODEX_STAT_MODE:$CODEX_STAT_SIZE:$CODEX_STAT_LINKS" = "$stage_uid:$target_mode:$expected_size:1" ] || exit 5
+
 [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 5
 
 mode_decimal=$((0$CODEX_STAT_MODE))
@@ -967,13 +986,12 @@ pub(super) async fn execute_preflighted_write(
     resolved: ResolvedWrite,
     cancel: CancellationToken,
 ) -> BridgeResult<WriteResult> {
-    execute_preflighted_write_at_root(bridge, resolved, None, cancel).await
+    execute_preflighted_write_at_root(bridge, resolved, cancel).await
 }
 
 pub(super) async fn execute_preflighted_write_at_root(
     bridge: &RemoteBridge,
     mut resolved: ResolvedWrite,
-    expected_root: Option<RootIdentity>,
     cancel: CancellationToken,
 ) -> BridgeResult<WriteResult> {
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
@@ -990,7 +1008,6 @@ pub(super) async fn execute_preflighted_write_at_root(
             argument_indices: &[0],
             stdin_nul_paths: false,
         },
-        expected_root,
         required_capabilities: &["safe_write"],
         stdout_limit: WRITE_PROTOCOL_LIMIT,
         stderr_limit: 1,
@@ -1059,13 +1076,12 @@ pub(super) async fn execute_preflighted_delete(
     resolved: ResolvedDelete,
     cancel: CancellationToken,
 ) -> BridgeResult<(GuardedDeleteResult, super::RemoteContext)> {
-    execute_preflighted_delete_at_root(bridge, resolved, None, cancel).await
+    execute_preflighted_delete_at_root(bridge, resolved, cancel).await
 }
 
 pub(super) async fn execute_preflighted_delete_at_root(
     bridge: &RemoteBridge,
     resolved: ResolvedDelete,
-    expected_root: Option<RootIdentity>,
     cancel: CancellationToken,
 ) -> BridgeResult<(GuardedDeleteResult, super::RemoteContext)> {
     let limits = bridge.runner.config().host(&resolved.host)?.limits;
@@ -1080,7 +1096,6 @@ pub(super) async fn execute_preflighted_delete_at_root(
             argument_indices: &[0],
             stdin_nul_paths: false,
         },
-        expected_root,
         required_capabilities: &["guarded_delete"],
         stdout_limit: WRITE_PROTOCOL_LIMIT,
         stderr_limit: 1,
@@ -1742,6 +1757,23 @@ mod tests {
             .count()
     }
 
+    fn assert_no_dispatcher_request_artifacts(directory: &std::path::Path) {
+        let unexpected = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                !name
+                    .to_string_lossy()
+                    .starts_with("codex-ssh-bridge-dispatcher.")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "dispatcher request artifacts remain: {unexpected:?}"
+        );
+    }
+
     fn resolved_delete() -> ResolvedDelete {
         ResolvedDelete {
             host: "dev".to_owned(),
@@ -1873,7 +1905,7 @@ mod tests {
         assert_eq!(write.status.code(), Some(2));
         assert!(write.stdout.is_empty());
         assert!(write.stderr.is_empty());
-        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        assert_no_dispatcher_request_artifacts(scratch.path());
 
         let delete = std::process::Command::new("/bin/sh")
             .args([
@@ -1891,7 +1923,7 @@ mod tests {
         assert_eq!(delete.status.code(), Some(2));
         assert!(delete.stdout.is_empty());
         assert!(delete.stderr.is_empty());
-        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        assert_no_dispatcher_request_artifacts(scratch.path());
     }
 
     #[test]
@@ -1906,6 +1938,11 @@ mod tests {
             assert!(script.contains("codex_mutation_decimal_valid \"$6\" || return 1"));
             assert!(script.contains("codex_mutation_decimal_valid \"$7\" || return 1"));
         }
+        assert!(!super::WRITE_SCRIPT.contains("chmod -h"));
+        assert!(super::WRITE_SCRIPT.contains("codex_mutation_mode \"$target_mode\" \"$tmp\""));
+        assert!(!super::WRITE_SCRIPT.contains("codex_mutation_mode \"$target_mode\" \"$target\""));
+        assert!(super::WRITE_SCRIPT.contains("exec 9<>\"$codex_mode_path\""));
+        assert!(super::WRITE_SCRIPT.contains("chmod \"$codex_mode\" -- /proc/self/fd/9"));
     }
 
     #[test]
@@ -2253,7 +2290,7 @@ mod tests {
             assert_eq!(std::fs::read(&target).unwrap(), b"victim", "tool={tool}");
             assert_eq!(ssh_call_count(&log, "P"), 1, "tool={tool}");
             assert_eq!(ssh_call_count(&log, "C"), 1, "tool={tool}");
-            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            assert_no_dispatcher_request_artifacts(&scratch);
         }
     }
 
@@ -2471,7 +2508,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(first.code, ErrorCode::RemoteCapabilityMissing);
         assert_eq!(std::fs::read(&first_target).unwrap(), b"first payload");
-        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_no_dispatcher_request_artifacts(&scratch);
         assert_eq!(ssh_call_count(&log, "P"), 1);
         assert_eq!(ssh_call_count(&log, "C"), 1);
 
@@ -2623,12 +2660,7 @@ esac"#,
             );
             assert_eq!(ssh_call_count(&log, "P"), 1, "form={}", case.form);
             assert_eq!(ssh_call_count(&log, "C"), 1, "form={}", case.form);
-            assert_eq!(
-                std::fs::read_dir(&scratch).unwrap().count(),
-                0,
-                "form={}",
-                case.form
-            );
+            assert_no_dispatcher_request_artifacts(&scratch);
 
             let second = bridge
                 .guarded_delete(
