@@ -27,17 +27,39 @@ CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --no
 
 Latency tests warm the relevant path, collect at least 120 samples, sort raw durations, and enforce the compiled p95 thresholds. RSS tests run fresh child processes and report warmed baseline, observed peak, and delta from `/proc/self/status`.
 
+To inspect bridge phases locally, opt into the profile feature and redirect
+the JSONL events (emitted on stderr) to a file:
+
+```bash
+CODEX_SSH_BRIDGE_PROFILE=1 \
+  cargo test --release --features profile --locked \
+  --test performance_acceptance task11_release_cold_and_warm_ssh_profile \
+  -- --nocapture 2>profile.jsonl
+```
+
+The normal release build does not include the profile feature or emit profile
+events. Events contain only phase, host alias, request id, cold/warm class,
+elapsed microseconds, and byte counts; credentials, commands, paths, and
+remote output are never recorded. The cold sample includes local policy and
+capability setup plus the first SSH session; the warm sample reuses the
+persistent session. GitHub CI stores the profile and RSS logs as a diagnostic
+artifact, but its timings are not a substitute for measurements across the
+actual network to a target server.
+
 ## Recorded values
 
 | Case | Samples / shape | Observed | Gate |
 |---|---:|---:|---:|
 | Bridge-only MCP dispatch | 200 | p50 4.685 µs, p95 5.889 µs, max 40.704 µs | p95 < 2 ms |
-| Complete fake-SSH MCP call | 120 | p50 35.238 ms, p95 53.699 ms, max 76.542 ms | p95 < 250 ms |
+| Cold fake-SSH MCP call | 100 | p50 52.043 ms, p95 58.715 ms, max 66.317 ms | diagnostic baseline |
+| Warm fake-SSH MCP call | 120 (after 16 warmups) | p50 32.975 ms, p95 43.829 ms, max 57.088 ms | p95 < 250 ms |
 | Five hosts, one-second command each | 5 concurrent | 1.121394528 s wall time; resolve/probe/command calls each exactly 5, with no root-observe calls | < 1.5 s |
 | Cancellation to whole process-group exit | one TERM-ignoring fixture | 71.637629 ms | < 250 ms |
-| Bounded persistent-session output plus retained models | fresh child | 8 MiB request, bounded resident capture | < 32 MiB |
-| Maximum-budget wide JSON array | fresh child | RSS delta 8,528 KiB | < 48 MiB |
-| Maximum-budget wide JSON object | separate fresh child | RSS delta 17,216 KiB | < 48 MiB |
+| Bounded persistent-session output plus retained models | fresh child | RSS delta 2,480 KiB | < 32 MiB |
+| MCP output at the 64 MiB quota plus retained models | three fresh children | RSS delta 7,248–7,280 KiB | < 16 MiB |
+| Maximum-budget wide JSON array | fresh child | RSS delta 8,400 KiB | < 48 MiB |
+| Maximum-budget wide JSON object | separate fresh child | RSS delta 17,088 KiB | < 48 MiB |
+| Base64 admission at the maximum input budget | fresh child | RSS delta 15,168 KiB | < 32 MiB |
 | Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
 | Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 
@@ -49,11 +71,17 @@ MCP admission and remote execution are separate measurements. The bridge admits 
 
 - Input framing rejects the first byte past the configured limit and then recovers at the next newline.
 - Strict JSON applies aggregate depth, node, object-member, and key-byte budgets during parsing.
-- Commands stream stdin and drain stdout/stderr concurrently.
+- Commands stream stdin and drain stdout/stderr concurrently; persistent
+  sessions stream frame payloads directly into the bounded capture sink rather
+  than retaining a second full stdout/stderr copy in `SessionResult`.
 - Large output spills to private files under shared byte, entry, and serialization-job quotas.
 - MCP rendering retains oversized details once and returns a compact provenance-bound reference.
 - Paging opens independent cursors rather than cloning a shared resident output buffer.
 - Array and object RSS gates run in different fresh children so allocator retention cannot hide amplification.
+
+The five-host 40 MiB streaming test also checks the file-backed spool quota;
+the number of simultaneously observed spool files is timing-dependent and is
+bounded by the configured quota rather than treated as an exact count.
 
 ## Rust, Bash, and SSHFS
 

@@ -62,3 +62,59 @@ jobs:
           test "$cargo_version" = "$plugin_version"
           jq -e '.mcpServers == null' .codex-plugin/plugin.json >/dev/null
           jq -e '.mcpServers["ssh-bridge"].args == ["mcp"]' .mcp.json.example >/dev/null
+
+  diagnostics:
+    name: Release profile and RSS diagnostics
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Install command-line test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+
+      - name: Collect cold/warm profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          CODEX_SSH_BRIDGE_PROFILE=1 \
+            cargo +"$RUST_TOOLCHAIN" test --release --features profile --locked \
+            --test performance_acceptance task11_release_cold_and_warm_ssh_profile \
+            -- --nocapture \
+            >diagnostics/profile.stdout \
+            2>diagnostics/profile.jsonl
+
+      - name: Collect release RSS diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --test mcp_tools task8_output_rss_ \
+            -- --nocapture 2>&1 | tee diagnostics/rss-mcp.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --test performance_acceptance \
+            task11_release_bounded_session_output_rss_fresh_child -- --nocapture \
+            2>&1 | tee diagnostics/rss-session.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --test mcp_protocol task7_wide_json_rss_ \
+            -- --nocapture 2>&1 | tee diagnostics/rss-json.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --lib \
+            remote::run::tests::task78_base64_admission_release_rss -- --nocapture \
+            2>&1 | tee diagnostics/rss-base64.log
+          cargo +"$RUST_TOOLCHAIN" test --release --locked --test remote_ops \
+            five_hosts_successfully_stream_forty_mib_below_rss_bound -- --nocapture \
+            2>&1 | tee diagnostics/rss-fixed-operations.log
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43602fa02 # v4.6.2
+        with:
+          name: release-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

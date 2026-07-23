@@ -52,6 +52,10 @@ There is no Python runtime or remote build step.
 GitHub Actions runs formatting, Clippy, the full test suite, a release build,
 and source-package checks for pull requests and pushes to `main`.
 
+The diagnostics job also runs the opt-in cold/warm profile and release RSS
+acceptance tests. Its JSONL profile and RSS logs are uploaded as a short-lived
+workflow artifact; they are not part of the published binary.
+
 Release builds are created only from version tags. The tag must match the
 version in `Cargo.toml`; for example:
 
@@ -72,6 +76,17 @@ Download the archive matching the local Codex host, extract the binary to a
 private path, and put that absolute path in `.mcp.json.example` before
 registering the MCP server. Windows and macOS assets are not produced because
 the bridge currently requires Linux OpenSSH and Linux SSHFS tooling.
+
+For isolated local development, keep worktrees in the repository's ignored
+`.worktrees/` directory so the checkout, branch, and generated target files
+stay together:
+
+```bash
+git worktree add .worktrees/<task-name> -b codex/<task-name> main
+```
+
+Remove a finished worktree with `git worktree remove .worktrees/<task-name>`
+after its branch has been merged or otherwise retained.
 
 ## Configure hosts
 
