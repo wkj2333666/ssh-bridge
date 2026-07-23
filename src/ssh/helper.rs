@@ -3,13 +3,14 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::capability::Capability;
-use crate::error::{BridgeError, BridgeResult};
+use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::quote::shell_word;
 
 const HELPER_DIRECTORY_ENV: &str = "CODEX_SSH_BRIDGE_HELPERS_DIR";
 const HELPER_DIRECTORY_NAME: &str = "remote-helpers";
 const HELPER_BOOTSTRAP_TAG: &str = "codex-ssh-helper-bootstrap-1";
 const MAX_HELPER_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const HELPER_BOOTSTRAP_SCRIPT: &str = r#"set -u
 umask 077
@@ -54,6 +55,69 @@ pub(crate) struct HelperArtifact {
     pub(crate) path: PathBuf,
     pub(crate) target: &'static str,
     pub(crate) arch: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HelperIdentity {
+    pub(crate) version: String,
+    pub(crate) target: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) length: usize,
+    pub(crate) sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootstrapStatus {
+    Hit,
+    Need,
+}
+
+pub(crate) fn helper_identity(
+    artifact: &HelperArtifact,
+    bytes: &[u8],
+) -> BridgeResult<HelperIdentity> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_HELPER_BYTES {
+        return Err(BridgeError::invalid_config(
+            "remote helper artifact size is outside the safe bound",
+        ));
+    }
+    Ok(HelperIdentity {
+        version: BRIDGE_VERSION.to_owned(),
+        target: artifact.target,
+        arch: artifact.arch,
+        length: bytes.len(),
+        sha256: sha256_hex(bytes),
+    })
+}
+
+pub(crate) fn parse_bootstrap_status(bytes: &[u8]) -> BridgeResult<BootstrapStatus> {
+    if bytes.len() > 64 || bytes.contains(&0) {
+        return Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "persistent helper bootstrap status is invalid",
+            false,
+        ));
+    }
+    match bytes {
+        b"CXSB-INSTALL-1 HIT\n" => Ok(BootstrapStatus::Hit),
+        b"CXSB-INSTALL-1 NEED\n" => Ok(BootstrapStatus::Need),
+        _ => Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "persistent helper bootstrap status is invalid",
+            false,
+        )),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 pub(crate) fn helper_artifact(capability: &Capability) -> Option<HelperArtifact> {
@@ -148,7 +212,10 @@ fn validate_artifact_path(directory: &Path, path: &Path) -> BridgeResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{helper_artifact, helper_command, helper_target_for_arch};
+    use super::{
+        BootstrapStatus, HelperArtifact, helper_artifact, helper_command, helper_identity,
+        helper_target_for_arch, parse_bootstrap_status,
+    };
     use crate::capability::{Capability, ShellKind};
     use std::collections::BTreeMap;
 
@@ -251,5 +318,50 @@ mod tests {
         input.flush().unwrap();
         drop(input);
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn helper_identity_uses_exact_length_and_sha256() {
+        let artifact = HelperArtifact {
+            path: std::path::PathBuf::from("/tmp/helper"),
+            target: "x86_64-unknown-linux-musl",
+            arch: "x86_64",
+        };
+        let identity = helper_identity(&artifact, b"abc").unwrap();
+        assert_eq!(identity.length, 3);
+        assert_eq!(identity.target, "x86_64-unknown-linux-musl");
+        assert_eq!(identity.arch, "x86_64");
+        assert_eq!(
+            identity.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn bootstrap_status_accepts_only_hit_or_need() {
+        assert_eq!(
+            parse_bootstrap_status(b"CXSB-INSTALL-1 HIT\n").unwrap(),
+            BootstrapStatus::Hit
+        );
+        assert_eq!(
+            parse_bootstrap_status(b"CXSB-INSTALL-1 NEED\n").unwrap(),
+            BootstrapStatus::Need
+        );
+    }
+
+    #[test]
+    fn bootstrap_status_rejects_trailing_or_unbounded_data() {
+        for value in [
+            b"CXSB-INSTALL-1 HIT".as_slice(),
+            b"CXSB-INSTALL-1 HIT\nextra".as_slice(),
+            b"CXSB-INSTALL-1 NOPE\n".as_slice(),
+            b"CXSB-INSTALL-1 HIT\0\n".as_slice(),
+        ] {
+            let error = parse_bootstrap_status(value).unwrap_err();
+            assert_eq!(error.code, crate::error::ErrorCode::ProtocolError);
+        }
+        let oversized = [b'X'; 65];
+        let error = parse_bootstrap_status(&oversized).unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::ProtocolError);
     }
 }

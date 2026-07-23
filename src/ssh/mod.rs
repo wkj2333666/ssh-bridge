@@ -18,6 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{Config, ResolvedHost};
@@ -30,6 +31,24 @@ pub(crate) use process::{
 };
 pub use process::{RunRequest, RunResult, RunTiming, SshRunner};
 pub(crate) use session::{HostSession, SessionOutput, SessionRequest, SessionResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HelperMode {
+    Persistent,
+    Temporary,
+    Shell,
+}
+
+impl HelperMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::Temporary => "temporary",
+            Self::Shell => "shell",
+        }
+    }
+}
 
 const RUNTIME_DIRECTORY: &str = "codex-ssh-bridge";
 const CONTROL_FILENAME_BYTES: usize = 3 + 32;
