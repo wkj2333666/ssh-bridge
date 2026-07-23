@@ -133,6 +133,10 @@ case "$remote_command" in
 		;;
 	*codex-ssh-persistent-helper-bootstrap-1*)
 		log_call S "$@"
+		if [ "${FAKE_SSH_PERSISTENT_FAIL:-0}" = 1 ]; then
+			printf '%s\n' 'persistent helper fixture failure' >&2
+			exit "${FAKE_SSH_PERSISTENT_FAIL_STATUS:-255}"
+		fi
 		exec /bin/sh -c "$remote_command"
 		;;
 esac

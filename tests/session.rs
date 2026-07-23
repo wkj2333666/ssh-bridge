@@ -46,6 +46,7 @@ fn persistent_session_runner(
     log: &std::path::Path,
     install_log: &std::path::Path,
     machine_arch: &str,
+    persistent_fail: bool,
 ) -> Arc<SshRunner> {
     let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
     let store = Arc::new(OutputStore::new(&runtime).unwrap());
@@ -71,6 +72,10 @@ fn persistent_session_runner(
         (
             OsString::from("FAKE_SSH_INSTALL_LOG"),
             install_log.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("FAKE_SSH_PERSISTENT_FAIL"),
+            OsString::from(if persistent_fail { "1" } else { "0" }),
         ),
     ]);
     Arc::new(
@@ -161,23 +166,44 @@ async fn persistent_helper_installs_once_and_reuses_after_bridge_restart() {
     let base = TempDir::new().unwrap();
     let log = base.path().join("ssh.log");
     let install_log = base.path().join("install.log");
-    let runner = persistent_session_runner(&base, &log, &install_log, machine_arch);
+    let runner = persistent_session_runner(&base, &log, &install_log, machine_arch, false);
     let mut first_request = request("printf persistent-first");
     first_request.timeout = Duration::from_secs(30);
-    let first = runner
-        .execute(first_request, CancellationToken::new())
-        .await;
+    let mut concurrent_request = request("printf persistent-concurrent");
+    concurrent_request.timeout = Duration::from_secs(30);
+    let (first, concurrent) = tokio::join!(
+        runner.execute(first_request, CancellationToken::new()),
+        runner.execute(concurrent_request, CancellationToken::new()),
+    );
     let first = first.unwrap();
+    let concurrent = concurrent.unwrap();
     assert_eq!(
         String::from_utf8_lossy(&first.output.stdout.head),
         "persistent-first"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&concurrent.output.stdout.head),
+        "persistent-concurrent"
+    );
+    assert_eq!(
+        first.helper_mode,
+        codex_ssh_bridge::ssh::HelperMode::Persistent
+    );
+    assert_eq!(
+        concurrent.helper_mode,
+        codex_ssh_bridge::ssh::HelperMode::Persistent
     );
     drop(runner);
 
     let restart_log = base.path().join("restart-ssh.log");
     let restart_install_log = base.path().join("restart-install.log");
-    let restarted =
-        persistent_session_runner(&base, &restart_log, &restart_install_log, machine_arch);
+    let restarted = persistent_session_runner(
+        &base,
+        &restart_log,
+        &restart_install_log,
+        machine_arch,
+        false,
+    );
     let mut second_request = request("printf persistent-second");
     second_request.timeout = Duration::from_secs(30);
     let second = restarted
@@ -204,6 +230,92 @@ async fn persistent_helper_installs_once_and_reuses_after_bridge_restart() {
     drop(restarted);
     let _ = fs::remove_file(helper_path);
     let _ = fs::remove_dir(&helper_directory);
+}
+
+#[tokio::test]
+async fn persistent_startup_failure_falls_back_to_temporary_helper() {
+    if std::env::var("CODEX_SSH_BRIDGE_PERSISTENT_HELPER_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "persistent helper integration is opt-in; set CODEX_SSH_BRIDGE_PERSISTENT_HELPER_INTEGRATION=1"
+        );
+        return;
+    }
+    let helper_source = std::env::var("CARGO_BIN_EXE_codex-ssh-bridge-helper")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/debug/codex-ssh-bridge-helper")
+        });
+    if !helper_source.is_file() {
+        eprintln!("persistent helper fixture is unavailable; skipping");
+        return;
+    }
+    let (machine_arch, helper_target) = match std::env::consts::ARCH {
+        "x86_64" => ("x86_64", "x86_64-unknown-linux-musl"),
+        "aarch64" => ("aarch64", "aarch64-unknown-linux-musl"),
+        _ => {
+            eprintln!("persistent helper fixture is unavailable on this architecture; skipping");
+            return;
+        }
+    };
+    let helper_directory = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("remote-helpers");
+    fs::create_dir_all(&helper_directory).unwrap();
+    let helper_path = helper_directory.join(helper_target);
+    fs::copy(&helper_source, &helper_path).unwrap();
+    fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let base = TempDir::new().unwrap();
+    let log = base.path().join("ssh.log");
+    let install_log = base.path().join("install.log");
+    let runner = persistent_session_runner(&base, &log, &install_log, machine_arch, true);
+    let mut run = request("printf temporary-fallback");
+    run.timeout = Duration::from_secs(30);
+    let result = runner.execute(run, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        result.helper_mode,
+        codex_ssh_bridge::ssh::HelperMode::Temporary
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.output.stdout.head),
+        "temporary-fallback"
+    );
+    let log_text = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        log_text.lines().filter(|line| *line == "S").count(),
+        2,
+        "{log_text}"
+    );
+    drop(runner);
+    let _ = fs::remove_file(helper_path);
+    let _ = fs::remove_dir(&helper_directory);
+}
+
+#[tokio::test]
+async fn unsupported_helper_architecture_uses_shell_mode() {
+    let base = TempDir::new().unwrap();
+    let log = base.path().join("ssh.log");
+    let install_log = base.path().join("install.log");
+    let runner = persistent_session_runner(&base, &log, &install_log, "mips64", false);
+    let result = runner
+        .execute(request("printf shell-only"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.helper_mode, codex_ssh_bridge::ssh::HelperMode::Shell);
+    assert_eq!(
+        String::from_utf8_lossy(&result.output.stdout.head),
+        "shell-only"
+    );
+    let log_text = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        log_text.lines().filter(|line| *line == "S").count(),
+        1,
+        "{log_text}"
+    );
 }
 
 #[tokio::test]

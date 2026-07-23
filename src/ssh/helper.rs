@@ -107,11 +107,21 @@ valid_helper() {
 lock_owned=0
 cleanup() {
     if [ "$lock_owned" -eq 1 ]; then
+        rm -f -- "$lock/pid" 2>/dev/null || true
         rmdir "$lock" 2>/dev/null || true
     fi
     rm -f "$target_root/.helper.$$.$helper_length.tmp" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
+stale_lock() {
+    owner=$(cat "$lock/pid" 2>/dev/null || true)
+    case "$owner" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$owner" 2>/dev/null && return 1
+    rm -f -- "$lock/pid" 2>/dev/null || return 1
+    rmdir "$lock" 2>/dev/null
+}
 wait_count=0
 while ! mkdir "$lock" 2>/dev/null; do
     if valid_helper; then
@@ -119,12 +129,17 @@ while ! mkdir "$lock" 2>/dev/null; do
         printf '%s\n' 'CXSB-INSTALL-1 HIT'
         exec "$helper" --max-frame "$max_frame"
     fi
+    if stale_lock; then
+        continue
+    fi
     wait_count=$((wait_count + 1))
     [ "$wait_count" -lt 30 ] || exit 73
     sleep 1
 done
 lock_owned=1
+printf '%s\n' "$$" >"$lock/pid" || exit 74
 if valid_helper; then
+    rm -f -- "$lock/pid" 2>/dev/null || exit 74
     rmdir "$lock" 2>/dev/null || exit 74
     lock_owned=0
     record_status HIT
@@ -152,6 +167,7 @@ digest=${digest%% *}
 [ "$digest" = "$helper_sha256" ] || exit 74
 chmod 700 "$temporary" || exit 74
 mv -f "$temporary" "$helper" || exit 74
+rm -f -- "$lock/pid" 2>/dev/null || exit 74
 rmdir "$lock" 2>/dev/null || exit 74
 lock_owned=0
 exec "$helper" --max-frame "$max_frame"
@@ -531,6 +547,121 @@ mod tests {
     }
 
     #[test]
+    fn persistent_bootstrap_reclaims_dead_lock_owner() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let identity = persistent_identity(b"abc");
+        let target = home
+            .path()
+            .join(".local/share/codex-ssh-bridge/helpers")
+            .join(&identity.version)
+            .join(identity.target);
+        std::fs::create_dir_all(&target).unwrap();
+        let lock = target.join(".install.lock");
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(lock.join("pid"), b"99999999\n").unwrap();
+
+        let command = persistent_helper_command(64 * 1024, &identity).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut status = String::new();
+        output.read_line(&mut status).unwrap();
+        assert_eq!(status, "CXSB-INSTALL-1 NEED\n");
+        input.write_all(b"abc").unwrap();
+        input.flush().unwrap();
+        drop(input);
+        assert!(!child.wait().unwrap().success());
+        assert_eq!(std::fs::read(target.join("helper")).unwrap(), b"abc");
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn persistent_bootstrap_rejects_symlink_target_directory() {
+        use std::process::{Command, Stdio};
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let identity = persistent_identity(b"abc");
+        let target_parent = home
+            .path()
+            .join(".local/share/codex-ssh-bridge/helpers")
+            .join(&identity.version);
+        std::fs::create_dir_all(&target_parent).unwrap();
+        let target = target_parent.join(identity.target);
+        std::os::unix::fs::symlink(outside.path(), &target).unwrap();
+
+        let command = persistent_helper_command(64 * 1024, &identity).unwrap();
+        let child = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("HOME", home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(!child.wait_with_output().unwrap().status.success());
+        assert!(!outside.path().join("helper").exists());
+    }
+
+    #[test]
+    fn persistent_bootstrap_short_upload_preserves_previous_helper() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let identity = persistent_identity(b"new-helper");
+        let target = home
+            .path()
+            .join(".local/share/codex-ssh-bridge/helpers")
+            .join(&identity.version)
+            .join(identity.target);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("helper"), b"previous-helper").unwrap();
+        std::fs::set_permissions(
+            target.join("helper"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        let command = persistent_helper_command(64 * 1024, &identity).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut status = String::new();
+        output.read_line(&mut status).unwrap();
+        assert_eq!(status, "CXSB-INSTALL-1 NEED\n");
+        input.write_all(b"new").unwrap();
+        input.flush().unwrap();
+        drop(input);
+        assert!(!child.wait().unwrap().success());
+        assert_eq!(
+            std::fs::read(target.join("helper")).unwrap(),
+            b"previous-helper"
+        );
+        assert!(!target.join(".install.lock").exists());
+    }
+
+    #[test]
     fn persistent_bootstrap_round_trips_hit_without_upload() {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
@@ -601,6 +732,18 @@ mod tests {
         let home = TempDir::new().unwrap();
         let tmp = home.path().join("tmp");
         std::fs::create_dir_all(&tmp).unwrap();
+        let target = home
+            .path()
+            .join(".local/share/codex-ssh-bridge/helpers")
+            .join(&identity.version)
+            .join(identity.target);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("helper"), b"stale-helper").unwrap();
+        std::fs::set_permissions(
+            target.join("helper"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let command = persistent_helper_command(64 * 1024, &identity).unwrap();
         let mut child = Command::new("/bin/sh")
             .args(["-c", &command])
