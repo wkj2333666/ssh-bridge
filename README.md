@@ -105,7 +105,11 @@ ssh devbox
 ./target/release/codex-ssh-bridge doctor devbox
 ```
 
-Add future servers with another concrete alias and `hosts add`; there is no five-host ceiling. Use `--read-only` for inspection-only profiles. The default local config is `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml) documents limits. It accepts exactly configuration `version = 1` and contains aliases, roots, descriptions, and limits—never credentials.
+Add future servers with another concrete alias and `hosts add`. Use
+`--read-only` for inspection-only profiles. The default local config is
+`~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml)
+documents limits. It accepts exactly configuration `version = 1` and contains
+aliases, roots, descriptions, and limits—never credentials.
 
 On first use, the bridge validates the local SSH configuration and probes the
 remote shell and utility capabilities. It reuses the connection for later
@@ -190,7 +194,7 @@ mkdir -p /absolute/local/mountpoint
 ./target/release/codex-ssh-bridge unmount /absolute/local/mountpoint
 ```
 
-The CLI requires a real absolute current-user-owned mountpoint, refuses nonempty directories without `--allow-nonempty`, forces `ro` for read-only profiles, and never enables `allow_other`. It prints that the mount is remote and not an Agent workspace.
+The CLI requires a real absolute current-user-owned mountpoint, refuses nonempty directories without `--allow-nonempty`, forces `ro` for read-only profiles, and never enables `allow_other`. It prints that the mount is remote and not a local workspace.
 
 Use SSHFS for browsing or narrow human editing. Keep builds, Git, tests, containers, and services on the server through `remote_run`. SFTP/FUSE workloads add a round trip to many metadata operations; caching, permissions, hardlinks, rename behavior, and broken-connection recovery also differ from a native filesystem. See the [SSHFS documentation](https://github.com/libfuse/sshfs).
 
