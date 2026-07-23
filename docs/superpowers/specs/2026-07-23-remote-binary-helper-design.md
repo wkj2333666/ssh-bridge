@@ -47,19 +47,38 @@ normal helper path.
 
 ## Artifact and compatibility matrix
 
-The release package contains the main bridge binary plus a `remote-helpers/`
-directory. Helpers are statically linked with musl and compiled without
-`target-cpu=native` so they do not require the remote glibc version or a newer
-CPU instruction set. The initial matrix is:
+The release package contains one main bridge binary for each published Linux
+target plus a `remote-helpers/` directory containing the complete helper
+matrix. The x86_64, aarch64, and armv7 helpers are statically linked with
+musl. The riscv64, ppc64le, and s390x helpers use the cross toolchain's GNU
+targets because the pinned cross release does not provide the corresponding
+musl images; if a remote loader or libc cannot run one of those helpers, the
+bridge falls back to the shell dispatcher before accepting a request. All
+artifacts are compiled without `target-cpu=native`.
+
+The published main targets are:
+
+| Main package target |
+|---|
+| `x86_64-unknown-linux-gnu` |
+| `aarch64-unknown-linux-gnu` |
+| `armv7-unknown-linux-gnueabihf` |
+| `x86_64-unknown-linux-musl` |
+| `aarch64-unknown-linux-musl` |
+| `riscv64gc-unknown-linux-gnu` |
+| `powerpc64le-unknown-linux-gnu` |
+| `s390x-unknown-linux-gnu` |
+
+The helper matrix is:
 
 | Remote `uname -m` | Helper target |
 |---|---|
 | `x86_64` | `x86_64-unknown-linux-musl` |
 | `aarch64` | `aarch64-unknown-linux-musl` |
 | `armv7l`, `armv7` | `armv7-unknown-linux-musleabihf` |
-| `riscv64` | `riscv64gc-unknown-linux-musl` |
-| `ppc64le` | `powerpc64le-unknown-linux-musl` |
-| `s390x` | `s390x-unknown-linux-musl` |
+| `riscv64` | `riscv64gc-unknown-linux-gnu` |
+| `ppc64le` | `powerpc64le-unknown-linux-gnu` |
+| `s390x` | `s390x-unknown-linux-gnu` |
 
 The helper directory is discovered relative to the configured bridge
 executable, with an explicit environment override reserved for development
