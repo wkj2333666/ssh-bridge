@@ -23,7 +23,6 @@ The bridge keeps one local-owned SSH session per alias. On supported Linux archi
 | Raw `ssh` | Universal and minimal | Leaves target selection, quoting, limits, shell detection, cancellation, and output handling to the Agent | Transport below the bridge |
 | SSHFS | Convenient human browsing | Makes remote files look local while commands still run locally; adds FUSE/SFTP latency and reconnect semantics | Explicit optional CLI only |
 | Native local MCP | Closed schemas, allowlisted hosts, bounded I/O, shared policy, explicit Bash/sh choice | Non-interactive by design | Default Agent interface |
-| Official Codex SSH Remote | Native remote project experience | Currently starts Codex remotely and requires remote installation/authentication | Deliberately not used |
 
 The bridge is Rust rather than a Bash program because strict MCP framing, bounded parsing, async concurrency, process-group cancellation, and spool quotas need one auditable state machine. Bash and POSIX sh remain supported as the *remote command shells*; the result always reports which shell actually ran.
 
@@ -36,7 +35,7 @@ SSHFS is intentionally absent from the MCP tool list. This prevents an Agent fro
 - Key-based or local-agent authentication and verified host keys.
 - Remote `sshd`, a POSIX sh, a GNU- or BSD-compatible `stat`, and the ordinary utilities checked by `doctor`; Bash is optional. `shell=login` additionally needs an account shell that can be resolved through `getent passwd` or, when `getent` is absent, one unique readable `/etc/passwd` record.
 - Optional local `sshfs` and `fusermount3` for the human mount commands.
-- The remote server architecture is irrelevant; only the local build must match the local host.
+- Common Linux remote architectures use the bundled helper; new or unsupported hosts remain usable through the shell fallback. The local bridge binary must match the local host.
 
 ## Build and package locally
 
@@ -49,19 +48,14 @@ There is no Python runtime or remote build step.
 
 ## CI and release builds
 
-GitHub Actions runs formatting, Clippy, the full test suite, a release build,
-and source-package checks for pull requests and pushes to `main`.
+GitHub Actions runs formatting, Clippy, the full test suite, release builds,
+and source-package checks. Release archives are published from version tags.
 
-The diagnostics job also runs the opt-in cold/warm profile and release RSS
-acceptance tests. Its JSONL profile and RSS logs are uploaded as a short-lived
-workflow artifact; they are not part of the published binary.
-
-Release builds are created only from version tags. The tag must match the
-version in `Cargo.toml`; for example:
+The release tag must match the version in `Cargo.toml`; for example:
 
 ```bash
-git tag v0.2.4
-git push origin v0.2.4
+git tag v<version>
+git push origin v<version>
 ```
 
 The release workflow publishes Linux binaries and SHA-256 files for:
@@ -91,17 +85,6 @@ private path, and put that absolute path in `.mcp.json.example` before
 registering the MCP server. Windows and macOS assets are not produced because
 the bridge currently requires Linux OpenSSH and Linux SSHFS tooling.
 
-For isolated local development, keep worktrees in the repository's ignored
-`.worktrees/` directory so the checkout, branch, and generated target files
-stay together:
-
-```bash
-git worktree add .worktrees/<task-name> -b codex/<task-name> main
-```
-
-Remove a finished worktree with `git worktree remove .worktrees/<task-name>`
-after its branch has been merged or otherwise retained.
-
 ## Configure hosts
 
 Define and manually verify a concrete alias in local `~/.ssh/config`:
@@ -124,11 +107,10 @@ ssh devbox
 
 Add future servers with another concrete alias and `hosts add`; there is no five-host ceiling. Use `--read-only` for inspection-only profiles. The default local config is `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml) documents limits. It accepts exactly configuration `version = 1` and contains aliases, roots, descriptions, and limits—never credentials.
 
-On the first operation for an alias, the bridge resolves the local OpenSSH policy with bounded `ssh -G`, records its immutable connection identity, and probes shell/utility capabilities. The policy and capability result are cached for the lifetime of the bridge; later operations use one framed request on the already-open SSH session without another `ssh -G`, root observation, or physical-root guard. The local Unix user and that user's OpenSSH configuration remain trusted execution authority.
-
-`doctor` reports the configured root's connection-time physical path and device/inode identity as diagnostics. The configured root remains a lexical routing boundary, and ordinary remote filesystem behavior—including symlink retargeting—matches a command run directly on that server. Individual writes and patches still use expected hashes, no-follow identity checks, atomic replacement, and explicit unknown-outcome reporting.
-
-`doctor devbox --verbose-ssh` also runs a bounded local OpenSSH diagnostic and redacts identity paths, agent sockets, commands, and credential-like fields.
+On first use, the bridge validates the local SSH configuration and probes the
+remote shell and utility capabilities. It reuses the connection for later
+requests. Writes and patches use expected hashes, no-follow checks, atomic
+replacement, and explicit conflict or unknown-outcome reporting.
 
 ## Configure MCP for local Codex
 
@@ -182,7 +164,9 @@ The default flow is bounded search/read → unified patch → remote verificatio
 
 `remote_run` accepts one command string plus `shell: bash|sh|login`; omission means `bash`. Prefer POSIX syntax. Bash is never silently changed to sh: if Bash is unavailable, the model receives a capability error and may explicitly retry with `shell:"sh"`. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
 
-Operational requests are multiplexed over one persistent SSH session per alias. Remote execution runs concurrently up to the configured global/per-host capacity; additional accepted calls wait cancellably inside the runner instead of becoming MCP errors. The local MCP task window is bounded at `global_concurrency + 8`; only a full window returns `MCP task queue full`, while `remote_hosts` remains available as a control lane. Each request has an independent process group and cancellation; mutations are not implicitly serialized, so concurrent same-path calls have no ordering guarantee. If cancellation cannot be confirmed, the session is closed and the result is explicitly marked unknown rather than retried.
+Operational requests use one persistent SSH session per alias and are bounded
+by the configured concurrency and output limits. Requests are cancellable;
+mutations report conflicts or unknown outcomes and are never blindly retried.
 
 ## Human direct CLI
 
@@ -214,6 +198,4 @@ Use SSHFS for browsing or narrow human editing. Keep builds, Git, tests, contain
 
 The bridge forces non-interactive authentication, strict host keys, no agent/X11/port forwarding, no local command, no TTY, bounded connection time, `ServerAliveInterval=15`, `ServerAliveCountMax=3`, and a private hashed ControlMaster socket for ordinary SSH and SSHFS. It never accepts arbitrary SSH options from MCP. Remote output remains untrusted and remote Unix permissions are the hard isolation boundary.
 
-Read [docs/security.md](docs/security.md) for the complete trust model and flags. Read [docs/performance.md](docs/performance.md) for reproducible commands and raw measurements.
-
-OpenAI's official SSH Remote workflow currently requires installing and authenticating Codex on the remote host ([Remote connections](https://learn.chatgpt.com/docs/remote-connections#connect-to-an-ssh-host)). This bridge deliberately keeps that identity and runtime local.
+Read [docs/security.md](docs/security.md) for the complete trust model and flags. Read [docs/performance.md](docs/performance.md) for performance notes.
