@@ -798,6 +798,14 @@ impl OutputStore {
         Stdout: AsyncRead + Unpin + Send + 'static,
         Stderr: AsyncRead + Unpin + Send + 'static,
     {
+        let _profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+            phase: "output_capture",
+            host: None,
+            request_id: None,
+            class: None,
+            elapsed_us: 0,
+            bytes: None,
+        });
         if limits.preview_bytes == 0
             || limits.preview_bytes > MAX_FRAME_BYTES
             || limits.max_output_bytes == 0

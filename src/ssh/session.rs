@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
+};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -21,7 +23,7 @@ use crate::error::{BridgeError, BridgeResult, ErrorCode};
 
 const CANCEL_GRACE: Duration = Duration::from_millis(200);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct SessionRequest {
     pub(crate) command: String,
     pub(crate) cwd: String,
@@ -32,6 +34,13 @@ pub(crate) struct SessionRequest {
     pub(crate) timeout: Duration,
     pub(crate) stdout_limit: u64,
     pub(crate) stderr_limit: u64,
+    pub(crate) output: Option<SessionOutput>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionOutput {
+    pub(crate) stdout: DuplexStream,
+    pub(crate) stderr: DuplexStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,8 +81,12 @@ struct PendingRequest {
     aggregate_limit: usize,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_seen: u64,
+    stderr_seen: u64,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    stdout_sink: Option<DuplexStream>,
+    stderr_sink: Option<DuplexStream>,
     sender: oneshot::Sender<BridgeResult<SessionResult>>,
 }
 
@@ -243,6 +256,10 @@ impl HostSession {
         });
         let frames = build_request_frames(request_id, &request, self.inner.max_payload)?;
         let (sender, mut receiver) = oneshot::channel();
+        let (stdout_sink, stderr_sink) = request
+            .output
+            .map(|output| (Some(output.stdout), Some(output.stderr)))
+            .unwrap_or((None, None));
         let pending = PendingRequest {
             started,
             stdout_limit: usize::try_from(request.stdout_limit)
@@ -258,8 +275,12 @@ impl HostSession {
             .map_err(|_| BridgeError::invalid_argument("output limit is too large"))?,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stdout_seen: 0,
+            stderr_seen: 0,
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_sink,
+            stderr_sink,
             sender,
         };
         self.inner.pending.lock().await.insert(request_id, pending);
@@ -478,28 +499,58 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
             let request = pending.get_mut(&frame.request_id).ok_or_else(|| {
                 protocol_error(&inner.host, "dispatcher returned an unknown request ID")
             })?;
-            let aggregate_used = request.stdout.len().saturating_add(request.stderr.len());
-            let (output, limit, truncated) = if frame.kind == FrameKind::Stdout {
-                (
-                    &mut request.stdout,
-                    request.stdout_limit,
-                    &mut request.stdout_truncated,
-                )
+            if frame.kind == FrameKind::Stdout {
+                let aggregate_used =
+                    request.stdout_seen.saturating_add(request.stderr_seen) as usize;
+                let remaining = request
+                    .stdout_limit
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(request.stdout_seen as usize)
+                    .min(request.aggregate_limit.saturating_sub(aggregate_used));
+                if frame.payload.len() > remaining {
+                    request.stdout_truncated = true;
+                }
+                let allowed = remaining.min(frame.payload.len());
+                let write_failed = if let Some(sink) = request.stdout_sink.as_mut() {
+                    sink.write_all(&frame.payload[..allowed]).await.is_err()
+                } else {
+                    request.stdout.extend_from_slice(&frame.payload[..allowed]);
+                    false
+                };
+                if write_failed {
+                    request.stdout_sink.take();
+                    request.stdout_truncated = true;
+                }
+                request.stdout_seen = request
+                    .stdout_seen
+                    .saturating_add(frame.payload.len() as u64);
             } else {
-                (
-                    &mut request.stderr,
-                    request.stderr_limit,
-                    &mut request.stderr_truncated,
-                )
-            };
-            let remaining = limit
-                .saturating_sub(output.len())
-                .min(request.aggregate_limit.saturating_sub(aggregate_used));
-            if frame.payload.len() > remaining {
-                output.extend_from_slice(&frame.payload[..remaining]);
-                *truncated = true;
-            } else {
-                output.extend_from_slice(&frame.payload);
+                let aggregate_used =
+                    request.stdout_seen.saturating_add(request.stderr_seen) as usize;
+                let remaining = request
+                    .stderr_limit
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(request.stderr_seen as usize)
+                    .min(request.aggregate_limit.saturating_sub(aggregate_used));
+                if frame.payload.len() > remaining {
+                    request.stderr_truncated = true;
+                }
+                let allowed = remaining.min(frame.payload.len());
+                let write_failed = if let Some(sink) = request.stderr_sink.as_mut() {
+                    sink.write_all(&frame.payload[..allowed]).await.is_err()
+                } else {
+                    request.stderr.extend_from_slice(&frame.payload[..allowed]);
+                    false
+                };
+                if write_failed {
+                    request.stderr_sink.take();
+                    request.stderr_truncated = true;
+                }
+                request.stderr_seen = request
+                    .stderr_seen
+                    .saturating_add(frame.payload.len() as u64);
             }
             Ok(())
         }
@@ -797,6 +848,7 @@ mod tests {
             timeout,
             stdout_limit: 1024,
             stderr_limit: 1024,
+            output: None,
         }
     }
 
