@@ -115,11 +115,15 @@ fn release_workflow_builds_and_packages_all_static_helper_targets() {
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "armv7-unknown-linux-musleabihf",
+    ] {
+        assert!(workflow.contains(target), "release workflow omits {target}");
+    }
+    for unsupported_target in [
         "riscv64gc-unknown-linux-musl",
         "powerpc64le-unknown-linux-musl",
         "s390x-unknown-linux-musl",
     ] {
-        assert!(workflow.contains(target), "release workflow omits {target}");
+        assert!(!workflow.contains(unsupported_target));
     }
     assert!(workflow.contains("name: helper-${{ matrix.target }}"));
     assert!(workflow.contains("remote-helpers/$helper"));
