@@ -83,6 +83,11 @@ version_root=$helpers_root/$bridge_version
 target_root=$version_root/$helper_target
 helper=$target_root/helper
 lock=$target_root/.install.lock
+record_status() {
+    if [ -n "${FAKE_SSH_INSTALL_LOG-}" ]; then
+        printf '%s\n' "$1" >>"$FAKE_SSH_INSTALL_LOG"
+    fi
+}
 mkdir -p "$target_root" 2>/dev/null || exit 74
 for directory in "$root" "$data_root" "$bridge_root" "$helpers_root" "$version_root" "$target_root"; do
     [ -d "$directory" ] || exit 74
@@ -110,6 +115,7 @@ trap cleanup EXIT HUP INT TERM
 wait_count=0
 while ! mkdir "$lock" 2>/dev/null; do
     if valid_helper; then
+        record_status HIT
         printf '%s\n' 'CXSB-INSTALL-1 HIT'
         exec "$helper" --max-frame "$max_frame"
     fi
@@ -121,9 +127,11 @@ lock_owned=1
 if valid_helper; then
     rmdir "$lock" 2>/dev/null || exit 74
     lock_owned=0
+    record_status HIT
     printf '%s\n' 'CXSB-INSTALL-1 HIT'
     exec "$helper" --max-frame "$max_frame"
 fi
+record_status NEED
 printf '%s\n' 'CXSB-INSTALL-1 NEED'
 temporary=$target_root/.helper.$$.$helper_length.tmp
 : >"$temporary" || exit 74
@@ -335,8 +343,7 @@ fn validate_artifact_path(directory: &Path, path: &Path) -> BridgeResult<()> {
 mod tests {
     use super::{
         BootstrapStatus, HelperArtifact, HelperIdentity, helper_artifact, helper_command,
-        helper_identity, helper_target_for_arch, parse_bootstrap_status,
-        persistent_helper_command,
+        helper_identity, helper_target_for_arch, parse_bootstrap_status, persistent_helper_command,
     };
     use crate::capability::{Capability, ShellKind};
     use std::collections::BTreeMap;
@@ -564,7 +571,10 @@ mod tests {
         let hello = crate::remote_helper_protocol::read_frame(&mut output, 64 * 1024)
             .unwrap()
             .unwrap();
-        assert_eq!(hello.kind, crate::remote_helper_protocol::FrameKind::HelloAck);
+        assert_eq!(
+            hello.kind,
+            crate::remote_helper_protocol::FrameKind::HelloAck
+        );
         crate::remote_helper_protocol::write_frame(
             &mut input,
             &crate::remote_helper_protocol::Frame {
@@ -611,7 +621,10 @@ mod tests {
         let hello = crate::remote_helper_protocol::read_frame(&mut output, 64 * 1024)
             .unwrap()
             .unwrap();
-        assert_eq!(hello.kind, crate::remote_helper_protocol::FrameKind::HelloAck);
+        assert_eq!(
+            hello.kind,
+            crate::remote_helper_protocol::FrameKind::HelloAck
+        );
         let installed = home
             .path()
             .join(".local/share/codex-ssh-bridge/helpers")

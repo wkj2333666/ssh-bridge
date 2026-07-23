@@ -6,7 +6,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::io::{
-    AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    DuplexStream,
 };
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -16,8 +17,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::dispatcher::dispatcher_command;
 use super::frame::{Frame, FrameKind, read_frame, write_frame};
-use super::helper::{HelperArtifact, helper_artifact, helper_bytes, helper_command};
-use super::{SshPolicy, build_ssh_argv};
+use super::helper::{
+    BootstrapStatus, HelperArtifact, HelperIdentity, helper_artifact, helper_bytes, helper_command,
+    helper_identity, parse_bootstrap_status, persistent_helper_command,
+};
+use super::{HelperMode, SshPolicy, build_ssh_argv};
 use crate::capability::{Capability, ShellKind, ShellSelection};
 use crate::config::EffectiveLimits;
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
@@ -63,7 +67,7 @@ pub(crate) struct HostSession {
 
 struct SessionInner {
     host: String,
-    helper: bool,
+    helper_mode: HelperMode,
     max_payload: usize,
     max_output_bytes: u64,
     tx: mpsc::Sender<Outbound>,
@@ -96,6 +100,38 @@ struct Outbound {
     frames: Vec<Frame>,
 }
 
+enum ConnectionStart {
+    Shell,
+    Temporary {
+        artifact: HelperArtifact,
+        bytes: Vec<u8>,
+    },
+    Persistent {
+        artifact: HelperArtifact,
+        bytes: Vec<u8>,
+        identity: HelperIdentity,
+    },
+}
+
+impl ConnectionStart {
+    fn helper_arch(&self) -> Option<&'static str> {
+        match self {
+            Self::Shell => None,
+            Self::Temporary { artifact, .. } | Self::Persistent { artifact, .. } => {
+                Some(artifact.arch)
+            }
+        }
+    }
+
+    const fn mode(&self) -> HelperMode {
+        match self {
+            Self::Shell => HelperMode::Shell,
+            Self::Temporary { .. } => HelperMode::Temporary,
+            Self::Persistent { .. } => HelperMode::Persistent,
+        }
+    }
+}
+
 impl HostSession {
     #[allow(dead_code)]
     pub(crate) async fn connect(
@@ -123,7 +159,16 @@ impl HostSession {
         environment: std::collections::BTreeMap<OsString, OsString>,
         cancel: CancellationToken,
     ) -> BridgeResult<Self> {
-        Self::connect_with_mode(policy, host, limits, executable, environment, cancel, None).await
+        Self::connect_with_mode(
+            policy,
+            host,
+            limits,
+            executable,
+            environment,
+            cancel,
+            ConnectionStart::Shell,
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_capability(
@@ -135,9 +180,14 @@ impl HostSession {
         capability: &Capability,
         cancel: CancellationToken,
     ) -> BridgeResult<Self> {
-        let helper = helper_artifact(capability)
-            .and_then(|artifact| helper_bytes(&artifact).ok().map(|bytes| (artifact, bytes)));
-        let Some((artifact, bytes)) = helper else {
+        let helper = helper_artifact(capability).and_then(|artifact| {
+            helper_bytes(&artifact).ok().and_then(|bytes| {
+                helper_identity(&artifact, &bytes)
+                    .ok()
+                    .map(|identity| (artifact, bytes, identity))
+            })
+        });
+        let Some((artifact, bytes, identity)) = helper else {
             return Self::connect_with_mode(
                 policy,
                 host,
@@ -145,7 +195,7 @@ impl HostSession {
                 executable,
                 environment,
                 cancel,
-                None,
+                ConnectionStart::Shell,
             )
             .await;
         };
@@ -160,22 +210,42 @@ impl HostSession {
             executable,
             environment,
             cancel.clone(),
-            Some((artifact, bytes)),
+            ConnectionStart::Persistent {
+                artifact: artifact.clone(),
+                bytes: bytes.clone(),
+                identity,
+            },
         )
         .await
         {
             Ok(session) => Ok(session),
             Err(error) if helper_startup_fallback_allowed(&error, &cancel) => {
-                Self::connect_with_mode(
-                    fallback_policy,
-                    fallback_host,
+                match Self::connect_with_mode(
+                    fallback_policy.clone(),
+                    fallback_host.clone(),
                     limits,
-                    fallback_executable,
-                    fallback_environment,
-                    cancel,
-                    None,
+                    fallback_executable.clone(),
+                    fallback_environment.clone(),
+                    cancel.clone(),
+                    ConnectionStart::Temporary { artifact, bytes },
                 )
                 .await
+                {
+                    Ok(session) => Ok(session),
+                    Err(error) if helper_startup_fallback_allowed(&error, &cancel) => {
+                        Self::connect_with_mode(
+                            fallback_policy,
+                            fallback_host,
+                            limits,
+                            fallback_executable,
+                            fallback_environment,
+                            cancel,
+                            ConnectionStart::Shell,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => Err(error),
         }
@@ -188,17 +258,22 @@ impl HostSession {
         executable: OsString,
         environment: std::collections::BTreeMap<OsString, OsString>,
         cancel: CancellationToken,
-        helper: Option<(HelperArtifact, Vec<u8>)>,
+        start: ConnectionStart,
     ) -> BridgeResult<Self> {
         if limits.max_frame_bytes == 0 {
             return Err(BridgeError::invalid_argument(
                 "SSH session frame limit must be positive",
             ));
         }
-        let helper_arch = helper.as_ref().map(|(artifact, _)| artifact.arch);
-        let command = match helper.as_ref() {
-            Some((_, bytes)) => helper_command(limits.max_frame_bytes, bytes.len())?,
-            None => dispatcher_command(limits.max_frame_bytes)?,
+        let helper_arch = start.helper_arch();
+        let command = match &start {
+            ConnectionStart::Shell => dispatcher_command(limits.max_frame_bytes)?,
+            ConnectionStart::Temporary { bytes, .. } => {
+                helper_command(limits.max_frame_bytes, bytes.len())?
+            }
+            ConnectionStart::Persistent { identity, .. } => {
+                persistent_helper_command(limits.max_frame_bytes, identity)?
+            }
         };
         let argv = build_ssh_argv(&policy, &host, &command);
         let mut child_command = Command::new(executable);
@@ -235,7 +310,8 @@ impl HostSession {
             .take()
             .ok_or_else(|| BridgeError::io("SSH session stderr pipe is missing"))?;
         tokio::spawn(drain_stderr(stderr));
-        let helper_bootstrap_profile = helper.as_ref().map(|_| {
+        let mut output = BufReader::new(stdout);
+        let helper_bootstrap_profile = (!matches!(start, ConnectionStart::Shell)).then(|| {
             crate::bridge_profile_span!(crate::profile::ProfileEvent {
                 phase: "helper_bootstrap",
                 host: Some(host.as_str()),
@@ -245,24 +321,46 @@ impl HostSession {
                 bytes: None,
             })
         });
-        if let Some((_, bytes)) = helper {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| BridgeError::io("SSH session stdin pipe is missing"))?;
-            if let Err(error) = stdin.write_all(&bytes).await {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(startup_error(&host, &error.to_string()));
+        match &start {
+            ConnectionStart::Persistent { bytes, .. } => {
+                let status = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(cancelled_error(&host, false));
+                    }
+                    result = timeout(
+                        Duration::from_millis(limits.connect_timeout_ms.max(1)),
+                        read_bootstrap_status_line(&mut output),
+                    ) => match result {
+                        Ok(Ok(status)) => status,
+                        Ok(Err(error)) => {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            return Err(error);
+                        }
+                        Err(_) => {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            return Err(BridgeError::new(
+                                ErrorCode::ConnectTimeout,
+                                "persistent helper bootstrap timed out",
+                                true,
+                            ));
+                        }
+                    }
+                };
+                if status == BootstrapStatus::Need {
+                    write_helper_bytes(&mut child, &host, bytes).await?;
+                }
             }
-            if let Err(error) = stdin.flush().await {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(startup_error(&host, &error.to_string()));
+            ConnectionStart::Temporary { bytes, .. } => {
+                write_helper_bytes(&mut child, &host, bytes).await?;
             }
+            ConnectionStart::Shell => {}
         }
         drop(helper_bootstrap_profile);
-        let mut output = BufReader::new(stdout);
         let hello = tokio::select! {
             biased;
             () = cancel.cancelled() => {
@@ -311,10 +409,11 @@ impl HostSession {
             return Err(startup_error(&host, "invalid SSH dispatcher handshake"));
         }
 
+        let helper_mode = start.mode();
         let (tx, rx) = mpsc::channel(64);
         let inner = Arc::new(SessionInner {
             host,
-            helper: helper_arch.is_some(),
+            helper_mode,
             max_payload: limits.max_frame_bytes,
             max_output_bytes: limits.max_output_bytes,
             tx,
@@ -383,7 +482,7 @@ impl HostSession {
             sender,
         };
         self.inner.pending.lock().await.insert(request_id, pending);
-        let helper_command_profile = if self.inner.helper {
+        let helper_command_profile = if self.inner.helper_mode != HelperMode::Shell {
             Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
                 phase: "helper_command_spawn",
                 host: Some(self.inner.host.as_str()),
@@ -401,7 +500,6 @@ impl HostSession {
             return Err(error);
         }
         drop(helper_command_profile);
-
         let deadline = tokio::time::sleep(request.timeout);
         tokio::pin!(deadline);
         tokio::select! {
@@ -451,9 +549,53 @@ impl HostSession {
         Ok(())
     }
 
+    pub(crate) fn helper_mode(&self) -> HelperMode {
+        self.inner.helper_mode
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
+}
+
+async fn write_helper_bytes(
+    child: &mut tokio::process::Child,
+    host: &str,
+    bytes: &[u8],
+) -> BridgeResult<()> {
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| BridgeError::io("SSH session stdin pipe is missing"))?;
+    if let Err(error) = stdin.write_all(bytes).await {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(startup_error(host, &error.to_string()));
+    }
+    if let Err(error) = stdin.flush().await {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(startup_error(host, &error.to_string()));
+    }
+    Ok(())
+}
+
+async fn read_bootstrap_status_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> BridgeResult<BootstrapStatus> {
+    let mut status = Vec::with_capacity(32);
+    let read = reader
+        .read_until(b'\n', &mut status)
+        .await
+        .map_err(BridgeError::io)?;
+    if read == 0 {
+        return Err(BridgeError::new(
+            ErrorCode::ProtocolError,
+            "persistent helper bootstrap closed before status",
+            false,
+        ));
+    }
+    parse_bootstrap_status(&status)
 }
 
 impl SessionInner {
@@ -535,7 +677,7 @@ async fn writer_loop(
             let upgraded = inner.upgrade();
             let max_payload = upgraded.as_ref().map_or(0, |inner| inner.max_payload);
             let _frame_profile = upgraded.as_ref().and_then(|inner| {
-                if inner.helper {
+                if inner.helper_mode != HelperMode::Shell {
                     Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
                         phase: "helper_frame_write",
                         host: Some(inner.host.as_str()),
@@ -628,7 +770,7 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                 protocol_error(&inner.host, "dispatcher returned an unknown request ID")
             })?;
             if frame.kind == FrameKind::Stdout {
-                let _output_profile = if inner.helper {
+                let _output_profile = if inner.helper_mode != HelperMode::Shell {
                     Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
                         phase: "helper_output_drain",
                         host: Some(inner.host.as_str()),
@@ -664,7 +806,7 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                     .stdout_seen
                     .saturating_add(frame.payload.len() as u64);
             } else {
-                let _output_profile = if inner.helper {
+                let _output_profile = if inner.helper_mode != HelperMode::Shell {
                     Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
                         phase: "helper_output_drain",
                         host: Some(inner.host.as_str()),
@@ -703,7 +845,7 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
             Ok(())
         }
         FrameKind::Exit => {
-            let _exit_profile = if inner.helper {
+            let _exit_profile = if inner.helper_mode != HelperMode::Shell {
                 Some(crate::bridge_profile_span!(crate::profile::ProfileEvent {
                     phase: "helper_exit",
                     host: Some(inner.host.as_str()),

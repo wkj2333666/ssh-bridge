@@ -41,6 +41,50 @@ fn session_runner(base: &TempDir, log: &std::path::Path) -> Arc<SshRunner> {
     )
 }
 
+fn persistent_session_runner(
+    base: &TempDir,
+    log: &std::path::Path,
+    install_log: &std::path::Path,
+    machine_arch: &str,
+) -> Arc<SshRunner> {
+    let runtime = RuntimePaths::ensure_from_base(base.path()).unwrap();
+    let store = Arc::new(OutputStore::new(&runtime).unwrap());
+    let remote_home = base.path().join("remote-home");
+    fs::create_dir_all(&remote_home).unwrap();
+    let environment = BTreeMap::from([
+        (
+            OsString::from("FAKE_SSH_MODE"),
+            OsString::from("local-fixed"),
+        ),
+        (OsString::from("FAKE_SSH_ROOT"), OsString::from("/tmp")),
+        (OsString::from("FAKE_SSH_SHELL"), OsString::from("sh")),
+        (
+            OsString::from("FAKE_SSH_KERNEL_NAME"),
+            OsString::from("Linux"),
+        ),
+        (
+            OsString::from("FAKE_SSH_MACHINE_ARCH"),
+            OsString::from(machine_arch),
+        ),
+        (OsString::from("HOME"), remote_home.into_os_string()),
+        (OsString::from("FAKE_SSH_LOG"), log.as_os_str().to_owned()),
+        (
+            OsString::from("FAKE_SSH_INSTALL_LOG"),
+            install_log.as_os_str().to_owned(),
+        ),
+    ]);
+    Arc::new(
+        SshRunner::with_executable(
+            Arc::new(config_with_host("dev", "/tmp")),
+            runtime,
+            store,
+            support::fake_ssh_path(),
+            environment,
+        )
+        .unwrap(),
+    )
+}
+
 fn request(command: &str) -> RunRequest {
     RunRequest {
         host: "dev".to_owned(),
@@ -74,6 +118,92 @@ async fn one_host_reuses_one_persistent_ssh_dispatcher() {
     );
     let log = fs::read_to_string(log).unwrap();
     assert_eq!(log.lines().filter(|line| *line == "S").count(), 1, "{log}");
+}
+
+#[tokio::test]
+async fn persistent_helper_installs_once_and_reuses_after_bridge_restart() {
+    if std::env::var("CODEX_SSH_BRIDGE_PERSISTENT_HELPER_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "persistent helper integration is opt-in; set CODEX_SSH_BRIDGE_PERSISTENT_HELPER_INTEGRATION=1"
+        );
+        return;
+    }
+    let helper_source = std::env::var("CARGO_BIN_EXE_codex-ssh-bridge-helper")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/debug/codex-ssh-bridge-helper")
+        });
+    if !helper_source.is_file() {
+        eprintln!("persistent helper fixture is unavailable; skipping");
+        return;
+    }
+    let (machine_arch, helper_target) = match std::env::consts::ARCH {
+        "x86_64" => ("x86_64", "x86_64-unknown-linux-musl"),
+        "aarch64" => ("aarch64", "aarch64-unknown-linux-musl"),
+        _ => {
+            eprintln!("persistent helper fixture is unavailable on this architecture; skipping");
+            return;
+        }
+    };
+    let helper_parent = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let helper_directory = helper_parent.join("remote-helpers");
+    fs::create_dir_all(&helper_directory).unwrap();
+    let helper_path = helper_directory.join(helper_target);
+    fs::copy(&helper_source, &helper_path).unwrap();
+    fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let base = TempDir::new().unwrap();
+    let log = base.path().join("ssh.log");
+    let install_log = base.path().join("install.log");
+    let runner = persistent_session_runner(&base, &log, &install_log, machine_arch);
+    let mut first_request = request("printf persistent-first");
+    first_request.timeout = Duration::from_secs(30);
+    let first = runner
+        .execute(first_request, CancellationToken::new())
+        .await;
+    let first = first.unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&first.output.stdout.head),
+        "persistent-first"
+    );
+    drop(runner);
+
+    let restart_log = base.path().join("restart-ssh.log");
+    let restart_install_log = base.path().join("restart-install.log");
+    let restarted =
+        persistent_session_runner(&base, &restart_log, &restart_install_log, machine_arch);
+    let mut second_request = request("printf persistent-second");
+    second_request.timeout = Duration::from_secs(30);
+    let second = restarted
+        .execute(second_request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&second.output.stdout.head),
+        "persistent-second"
+    );
+    assert_eq!(fs::read_to_string(&install_log).unwrap(), "NEED\n");
+    assert_eq!(fs::read_to_string(&restart_install_log).unwrap(), "HIT\n");
+
+    let installed = base
+        .path()
+        .join("remote-home/.local/share/codex-ssh-bridge/helpers")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join(format!("{helper_target}/helper"));
+    assert_eq!(
+        fs::metadata(installed).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    drop(restarted);
+    let _ = fs::remove_file(helper_path);
+    let _ = fs::remove_dir(&helper_directory);
 }
 
 #[tokio::test]
