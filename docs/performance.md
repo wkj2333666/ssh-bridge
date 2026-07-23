@@ -22,6 +22,7 @@ cargo test --release --test mcp_tools task8_cancel_process_ -- --nocapture
 cargo test --release --test mcp_tools task8_output_rss_ -- --nocapture
 cargo test --release --test mcp_protocol task7_wide_json_rss_ -- --nocapture
 cargo test --release --test performance_acceptance -- --nocapture
+env CODEX_SSH_BRIDGE_PROFILE=1 cargo test --release --features profile --test performance_acceptance task12_release_helper_and_shell_cold_warm_profile -- --nocapture
 CODEX_SSH_BRIDGE_REQUIRE_REAL_SSH=1 cargo test --release --test real_ssh -- --nocapture
 ```
 
