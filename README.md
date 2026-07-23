@@ -14,7 +14,13 @@ remote sshd ── files, compilers, tests, services
 optional, human-only: local SSHFS mount over SFTP
 ```
 
-The bridge keeps one local-owned SSH session per alias. On supported Linux architectures it uploads a precompiled Rust helper once for that session; unsupported hosts use the complete transient POSIX dispatcher fallback. Neither path installs a persistent package: the server receives no Codex binary, API key, plugin, or bridge installation.
+The bridge keeps one local-owned SSH session per alias. On supported Linux
+architectures it installs a matching Rust helper under the remote account's
+`~/.local/share/codex-ssh-bridge/helpers/<bridge-version>/<target>/helper`
+with mode `0700`, then reuses that file for later bridge starts. The helper
+process itself lives only as long as the SSH session; unsupported hosts and
+startup-incompatible helpers fall back to the POSIX dispatcher. No Codex
+binary, API key, plugin, daemon, or service is installed remotely.
 
 ## Why this design
 
@@ -75,10 +81,25 @@ and `armv7l`, plus GNU-target helpers for `riscv64`, `ppc64le`, and `s390x`.
 When a GNU helper cannot run because the remote loader or libc is incompatible,
 the bridge reports the startup fallback and uses the POSIX dispatcher.
 Keep that directory beside the bridge binary. The bridge probes `uname -s` and
-`uname -m`, uploads the matching helper once per SSH session, and automatically
-uses the POSIX dispatcher when the host or artifact is unsupported. For local
+`uname -m`, verifies the local helper length and SHA-256, and installs the
+matching helper once per bridge-version/target on each remote account. A later
+cold connection reports a persistent cache hit and uploads zero helper bytes;
+warm requests do not probe, hash, lock, or upload. If persistent startup fails,
+the fallback order is temporary helper, then POSIX dispatcher. For local
 development or a custom package, set `CODEX_SSH_BRIDGE_HELPERS_DIR` to a
 private directory containing files named by their Rust target triple.
+
+The selected transport is returned as `helper_mode: "persistent"`,
+`"temporary"`, or `"shell"` in remote structured results. To remove all
+installed helper versions for one verified SSH account, run this explicitly
+(it is not an automatic operation):
+
+```bash
+ssh ALIAS -- 'find ~/.local/share/codex-ssh-bridge/helpers -mindepth 1 -maxdepth 1 -type d -exec rm -rf -- {} +'
+```
+
+This deletes every bridge helper version for that account. Verify `ALIAS`
+before running it; do not paste an unverified host name into the command.
 
 Download the archive matching the local Codex host, extract the binary to a
 private path, and put that absolute path in `.mcp.json.example` before
@@ -113,8 +134,9 @@ aliases, roots, descriptions, and limits—never credentials.
 
 On first use, the bridge validates the local SSH configuration and probes the
 remote shell and utility capabilities. It reuses the connection for later
-requests. Writes and patches use expected hashes, no-follow checks, atomic
-replacement, and explicit conflict or unknown-outcome reporting.
+requests and reports the selected shell, fallback flag, and helper mode.
+Writes and patches use expected hashes, no-follow checks, atomic replacement,
+and explicit conflict or unknown-outcome reporting.
 
 ## Configure MCP for local Codex
 
@@ -171,6 +193,9 @@ The default flow is bounded search/read → unified patch → remote verificatio
 Operational requests use one persistent SSH session per alias and are bounded
 by the configured concurrency and output limits. Requests are cancellable;
 mutations report conflicts or unknown outcomes and are never blindly retried.
+`helper_mode` describes only the transport selected during cold setup; it does
+not change command shell selection (`bash` remains the default unless the
+caller explicitly requests `sh` or `login`).
 
 ## Human direct CLI
 

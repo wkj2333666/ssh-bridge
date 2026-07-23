@@ -17,9 +17,31 @@ Untrusted inputs:
 
 The configured remote root is a routing boundary, not a security sandbox. Remote reads can follow remote symlinks, just as commands run directly on the server can. The connection-time capability probe records the physical path and device/inode identity using a GNU- or BSD-compatible `stat` for diagnostics; it is not a per-request authorization guard and is not re-run on warm requests. The configured root remains a lexical path boundary. Safe writes and patches additionally use no-follow path identity checks, snapshots, hashes, expected-content checks, and guarded commits, but the remote Unix account, permissions, container, forced command, or service policy remains the hard boundary.
 
-No Codex credential, bridge package, plugin, or MCP server is placed on a server. On a supported Linux host the bridge uploads a matching local helper into a private mode-0700 per-session directory, verifies its helper handshake, and removes that directory at session exit; a GNU helper whose remote loader or libc is incompatible falls back to the shell dispatcher before accepting a request. The uploaded bytes are length-delimited stdin data and are never interpolated into shell source. All SSH authentication occurs in the local OpenSSH client.
+No Codex credential, bridge package, plugin, or MCP server is placed on a
+server. On a supported Linux host the bridge installs a matching helper under
+`~/.local/share/codex-ssh-bridge/helpers/<bridge-version>/<target>/helper` with
+private mode `0700`, exact length, and SHA-256 validation. Installation uses a
+cold-only lock and atomic rename; the helper file persists across bridge
+restarts, while the helper process and SSH child end with the session. A GNU
+helper whose remote loader or libc is incompatible falls back to the temporary
+helper and then the shell dispatcher before accepting a request. The uploaded
+bytes are length-delimited stdin data and are never interpolated into shell
+source. All SSH authentication occurs in the local OpenSSH client.
 
-Operational work uses one local-owned SSH child per configured alias. The helper or shell dispatcher is kept only for that SSH session. Each request is framed as data, starts a separate process group, and has independent stdout/stderr limits, timeout, and cancellation. Remote runner slots remain the only execution limiter: an accepted task may wait cancellably for a global or per-host slot. A separate bounded local MCP task window prevents unbounded memory use; `MCP task queue full` means that local window is full, not that the remote host failed. `remote_hosts` remains a control lane. A helper startup failure before the first accepted request falls back once to the shell dispatcher; after acceptance, helper transport failure is an unknown outcome and is never silently retried through sh. A shell dispatcher startup failure is terminal for that request.
+Operational work uses one local-owned SSH child per configured alias. The
+persistent helper file is reused, but the helper or shell dispatcher process is
+kept only for that SSH session. Each request is framed as data, starts a
+separate process group, and has independent stdout/stderr limits, timeout, and
+cancellation. Remote runner slots remain the only execution limiter: an
+accepted task may wait cancellably for a global or per-host slot. A separate
+bounded local MCP task window prevents unbounded memory use; `MCP task queue
+full` means that local window is full, not that the remote host failed.
+`remote_hosts` remains a control lane. A helper startup failure before the
+first accepted request falls back once through the ordered temporary-helper and
+shell-dispatcher paths; after acceptance, helper transport failure is an
+unknown outcome and is never silently retried through sh. A shell dispatcher
+startup failure is terminal for that request. Successful structured results
+expose `helper_mode` as `persistent`, `temporary`, or `shell`.
 
 ## OpenSSH policy
 
