@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -375,7 +376,13 @@ where
             command
         }
         "login" => {
-            let mut command = Command::new(spec.login_shell.as_deref().unwrap_or("/bin/sh"));
+            let login_shell = spec.login_shell.as_deref().unwrap_or("/bin/sh");
+            let metadata =
+                std::fs::metadata(login_shell).map_err(|_| "login-shell-unavailable".to_owned())?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                return Err("login-shell-unavailable".to_owned());
+            }
+            let mut command = Command::new(login_shell);
             command.args(["-c", &spec.command]);
             command
         }

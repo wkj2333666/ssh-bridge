@@ -183,6 +183,30 @@ async fn supported_linux_architecture_uses_uploaded_helper_once_per_session() {
         "{log_text}"
     );
     drop(runner);
+
+    fs::copy("/bin/false", &helper_path).unwrap();
+    fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let fallback_base = TempDir::new().unwrap();
+    let fallback_log = fallback_base.path().join("ssh.log");
+    let fallback_runner = session_runner(&fallback_base, &fallback_log);
+    let fallback = fallback_runner
+        .execute(request("printf shell-fallback"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&fallback.output.stdout.head),
+        "shell-fallback"
+    );
+    let fallback_log_text = fs::read_to_string(fallback_log).unwrap();
+    assert_eq!(
+        fallback_log_text
+            .lines()
+            .filter(|line| *line == "S")
+            .count(),
+        2,
+        "{fallback_log_text}"
+    );
+    drop(fallback_runner);
     let _ = fs::remove_file(helper_path);
     let _ = fs::remove_dir(&helper_directory);
 }

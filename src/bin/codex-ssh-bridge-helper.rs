@@ -3,9 +3,22 @@ use std::io;
 use codex_ssh_bridge::remote_helper::{HelperConfig, run};
 
 fn main() {
+    remove_bootstrap_artifact();
     if let Err(error) = run(io::stdin(), io::stdout(), parse_config()) {
         eprintln!("codex-ssh-bridge-helper: {error}");
         std::process::exit(74);
+    }
+}
+
+fn remove_bootstrap_artifact() {
+    let Some(path) = std::env::var_os("CODEX_SSH_HELPER_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let parent = path.parent().map(std::path::Path::to_owned);
+    let _ = std::fs::remove_file(&path);
+    if let Some(parent) = parent {
+        let _ = std::fs::remove_dir(parent);
     }
 }
 

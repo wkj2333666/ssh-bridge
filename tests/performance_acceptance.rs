@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::hint::black_box;
+use std::io::{BufReader, Write};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,7 @@ use codex_ssh_bridge::mcp::{
 };
 use codex_ssh_bridge::output::OutputStore;
 use codex_ssh_bridge::remote::RemoteBridge;
+use codex_ssh_bridge::remote_helper_protocol::{Frame, FrameKind, read_frame, write_frame};
 use codex_ssh_bridge::ssh::{RuntimePaths, SshRunner};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -118,6 +120,13 @@ fn duration_percentiles(samples: &mut [Duration]) -> (Duration, Duration, Durati
     (percentile(50), percentile(95), *samples.last().unwrap())
 }
 
+fn short_duration_percentiles(samples: &mut [Duration]) -> (Duration, Duration, Duration) {
+    assert!(!samples.is_empty());
+    samples.sort_unstable();
+    let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
+    (samples[samples.len() / 2], p95, *samples.last().unwrap())
+}
+
 fn report_latency(label: &str, samples: &mut [Duration]) -> (Duration, Duration, Duration) {
     let (p50, p95, maximum) = duration_percentiles(samples);
     eprintln!(
@@ -190,6 +199,148 @@ async fn task11_release_cold_and_warm_ssh_profile() {
     assert_eq!(
         warm_kinds.iter().filter(|kind| **kind == "C").count(),
         SSH_WARM_CALLS + SSH_MEASURED_CALLS
+    );
+}
+
+fn helper_release_path() -> std::path::PathBuf {
+    std::env::var("CARGO_BIN_EXE_codex-ssh-bridge-helper")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/release/codex-ssh-bridge-helper")
+        })
+}
+
+fn send_profile_request(writer: &mut impl Write, request_id: u64) {
+    let metadata = b"shell=sh\ncwd_length=4\ncommand_length=1\nstdin_length=0\ntimeout_ms=1000\nstdout_limit=1024\nstderr_limit=1024\n";
+    for frame in [
+        Frame {
+            kind: FrameKind::Open,
+            request_id,
+            payload: metadata.to_vec(),
+        },
+        Frame {
+            kind: FrameKind::Data,
+            request_id,
+            payload: b"/tmp".to_vec(),
+        },
+        Frame {
+            kind: FrameKind::Data,
+            request_id,
+            payload: b":".to_vec(),
+        },
+    ] {
+        write_frame(writer, &frame, 64 * 1024).unwrap();
+    }
+    writer.flush().unwrap();
+}
+
+fn wait_profile_exit(reader: &mut BufReader<impl std::io::Read>, request_id: u64) {
+    loop {
+        let frame = read_frame(reader, 64 * 1024)
+            .unwrap()
+            .expect("profile transport closed before EXIT");
+        assert_eq!(frame.request_id, request_id);
+        if frame.kind == FrameKind::Exit {
+            return;
+        }
+    }
+}
+
+fn close_profile_child(mut child: std::process::Child, mut writer: impl Write) {
+    write_frame(
+        &mut writer,
+        &Frame {
+            kind: FrameKind::Close,
+            request_id: 0,
+            payload: Vec::new(),
+        },
+        64 * 1024,
+    )
+    .unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn task12_release_helper_and_shell_cold_warm_profile() {
+    if cfg!(debug_assertions) {
+        eprintln!("Task12 helper profile is release-only");
+        return;
+    }
+    let helper_path = helper_release_path();
+    if !helper_path.is_file() {
+        eprintln!("Task12 helper profile skipped: release helper binary is unavailable");
+        return;
+    }
+    let dispatcher = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ssh/dispatcher.sh"),
+    )
+    .unwrap();
+    let mut helper_cold = Vec::new();
+    let mut shell_cold = Vec::new();
+    for _ in 0..8 {
+        let started = Instant::now();
+        let mut child = Command::new(&helper_path)
+            .args(["--max-frame", "65536"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        assert_eq!(
+            read_frame(&mut reader, 65536).unwrap().unwrap().kind,
+            FrameKind::HelloAck
+        );
+        helper_cold.push(started.elapsed());
+        close_profile_child(child, writer);
+
+        let started = Instant::now();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &dispatcher, "--", "codex-ssh-dispatcher-1", "65536"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        assert_eq!(
+            read_frame(&mut reader, 65536).unwrap().unwrap().kind,
+            FrameKind::HelloAck
+        );
+        shell_cold.push(started.elapsed());
+        close_profile_child(child, writer);
+    }
+
+    let mut helper = Command::new(&helper_path)
+        .args(["--max-frame", "65536"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut helper_writer = helper.stdin.take().unwrap();
+    let mut helper_reader = BufReader::new(helper.stdout.take().unwrap());
+    let _ = read_frame(&mut helper_reader, 65536).unwrap();
+    let mut helper_warm = Vec::new();
+    for request_id in 1..=32 {
+        let started = Instant::now();
+        send_profile_request(&mut helper_writer, request_id);
+        wait_profile_exit(&mut helper_reader, request_id);
+        helper_warm.push(started.elapsed());
+    }
+    close_profile_child(helper, helper_writer);
+
+    let (helper_cold_p50, helper_cold_p95, _) = short_duration_percentiles(&mut helper_cold);
+    let (shell_cold_p50, shell_cold_p95, _) = short_duration_percentiles(&mut shell_cold);
+    let (helper_warm_p50, helper_warm_p95, _) = short_duration_percentiles(&mut helper_warm);
+    eprintln!(
+        "Task12 helper/shell cold/warm: helper_cold={helper_cold_p50:?}/{helper_cold_p95:?}, shell_cold={shell_cold_p50:?}/{shell_cold_p95:?}, helper_warm={helper_warm_p50:?}/{helper_warm_p95:?}"
     );
 }
 

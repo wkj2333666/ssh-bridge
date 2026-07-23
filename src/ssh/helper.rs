@@ -46,7 +46,7 @@ while [ "$read_bytes" -lt "$helper_length" ]; do
 done
 [ "$read_bytes" -eq "$helper_length" ] || exit 74
 chmod 700 "$helper" || exit 74
-exec "$helper" --max-frame "$max_frame"
+CODEX_SSH_HELPER_PATH="$helper" exec "$helper" --max-frame "$max_frame"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
