@@ -121,7 +121,10 @@ fn release_workflow_builds_and_packages_all_common_targets() {
         "powerpc64le-unknown-linux-gnu",
         "s390x-unknown-linux-gnu",
     ] {
-        assert!(workflow.contains(main_target), "release workflow omits {main_target}");
+        assert!(
+            workflow.contains(main_target),
+            "release workflow omits {main_target}"
+        );
     }
     for helper_target in [
         "x86_64-unknown-linux-musl",
@@ -131,7 +134,10 @@ fn release_workflow_builds_and_packages_all_common_targets() {
         "powerpc64le-unknown-linux-gnu",
         "s390x-unknown-linux-gnu",
     ] {
-        assert!(workflow.contains(helper_target), "release workflow omits {helper_target}");
+        assert!(
+            workflow.contains(helper_target),
+            "release workflow omits {helper_target}"
+        );
     }
     assert!(workflow.contains("name: helper-${{ matrix.target }}"));
     assert!(workflow.contains("remote-helpers/$helper"));
