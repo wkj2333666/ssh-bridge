@@ -719,6 +719,8 @@ emit_record REQUESTED_ROOT "$requested_root"
 emit_record ROOT "$physical_root"
 emit_record ROOT_DEVICE "$root_device"
 emit_record ROOT_INODE "$root_inode"
+emit_record KERNEL_NAME "$(uname -s 2>/dev/null || printf unknown)"
+emit_record MACHINE_ARCH "$(uname -m 2>/dev/null || printf unknown)"
 emit_record SHELL_KIND "$shell_kind"
 emit_record BASH_VERSION "$bash_version"
 emit_record LOGIN_SHELL "$login_shell"
@@ -755,6 +757,8 @@ pub struct Capability {
     pub physical_root: String,
     pub root_device: u64,
     pub root_inode: u64,
+    pub kernel_name: Option<String>,
+    pub machine_arch: Option<String>,
     pub shell: ShellKind,
     pub bash_version: Option<String>,
     pub login_shell: Option<String>,
@@ -763,6 +767,8 @@ pub struct Capability {
 
 pub const MAX_SHELL_VERSION_BYTES: usize = 256;
 pub const MAX_LOGIN_SHELL_BYTES: usize = 4096;
+pub const MAX_KERNEL_NAME_BYTES: usize = 64;
+pub const MAX_MACHINE_ARCH_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellRequest {
@@ -873,6 +879,8 @@ pub fn parse_probe_output(
     }
     let root_device = parse_root_identity_number(required(&records, "ROOT_DEVICE")?)?;
     let root_inode = parse_root_identity_number(required(&records, "ROOT_INODE")?)?;
+    let kernel_name = optional_bounded_record(&records, "KERNEL_NAME", MAX_KERNEL_NAME_BYTES)?;
+    let machine_arch = optional_bounded_record(&records, "MACHINE_ARCH", MAX_MACHINE_ARCH_BYTES)?;
 
     let bash_version = required(&records, "BASH_VERSION")?;
     if bash_version.len() > MAX_SHELL_VERSION_BYTES {
@@ -917,6 +925,8 @@ pub fn parse_probe_output(
         physical_root: physical_root.to_owned(),
         root_device,
         root_inode,
+        kernel_name,
+        machine_arch,
         shell,
         bash_version,
         login_shell,
@@ -927,7 +937,7 @@ pub fn parse_probe_output(
 fn validate_key_value(key: &str, value: &str) -> BridgeResult<()> {
     match key {
         "CODEX_SSH_PROBE" | "REQUESTED_ROOT" | "ROOT" | "ROOT_DEVICE" | "ROOT_INODE"
-        | "SHELL_KIND" | "BASH_VERSION" | "LOGIN_SHELL" => Ok(()),
+        | "KERNEL_NAME" | "MACHINE_ARCH" | "SHELL_KIND" | "BASH_VERSION" | "LOGIN_SHELL" => Ok(()),
         _ => match key.strip_prefix("TOOL_") {
             Some(name) if TOOL_NAMES.contains(&name) && matches!(value, "0" | "1") => Ok(()),
             Some(name) if !TOOL_NAMES.contains(&name) => {
@@ -937,6 +947,23 @@ fn validate_key_value(key: &str, value: &str) -> BridgeResult<()> {
             None => Err(protocol_error("unknown capability key")),
         },
     }
+}
+
+fn optional_bounded_record(
+    records: &BTreeMap<String, String>,
+    key: &str,
+    max_bytes: usize,
+) -> BridgeResult<Option<String>> {
+    let Some(value) = records.get(key) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_bytes || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(protocol_error("capability platform record is invalid"));
+    }
+    Ok(Some(value.clone()))
 }
 
 fn parse_root_identity_number(value: &str) -> BridgeResult<u64> {

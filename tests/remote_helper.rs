@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use codex_ssh_bridge::remote_helper_protocol::{
-    Frame, FrameKind, read_frame, write_frame,
-};
+use codex_ssh_bridge::remote_helper_protocol::{Frame, FrameKind, read_frame, write_frame};
 
 #[test]
 fn helper_wire_round_trips_binary_and_empty_payloads() {
@@ -50,8 +48,7 @@ fn helper_path() -> PathBuf {
         .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/debug/codex-ssh-bridge-helper")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/codex-ssh-bridge-helper")
         })
 }
 
@@ -129,9 +126,11 @@ fn helper_preserves_streams_and_exit_status() {
     let hello = read_next(&mut output);
     assert_eq!(hello.kind, FrameKind::HelloAck);
     assert_eq!(hello.request_id, 0);
-    assert!(String::from_utf8(hello.payload)
-        .unwrap()
-        .contains("protocol=codex-ssh-helper/1;version=1;"));
+    assert!(
+        String::from_utf8(hello.payload)
+            .unwrap()
+            .contains("protocol=codex-ssh-helper/1;version=1;")
+    );
 
     send_request(&mut input, 1, cwd, b"printf out; printf err >&2; exit 7");
     let mut stdout = Vec::new();

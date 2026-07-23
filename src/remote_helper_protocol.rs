@@ -162,11 +162,7 @@ pub fn read_frame<R: Read>(reader: &mut R, max_payload: usize) -> io::Result<Opt
     }))
 }
 
-pub fn write_frame<W: Write>(
-    writer: &mut W,
-    frame: &Frame,
-    max_payload: usize,
-) -> io::Result<()> {
+pub fn write_frame<W: Write>(writer: &mut W, frame: &Frame, max_payload: usize) -> io::Result<()> {
     if frame.payload.len() > max_payload {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

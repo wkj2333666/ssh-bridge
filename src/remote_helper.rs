@@ -223,7 +223,9 @@ fn read_request<R: Read>(
     let stderr_limit = parse_u64(&fields, "stderr_limit")?;
     let login_shell = match fields.get("login_shell").map(String::as_str) {
         Some("") | None => None,
-        Some(value) if value.starts_with('/') && !value.bytes().any(|byte| byte.is_ascii_control()) => {
+        Some(value)
+            if value.starts_with('/') && !value.bytes().any(|byte| byte.is_ascii_control()) =>
+        {
             Some(value.to_owned())
         }
         Some(_) => return Err("invalid-login-shell".to_owned()),
@@ -398,7 +400,9 @@ where
             });
         }
     }
-    let mut child = command.spawn().map_err(|_| "command-spawn-failed".to_owned())?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| "command-spawn-failed".to_owned())?;
     let pid = child
         .id()
         .try_into()
@@ -456,7 +460,9 @@ where
         let watchdog_control = Arc::clone(control);
         Some(thread::spawn(move || {
             let (done_lock, done_signal) = &*watchdog_done;
-            let done = done_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let done = done_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (done, _) = done_signal
                 .wait_timeout_while(done, timeout, |done| !*done)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -465,9 +471,7 @@ where
             }
         }))
     };
-    let status = child
-        .wait()
-        .map_err(|_| "command-wait-failed".to_owned())?;
+    let status = child.wait().map_err(|_| "command-wait-failed".to_owned())?;
     let (done_lock, done_signal) = &*watchdog_done;
     if let Ok(mut done) = done_lock.lock() {
         *done = true;
@@ -574,7 +578,10 @@ fn machine_arch() -> String {
             let value = unsafe { value.assume_init() };
             let bytes = value.machine.as_ptr().cast::<u8>();
             let bytes = unsafe { std::slice::from_raw_parts(bytes, value.machine.len()) };
-            let length = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+            let length = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
             if let Ok(machine) = std::str::from_utf8(&bytes[..length])
                 && !machine.is_empty()
             {

@@ -96,6 +96,8 @@ fn capability(shell: ShellKind) -> Capability {
         physical_root: "/srv/project".to_owned(),
         root_device: 1,
         root_inode: 2,
+        kernel_name: None,
+        machine_arch: None,
         shell,
         bash_version,
         login_shell: Some("/bin/sh".to_owned()),
@@ -502,6 +504,40 @@ fn parser_accepts_bash_sh_and_newlines_without_conflating_requested_and_physical
     assert_eq!(sh.shell, ShellKind::PosixSh);
     assert_eq!(sh.bash_version, None);
     assert_eq!(sh.login_shell.as_deref(), Some("/bin/sh"));
+}
+
+#[test]
+fn parser_accepts_optional_linux_architecture_records_and_keeps_old_fixtures_compatible() {
+    let expected = RemotePath::resolve("/srv/project", ".").unwrap();
+    let mut output = String::from_utf8(sh_probe(expected.absolute(), "/srv/project")).unwrap();
+    output = output.replace(
+        "ROOT_INODE=2\0",
+        "ROOT_INODE=2\0KERNEL_NAME=Linux\0MACHINE_ARCH=x86_64\0",
+    );
+    let capability = parse_probe_output(output.as_bytes(), &expected).unwrap();
+    assert_eq!(capability.kernel_name.as_deref(), Some("Linux"));
+    assert_eq!(capability.machine_arch.as_deref(), Some("x86_64"));
+
+    let legacy =
+        parse_probe_output(&sh_probe(expected.absolute(), "/srv/project"), &expected).unwrap();
+    assert_eq!(legacy.kernel_name, None);
+    assert_eq!(legacy.machine_arch, None);
+}
+
+#[test]
+fn parser_rejects_invalid_optional_platform_records() {
+    let expected = RemotePath::resolve("/srv/project", ".").unwrap();
+    let base = String::from_utf8(sh_probe(expected.absolute(), "/srv/project")).unwrap();
+    let suffixes = vec![
+        "KERNEL_NAME=Linux\nother\0".to_owned(),
+        format!("MACHINE_ARCH={}\0", "x".repeat(65)),
+        "KERNEL_NAME=Linux\0KERNEL_NAME=Other\0".to_owned(),
+    ];
+    for suffix in suffixes {
+        let output = format!("{base}{suffix}");
+        let error = parse_probe_output(output.as_bytes(), &expected).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolError);
+    }
 }
 
 #[test]
