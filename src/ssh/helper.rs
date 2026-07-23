@@ -80,6 +80,11 @@ fn helper_target_for_arch(machine_arch: &str) -> Option<(&'static str, &'static 
 }
 
 pub(crate) fn helper_bytes(artifact: &HelperArtifact) -> BridgeResult<Vec<u8>> {
+    let directory = artifact
+        .path
+        .parent()
+        .ok_or_else(|| BridgeError::invalid_config("remote helper artifact has no parent"))?;
+    validate_artifact_path(directory, &artifact.path)?;
     let metadata = fs::symlink_metadata(&artifact.path).map_err(BridgeError::io)?;
     if metadata.len() == 0 || metadata.len() > MAX_HELPER_BYTES {
         return Err(BridgeError::invalid_config(
@@ -119,9 +124,11 @@ pub(crate) fn helper_directory() -> BridgeResult<PathBuf> {
 fn validate_artifact_path(directory: &Path, path: &Path) -> BridgeResult<()> {
     let directory_metadata = fs::symlink_metadata(directory).map_err(BridgeError::io)?;
     let file_metadata = fs::symlink_metadata(path).map_err(BridgeError::io)?;
+    let uid = unsafe { libc::geteuid() };
     if !directory_metadata.is_dir()
         || directory_metadata.file_type().is_symlink()
         || directory_metadata.permissions().mode() & 0o022 != 0
+        || (directory_metadata.uid() != uid && directory_metadata.uid() != 0)
         || !file_metadata.is_file()
         || file_metadata.file_type().is_symlink()
         || file_metadata.permissions().mode() & 0o111 == 0
@@ -131,7 +138,6 @@ fn validate_artifact_path(directory: &Path, path: &Path) -> BridgeResult<()> {
             "remote helper artifact path is not a private executable",
         ));
     }
-    let uid = unsafe { libc::geteuid() };
     if file_metadata.uid() != uid && file_metadata.uid() != 0 {
         return Err(BridgeError::invalid_config(
             "remote helper artifact has an unexpected owner",
