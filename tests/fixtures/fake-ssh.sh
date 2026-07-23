@@ -131,6 +131,10 @@ case "$remote_command" in
 		log_call S "$@"
 		exec /bin/sh -c "$remote_command"
 		;;
+	*codex-ssh-persistent-helper-bootstrap-1*)
+		log_call S "$@"
+		exec /bin/sh -c "$remote_command"
+		;;
 esac
 
 if [ -n "${FAKE_SSH_PHASE_LOG:-}" ]; then

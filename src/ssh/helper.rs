@@ -9,6 +9,7 @@ use crate::quote::shell_word;
 const HELPER_DIRECTORY_ENV: &str = "CODEX_SSH_BRIDGE_HELPERS_DIR";
 const HELPER_DIRECTORY_NAME: &str = "remote-helpers";
 const HELPER_BOOTSTRAP_TAG: &str = "codex-ssh-helper-bootstrap-1";
+const PERSISTENT_HELPER_BOOTSTRAP_TAG: &str = "codex-ssh-persistent-helper-bootstrap-1";
 const MAX_HELPER_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -48,6 +49,104 @@ done
 [ "$read_bytes" -eq "$helper_length" ] || exit 74
 chmod 700 "$helper" || exit 74
 CODEX_SSH_HELPER_PATH="$helper" exec "$helper" --max-frame "$max_frame"
+"#;
+
+const PERSISTENT_HELPER_BOOTSTRAP_SCRIPT: &str = r#"set -u
+umask 077
+bootstrap_tag=${1-}
+max_frame=${2-}
+bridge_version=${3-}
+helper_target=${4-}
+helper_arch=${5-}
+helper_length=${6-}
+helper_sha256=${7-}
+[ "$bootstrap_tag" = codex-ssh-persistent-helper-bootstrap-1 ] || exit 64
+case "$max_frame:$helper_length" in
+    ''|*[!0-9:]*|*:*:) exit 64 ;;
+esac
+[ "$max_frame" -gt 0 ] || exit 64
+[ "$helper_length" -gt 0 ] || exit 64
+case "$bridge_version:$helper_target:$helper_arch" in
+    ''|*[!A-Za-z0-9._:-]*) exit 64 ;;
+esac
+case "$helper_sha256" in
+    ''|*[!0-9a-f]*) exit 64 ;;
+esac
+[ "${#helper_sha256}" -eq 64 ] || exit 64
+home=$(CDPATH= cd -P -- ~ 2>/dev/null && pwd -P) || exit 74
+case "$home" in /*) ;; *) exit 74 ;; esac
+root=$home/.local
+data_root=$root/share
+bridge_root=$data_root/codex-ssh-bridge
+helpers_root=$bridge_root/helpers
+version_root=$helpers_root/$bridge_version
+target_root=$version_root/$helper_target
+helper=$target_root/helper
+lock=$target_root/.install.lock
+mkdir -p "$target_root" 2>/dev/null || exit 74
+for directory in "$root" "$data_root" "$bridge_root" "$helpers_root" "$version_root" "$target_root"; do
+    [ -d "$directory" ] || exit 74
+    [ ! -L "$directory" ] || exit 74
+    chmod 700 "$directory" || exit 74
+done
+valid_helper() {
+    [ -f "$helper" ] && [ ! -L "$helper" ] && [ -x "$helper" ] || return 1
+    mode=$(stat -c '%a' "$helper" 2>/dev/null || stat -f '%Lp' "$helper" 2>/dev/null) || return 1
+    [ "$mode" = 700 ] || return 1
+    size=$(wc -c <"$helper" | tr -d '[:space:]') || return 1
+    [ "$size" = "$helper_length" ] || return 1
+    digest=$(sha256sum "$helper" 2>/dev/null) || return 1
+    digest=${digest%% *}
+    [ "$digest" = "$helper_sha256" ]
+}
+lock_owned=0
+cleanup() {
+    if [ "$lock_owned" -eq 1 ]; then
+        rmdir "$lock" 2>/dev/null || true
+    fi
+    rm -f "$target_root/.helper.$$.$helper_length.tmp" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+wait_count=0
+while ! mkdir "$lock" 2>/dev/null; do
+    if valid_helper; then
+        printf '%s\n' 'CXSB-INSTALL-1 HIT'
+        exec "$helper" --max-frame "$max_frame"
+    fi
+    wait_count=$((wait_count + 1))
+    [ "$wait_count" -lt 30 ] || exit 73
+    sleep 1
+done
+lock_owned=1
+if valid_helper; then
+    rmdir "$lock" 2>/dev/null || exit 74
+    lock_owned=0
+    printf '%s\n' 'CXSB-INSTALL-1 HIT'
+    exec "$helper" --max-frame "$max_frame"
+fi
+printf '%s\n' 'CXSB-INSTALL-1 NEED'
+temporary=$target_root/.helper.$$.$helper_length.tmp
+: >"$temporary" || exit 74
+read_bytes=0
+while [ "$read_bytes" -lt "$helper_length" ]; do
+    chunk=$((helper_length - read_bytes))
+    [ "$chunk" -le 65536 ] || chunk=65536
+    dd bs="$chunk" count=1 >>"$temporary" 2>/dev/null || exit 74
+    now=$(wc -c <"$temporary" | tr -d '[:space:]') || exit 74
+    case "$now" in ''|*[!0-9]*) exit 74 ;; esac
+    [ "$now" -gt "$read_bytes" ] || exit 74
+    [ "$now" -le "$helper_length" ] || exit 74
+    read_bytes=$now
+done
+[ "$read_bytes" -eq "$helper_length" ] || exit 74
+digest=$(sha256sum "$temporary" 2>/dev/null) || exit 74
+digest=${digest%% *}
+[ "$digest" = "$helper_sha256" ] || exit 74
+chmod 700 "$temporary" || exit 74
+mv -f "$temporary" "$helper" || exit 74
+rmdir "$lock" 2>/dev/null || exit 74
+lock_owned=0
+exec "$helper" --max-frame "$max_frame"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +270,28 @@ pub(crate) fn helper_command(max_frame_bytes: usize, helper_length: usize) -> Br
     Ok(format!("sh -c {script} -- {tag} {length} {max_frame}"))
 }
 
+pub(crate) fn persistent_helper_command(
+    max_frame_bytes: usize,
+    identity: &HelperIdentity,
+) -> BridgeResult<String> {
+    if max_frame_bytes == 0 || identity.length == 0 || identity.sha256.len() != 64 {
+        return Err(BridgeError::invalid_argument(
+            "persistent helper bootstrap arguments are invalid",
+        ));
+    }
+    let script = shell_word(PERSISTENT_HELPER_BOOTSTRAP_SCRIPT)?;
+    let tag = shell_word(PERSISTENT_HELPER_BOOTSTRAP_TAG)?;
+    let max_frame = shell_word(&max_frame_bytes.to_string())?;
+    let version = shell_word(&identity.version)?;
+    let target = shell_word(identity.target)?;
+    let arch = shell_word(identity.arch)?;
+    let length = shell_word(&identity.length.to_string())?;
+    let sha256 = shell_word(&identity.sha256)?;
+    Ok(format!(
+        "sh -c {script} -- {tag} {max_frame} {version} {target} {arch} {length} {sha256}"
+    ))
+}
+
 pub(crate) fn helper_directory() -> BridgeResult<PathBuf> {
     let directory = match std::env::var_os(HELPER_DIRECTORY_ENV) {
         Some(path) if !path.is_empty() => PathBuf::from(path),
@@ -213,8 +334,9 @@ fn validate_artifact_path(directory: &Path, path: &Path) -> BridgeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapStatus, HelperArtifact, helper_artifact, helper_command, helper_identity,
-        helper_target_for_arch, parse_bootstrap_status,
+        BootstrapStatus, HelperArtifact, HelperIdentity, helper_artifact, helper_command,
+        helper_identity, helper_target_for_arch, parse_bootstrap_status,
+        persistent_helper_command,
     };
     use crate::capability::{Capability, ShellKind};
     use std::collections::BTreeMap;
@@ -363,5 +485,152 @@ mod tests {
         let oversized = [b'X'; 65];
         let error = parse_bootstrap_status(&oversized).unwrap_err();
         assert_eq!(error.code, crate::error::ErrorCode::ProtocolError);
+    }
+
+    fn helper_fixture() -> (std::path::PathBuf, Vec<u8>) {
+        let helper_path = std::env::var("CARGO_BIN_EXE_codex-ssh-bridge-helper")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_codex_ssh_bridge_helper"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/debug/codex-ssh-bridge-helper")
+            });
+        if !helper_path.is_file() {
+            panic!("helper fixture is unavailable: {}", helper_path.display());
+        }
+        let bytes = std::fs::read(&helper_path).unwrap();
+        (helper_path, bytes)
+    }
+
+    fn persistent_identity(bytes: &[u8]) -> HelperIdentity {
+        let artifact = HelperArtifact {
+            path: std::path::PathBuf::from("/tmp/helper"),
+            target: "x86_64-unknown-linux-musl",
+            arch: "x86_64",
+        };
+        helper_identity(&artifact, bytes).unwrap()
+    }
+
+    #[test]
+    fn persistent_bootstrap_contains_no_helper_bytes() {
+        let identity = persistent_identity(b"binary\0payload\xff");
+        let command = persistent_helper_command(64 * 1024, &identity).unwrap();
+        assert!(command.contains("codex-ssh-persistent-helper-bootstrap-1"));
+        assert!(command.contains(&identity.version));
+        assert!(command.contains(identity.target));
+        assert!(command.contains(&identity.sha256));
+        assert!(!command.contains("binary"));
+        assert!(!command.as_bytes().contains(&0));
+    }
+
+    #[test]
+    fn persistent_bootstrap_round_trips_hit_without_upload() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use tempfile::TempDir;
+
+        let (_helper_path, bytes) = helper_fixture();
+        let identity = persistent_identity(&bytes);
+        let home = TempDir::new().unwrap();
+        let target = home
+            .path()
+            .join(".local/share/codex-ssh-bridge/helpers")
+            .join(&identity.version)
+            .join(identity.target);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("helper"), &bytes).unwrap();
+        std::fs::set_permissions(
+            target.join("helper"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        let command = persistent_helper_command(64 * 1024, &identity).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("HOME", home.path())
+            .env("TMPDIR", home.path().join("tmp"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::create_dir_all(home.path().join("tmp")).unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut status = String::new();
+        output.read_line(&mut status).unwrap();
+        assert_eq!(status, "CXSB-INSTALL-1 HIT\n");
+        let hello = crate::remote_helper_protocol::read_frame(&mut output, 64 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello.kind, crate::remote_helper_protocol::FrameKind::HelloAck);
+        crate::remote_helper_protocol::write_frame(
+            &mut input,
+            &crate::remote_helper_protocol::Frame {
+                kind: crate::remote_helper_protocol::FrameKind::Close,
+                request_id: 0,
+                payload: Vec::new(),
+            },
+            64 * 1024,
+        )
+        .unwrap();
+        input.flush().unwrap();
+        drop(input);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn persistent_bootstrap_round_trips_need_with_binary_bytes() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use tempfile::TempDir;
+
+        let (_helper_path, bytes) = helper_fixture();
+        let identity = persistent_identity(&bytes);
+        let home = TempDir::new().unwrap();
+        let tmp = home.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let command = persistent_helper_command(64 * 1024, &identity).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("HOME", home.path())
+            .env("TMPDIR", &tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut status = String::new();
+        output.read_line(&mut status).unwrap();
+        assert_eq!(status, "CXSB-INSTALL-1 NEED\n");
+        input.write_all(&bytes).unwrap();
+        input.flush().unwrap();
+        let hello = crate::remote_helper_protocol::read_frame(&mut output, 64 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello.kind, crate::remote_helper_protocol::FrameKind::HelloAck);
+        let installed = home
+            .path()
+            .join(".local/share/codex-ssh-bridge/helpers")
+            .join(&identity.version)
+            .join(identity.target)
+            .join("helper");
+        assert_eq!(std::fs::read(installed).unwrap(), bytes);
+        crate::remote_helper_protocol::write_frame(
+            &mut input,
+            &crate::remote_helper_protocol::Frame {
+                kind: crate::remote_helper_protocol::FrameKind::Close,
+                request_id: 0,
+                payload: Vec::new(),
+            },
+            64 * 1024,
+        )
+        .unwrap();
+        input.flush().unwrap();
+        drop(input);
+        assert!(child.wait().unwrap().success());
     }
 }
