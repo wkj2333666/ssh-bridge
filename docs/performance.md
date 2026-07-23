@@ -42,9 +42,11 @@ events. Events contain only phase, host alias, request id, cold/warm class,
 elapsed microseconds, and byte counts; credentials, commands, paths, and
 remote output are never recorded. The cold sample includes local policy and
 capability setup plus the first SSH session; the warm sample reuses the
-persistent session. GitHub CI stores the profile and RSS logs as a diagnostic
-artifact, but its timings are not a substitute for measurements across the
-actual network to a target server.
+persistent session. Preparation, session, and capture spans intentionally
+overlap while the remote process and output drains run concurrently, so their
+durations must not be added together. GitHub CI stores the profile and RSS
+logs as a diagnostic artifact, but its timings are not a substitute for
+measurements across the actual network to a target server.
 
 ## Recorded values
 
@@ -59,7 +61,7 @@ actual network to a target server.
 | MCP output at the 64 MiB quota plus retained models | three fresh children | RSS delta 7,248–7,280 KiB | < 16 MiB |
 | Maximum-budget wide JSON array | fresh child | RSS delta 8,400 KiB | < 48 MiB |
 | Maximum-budget wide JSON object | separate fresh child | RSS delta 17,088 KiB | < 48 MiB |
-| Base64 admission at the maximum input budget | fresh child | RSS delta 15,168 KiB | < 32 MiB |
+| Base64 admission at the maximum input budget | fresh child | RSS delta 14,176 KiB | < 32 MiB |
 | Maximum MCP payload | complete framed case | payload 8,388,608 bytes; newline-delimited frame 8,388,609 bytes | exact compiled ceiling |
 | Tool-list / required output page | complete MCP serialization | 6,947 / 1,048,576 bytes | within wire budget |
 

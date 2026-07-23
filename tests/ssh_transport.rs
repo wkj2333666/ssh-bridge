@@ -1540,11 +1540,11 @@ async fn warm_requests_use_one_persistent_command_without_identity_or_root_round
             index != 0,
             "cold request must create the session and warm requests must reuse it"
         );
-        let phases =
-            result.timing.preparation_ms + result.timing.session_ms + result.timing.capture_ms;
         assert!(
-            phases <= result.elapsed_ms.saturating_add(3),
-            "phase timing must fit inside the operation: timing={:?} elapsed_ms={}",
+            result.timing.preparation_ms <= result.elapsed_ms.saturating_add(3)
+                && result.timing.session_ms <= result.elapsed_ms.saturating_add(3)
+                && result.timing.capture_ms <= result.elapsed_ms.saturating_add(3),
+            "each phase timing must fit inside the operation: timing={:?} elapsed_ms={}",
             result.timing,
             result.elapsed_ms
         );
@@ -1643,7 +1643,10 @@ async fn wait_for_log_marker(path: &std::path::Path, marker: &str) {
 
 async fn wait_for_file(path: &std::path::Path) {
     timeout(Duration::from_secs(2), async {
-        while !path.exists() {
+        while fs::metadata(path)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(true)
+        {
             sleep(Duration::from_millis(5)).await;
         }
     })
