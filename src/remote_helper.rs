@@ -110,12 +110,16 @@ where
                 match read_request(&mut reader, frame, config.max_frame_bytes) {
                     Ok(spec) => {
                         let control = Arc::new(RequestControl::new());
-                        let duplicate = shared
-                            .requests
-                            .lock()
-                            .map_err(lock_error)?
-                            .insert(spec.request_id, Arc::clone(&control))
-                            .is_some();
+                        let duplicate = {
+                            let mut requests = shared.requests.lock().map_err(lock_error)?;
+                            match requests.entry(spec.request_id) {
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    entry.insert(Arc::clone(&control));
+                                    false
+                                }
+                                std::collections::hash_map::Entry::Occupied(_) => true,
+                            }
+                        };
                         if duplicate {
                             send_error(&shared, spec.request_id, "duplicate-request-id")?;
                             continue;
