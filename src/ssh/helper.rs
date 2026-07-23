@@ -173,9 +173,9 @@ mod tests {
             ("aarch64", "aarch64-unknown-linux-musl"),
             ("armv7l", "armv7-unknown-linux-musleabihf"),
             ("armv7", "armv7-unknown-linux-musleabihf"),
-            ("riscv64", "riscv64gc-unknown-linux-musl"),
-            ("ppc64le", "powerpc64le-unknown-linux-musl"),
-            ("s390x", "s390x-unknown-linux-musl"),
+            ("riscv64", "riscv64gc-unknown-linux-gnu"),
+            ("ppc64le", "powerpc64le-unknown-linux-gnu"),
+            ("s390x", "s390x-unknown-linux-gnu"),
         ] {
             assert_eq!(
                 helper_target_for_arch(arch).map(|(target, _)| target),

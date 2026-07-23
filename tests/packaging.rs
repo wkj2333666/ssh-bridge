@@ -109,21 +109,29 @@ fn source_package_requires_local_build_and_ignores_user_mcp_config() {
 }
 
 #[test]
-fn release_workflow_builds_and_packages_all_static_helper_targets() {
+fn release_workflow_builds_and_packages_all_common_targets() {
     let workflow = read_text(".github/workflows/release.yml");
-    for target in [
+    for main_target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "armv7-unknown-linux-gnueabihf",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "riscv64gc-unknown-linux-gnu",
+        "powerpc64le-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
+    ] {
+        assert!(workflow.contains(main_target), "release workflow omits {main_target}");
+    }
+    for helper_target in [
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "armv7-unknown-linux-musleabihf",
+        "riscv64gc-unknown-linux-gnu",
+        "powerpc64le-unknown-linux-gnu",
+        "s390x-unknown-linux-gnu",
     ] {
-        assert!(workflow.contains(target), "release workflow omits {target}");
-    }
-    for unsupported_target in [
-        "riscv64gc-unknown-linux-musl",
-        "powerpc64le-unknown-linux-musl",
-        "s390x-unknown-linux-musl",
-    ] {
-        assert!(!workflow.contains(unsupported_target));
+        assert!(workflow.contains(helper_target), "release workflow omits {helper_target}");
     }
     assert!(workflow.contains("name: helper-${{ matrix.target }}"));
     assert!(workflow.contains("remote-helpers/$helper"));
