@@ -82,6 +82,7 @@ pub struct RunTiming {
     pub preparation_ms: u64,
     pub session_ms: u64,
     pub capture_ms: u64,
+    pub session_reused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +196,14 @@ impl SshRunner {
         cancel: CancellationToken,
     ) -> BridgeResult<RunResult> {
         let operation_started = Instant::now();
+        let initialization_profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+            phase: "runner_initialization",
+            host: Some(request.host.as_str()),
+            request_id: None,
+            class: None,
+            elapsed_us: 0,
+            bytes: None,
+        });
         let host = self.config.host(&request.host)?;
         let root = host.profile.root.clone();
         let limits = host.limits;
@@ -232,12 +241,21 @@ impl SshRunner {
         let operation_deadline = Instant::now()
             .checked_add(request.timeout)
             .ok_or_else(|| BridgeError::invalid_argument("command timeout is too large"))?;
-        let session = self
+        let (session, session_reused) = self
             .session_for_host(&policy, &request.host, limits, &cancel)
             .await
             .map_err(|error| {
                 attach_selected_context(error, &request.host, &capability.physical_root, &shell)
             })?;
+        drop(initialization_profile);
+        let preparation_profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+            phase: "runner_preparation",
+            host: Some(request.host.as_str()),
+            request_id: None,
+            class: Some(if session_reused { "warm" } else { "cold" }),
+            elapsed_us: 0,
+            bytes: None,
+        });
         let remote_timeout = !matches!(shell.shell, ShellKind::Login)
             && capability.tools.get("timeout") == Some(&true);
         let prepared = (|| {
@@ -281,6 +299,7 @@ impl SshRunner {
         })?;
         let (remote_command, local_deadline) = prepared;
         let preparation_ms = elapsed_ms(operation_started.elapsed());
+        drop(preparation_profile);
         let session_result = match session
             .execute(
                 SessionRequest {
@@ -363,6 +382,7 @@ impl SshRunner {
                 preparation_ms,
                 session_ms: session_result.elapsed_ms,
                 capture_ms,
+                session_reused,
             },
         })
     }
@@ -377,10 +397,10 @@ impl SshRunner {
         host: &str,
         limits: EffectiveLimits,
         cancel: &CancellationToken,
-    ) -> BridgeResult<Arc<HostSession>> {
+    ) -> BridgeResult<(Arc<HostSession>, bool)> {
         if let Some(session) = self.sessions.lock().await.get(host).cloned() {
             if !session.is_closed() {
-                return Ok(session);
+                return Ok((session, true));
             }
             self.sessions.lock().await.remove(host);
         }
@@ -395,10 +415,18 @@ impl SshRunner {
         let _guard = connector.lock().await;
         if let Some(session) = self.sessions.lock().await.get(host).cloned() {
             if !session.is_closed() {
-                return Ok(session);
+                return Ok((session, true));
             }
             self.sessions.lock().await.remove(host);
         }
+        let connect_profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+            phase: "session_connect",
+            host: Some(host),
+            request_id: None,
+            class: Some("cold"),
+            elapsed_us: 0,
+            bytes: None,
+        });
         let session = Arc::new(
             HostSession::connect_with(
                 policy.clone(),
@@ -410,11 +438,12 @@ impl SshRunner {
             )
             .await?,
         );
+        drop(connect_profile);
         self.sessions
             .lock()
             .await
             .insert(host.to_owned(), Arc::clone(&session));
-        Ok(session)
+        Ok((session, false))
     }
 
     async fn drop_session(&self, host: &str, expected: &Arc<HostSession>) {
@@ -433,6 +462,18 @@ impl SshRunner {
         limits: EffectiveLimits,
         cancel: &CancellationToken,
     ) -> BridgeResult<CapturedOutput> {
+        let _capture_profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+            phase: "output_capture",
+            host: None,
+            request_id: Some(result.request_id),
+            class: None,
+            elapsed_us: 0,
+            bytes: Some(
+                u64::try_from(result.stdout.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(result.stderr.len()).unwrap_or(u64::MAX)),
+            ),
+        });
         let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
         let (mut stderr_writer, stderr_reader) = duplex(64 * 1024);
         let stdout = result.stdout.clone();
@@ -654,7 +695,7 @@ impl SshRunner {
         let operation_deadline = Instant::now()
             .checked_add(request.timeout)
             .ok_or_else(|| BridgeError::invalid_argument("fixed command timeout is too large"))?;
-        let session = self
+        let (session, _session_reused) = self
             .session_for_host(&policy, &request.host, limits, &cancel)
             .await
             .map_err(|error| {

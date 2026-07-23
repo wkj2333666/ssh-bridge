@@ -1526,7 +1526,7 @@ async fn warm_requests_use_one_persistent_command_without_identity_or_root_round
             ("FAKE_SSH_LOG", log.display().to_string()),
         ],
     );
-    for _ in 0..102 {
+    for index in 0..102 {
         let result = fixture
             .runner
             .execute(
@@ -1535,6 +1535,11 @@ async fn warm_requests_use_one_persistent_command_without_identity_or_root_round
             )
             .await
             .unwrap();
+        assert_eq!(
+            result.timing.session_reused,
+            index != 0,
+            "cold request must create the session and warm requests must reuse it"
+        );
         let phases =
             result.timing.preparation_ms + result.timing.session_ms + result.timing.capture_ms;
         assert!(

@@ -127,6 +127,72 @@ fn report_latency(label: &str, samples: &mut [Duration]) -> (Duration, Duration,
     (p50, p95, maximum)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn task11_release_cold_and_warm_ssh_profile() {
+    if cfg!(debug_assertions) {
+        eprintln!("Task11 cold/warm profile acceptance is release-only");
+        return;
+    }
+
+    const COLD_MEASURED_CALLS: usize = 100;
+    let mut cold_samples = Vec::with_capacity(COLD_MEASURED_CALLS);
+    for _ in 0..COLD_MEASURED_CALLS {
+        let fixture = fake_fixture(
+            &["dev"],
+            &[
+                ("FAKE_SSH_MODE", OsString::from("streams")),
+                ("FAKE_SSH_STDOUT", OsString::from("cold")),
+                ("FAKE_SSH_STDERR", OsString::new()),
+            ],
+        );
+        let started = Instant::now();
+        let result = call_json(
+            &fixture.tools,
+            "remote_run",
+            json!({"host":"dev","command":":","shell":"sh"}),
+        )
+        .await;
+        cold_samples.push(started.elapsed());
+        assert_eq!(result["isError"], Value::Null, "{result}");
+    }
+    let (_, cold_p95, _) = report_latency("cold complete fake-SSH call", &mut cold_samples);
+
+    let warm = fake_fixture(
+        &["dev"],
+        &[
+            ("FAKE_SSH_MODE", OsString::from("streams")),
+            ("FAKE_SSH_STDOUT", OsString::from("warm")),
+            ("FAKE_SSH_STDERR", OsString::new()),
+        ],
+    );
+    let arguments = json!({"host":"dev","command":":","shell":"sh"});
+    for _ in 0..SSH_WARM_CALLS {
+        let result = call_json(&warm.tools, "remote_run", arguments.clone()).await;
+        assert_eq!(result["isError"], Value::Null, "{result}");
+    }
+    let mut warm_samples = Vec::with_capacity(SSH_MEASURED_CALLS);
+    for _ in 0..SSH_MEASURED_CALLS {
+        let started = Instant::now();
+        let result = call_json(&warm.tools, "remote_run", arguments.clone()).await;
+        warm_samples.push(started.elapsed());
+        assert_eq!(result["isError"], Value::Null, "{result}");
+    }
+    let (_, warm_p95, _) = report_latency("warm complete fake-SSH call", &mut warm_samples);
+    assert!(
+        warm_p95 < SSH_P95_CEILING,
+        "warm complete fake-SSH p95={warm_p95:?} exceeded broad regression ceiling"
+    );
+    eprintln!("Task11 cold/warm separation: cold_p95={cold_p95:?} warm_p95={warm_p95:?}");
+    let warm_kinds = transport_call_kinds(&warm.log);
+    assert_eq!(warm_kinds.iter().filter(|kind| **kind == "G").count(), 1);
+    assert_eq!(warm_kinds.iter().filter(|kind| **kind == "P").count(), 1);
+    assert_eq!(warm_kinds.iter().filter(|kind| **kind == "R").count(), 0);
+    assert_eq!(
+        warm_kinds.iter().filter(|kind| **kind == "C").count(),
+        SSH_WARM_CALLS + SSH_MEASURED_CALLS
+    );
+}
+
 fn transport_call_kinds(log: &std::path::Path) -> Vec<&'static str> {
     std::fs::read_to_string(log)
         .unwrap_or_default()

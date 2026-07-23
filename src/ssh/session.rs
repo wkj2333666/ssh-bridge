@@ -233,6 +233,14 @@ impl HostSession {
     ) -> BridgeResult<SessionResult> {
         let started = Instant::now();
         let request_id = self.inner.next_request_id()?;
+        let _request_profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+            phase: "session_request",
+            host: Some(self.inner.host.as_str()),
+            request_id: Some(request_id),
+            class: None,
+            elapsed_us: 0,
+            bytes: None,
+        });
         let frames = build_request_frames(request_id, &request, self.inner.max_payload)?;
         let (sender, mut receiver) = oneshot::channel();
         let pending = PendingRequest {

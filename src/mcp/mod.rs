@@ -465,6 +465,15 @@ impl<S: ToolService> McpServer<S> {
                     cancel: cancel.clone(),
                     wire_budget,
                 };
+                let _admission_profile =
+                    crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                        phase: "mcp_admission",
+                        host: None,
+                        request_id: None,
+                        class: None,
+                        elapsed_us: 0,
+                        bytes: None,
+                    });
                 active.insert(
                     id.clone(),
                     InFlight {
@@ -477,6 +486,15 @@ impl<S: ToolService> McpServer<S> {
                 let service = Arc::clone(&self.service);
                 let completed_id = id.clone();
                 let handle = join_set.spawn(async move {
+                    let _service_profile =
+                        crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                            phase: "mcp_service",
+                            host: None,
+                            request_id: None,
+                            class: None,
+                            elapsed_us: 0,
+                            bytes: None,
+                        });
                     let outcome = service.call(name, arguments, context).await;
                     CompletedCall {
                         id: completed_id,
@@ -538,6 +556,14 @@ fn process_completion(
                 return Err(());
             };
             if !inflight.cancelled_by_client {
+                let _render_profile = crate::bridge_profile_span!(crate::profile::ProfileEvent {
+                    phase: "mcp_render",
+                    host: None,
+                    request_id: None,
+                    class: None,
+                    elapsed_us: 0,
+                    bytes: None,
+                });
                 let response = BorrowedCallResponse {
                     jsonrpc: "2.0",
                     id: &completed.id,

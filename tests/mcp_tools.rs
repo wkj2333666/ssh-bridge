@@ -2293,42 +2293,6 @@ async fn task78_release_dispatch_p95_is_below_two_milliseconds() {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn task78_release_fake_call_p95_is_below_ten_milliseconds() {
-    const WARM_CALLS: usize = 16;
-    const MEASURED_CALLS: usize = 120;
-    let remote = tempfile::TempDir::new().unwrap();
-    let (_runtime, _log, tools) = fake_remote_tools_with_options(
-        remote.path(),
-        false,
-        &[
-            ("FAKE_SSH_MODE", OsString::from("streams")),
-            ("FAKE_SSH_STDOUT", OsString::from("fake-call")),
-            ("FAKE_SSH_STDERR", OsString::from("")),
-        ],
-    );
-    let arguments = json!({"host":"dev","command":":","shell":"sh"});
-    for _ in 0..WARM_CALLS {
-        let result = call_json(&tools, "remote_run", arguments.clone()).await;
-        assert_eq!(result["isError"], Value::Null, "{result}");
-    }
-    let mut samples = Vec::with_capacity(MEASURED_CALLS);
-    for _ in 0..MEASURED_CALLS {
-        let started = Instant::now();
-        let result = call_json(&tools, "remote_run", arguments.clone()).await;
-        samples.push(started.elapsed());
-        assert_eq!(result["isError"], Value::Null, "{result}");
-    }
-    let (_, p95, _) =
-        report_latency_samples("complete fake-SSH MCP call release sample", &mut samples);
-    if !cfg!(debug_assertions) {
-        assert!(
-            p95 < Duration::from_millis(10),
-            "complete fake-SSH call p95={p95:?}, raw={samples:?}"
-        );
-    }
-}
-
 fn resident_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap()
