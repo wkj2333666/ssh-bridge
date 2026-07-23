@@ -129,6 +129,7 @@ fn release_workflow_builds_and_packages_all_static_helper_targets() {
     assert!(workflow.contains("remote-helpers/$helper"));
     assert!(workflow.contains("--bin codex-ssh-bridge-helper"));
     assert!(workflow.contains("statically linked|musl"));
+    assert!(workflow.contains("find release-assets -maxdepth 1 -type f"));
 }
 
 #[test]

@@ -60,8 +60,8 @@ Release builds are created only from version tags. The tag must match the
 version in `Cargo.toml`; for example:
 
 ```bash
-git tag v0.2.2
-git push origin v0.2.2
+git tag v0.2.3
+git push origin v0.2.3
 ```
 
 The release workflow publishes Linux binaries and SHA-256 files for:

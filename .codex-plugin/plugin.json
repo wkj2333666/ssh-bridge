@@ -1,6 +1,6 @@
 {
   "name": "codex-ssh-bridge",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Operate allowlisted SSH hosts through a local native bridge without installing or authenticating Codex remotely.",
   "author": {
     "name": "Local developer"
