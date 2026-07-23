@@ -19,7 +19,7 @@ The configured remote root is a routing boundary, not a security sandbox. Remote
 
 No Codex credential, binary, plugin, MCP server, or persistent helper is placed on a server. All SSH authentication occurs in the local OpenSSH client.
 
-Operational work uses one local-owned SSH child per configured alias. The bridge streams a bounded POSIX dispatcher as the remote command and keeps it only for that SSH session; it does not write a helper into the remote filesystem. Each request is framed as data, starts a separate process group, and has independent stdout/stderr limits, timeout, and cancellation. A dispatcher startup failure is terminal for that request; there is no silent one-shot fallback.
+Operational work uses one local-owned SSH child per configured alias. The bridge streams a bounded POSIX dispatcher as the remote command and keeps it only for that SSH session; it does not write a helper into the remote filesystem. Each request is framed as data, starts a separate process group, and has independent stdout/stderr limits, timeout, and cancellation. Remote runner slots remain the only execution limiter: an accepted task may wait cancellably for a global or per-host slot. A separate bounded local MCP task window prevents unbounded memory use; `MCP task queue full` means that local window is full, not that the remote host failed. `remote_hosts` remains a control lane. A dispatcher startup failure is terminal for that request; there is no silent one-shot fallback.
 
 ## OpenSSH policy
 

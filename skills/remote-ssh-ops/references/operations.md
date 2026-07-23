@@ -66,7 +66,7 @@ The SSH account's login shell must be able to launch the POSIX dispatcher comman
 
 Prefer POSIX syntax. Request Bash for arrays, `[[ ... ]]`, `source`, `pipefail`, or Bash substitutions. Always inspect result `shell.kind`, `shell.fallback`, and `warnings`.
 
-Requests are independent and concurrent up to global/per-host limits. There is no mutation lock and no ordering guarantee for simultaneous writes to the same path. Atomic replace and expected-hash checks remain the protection for individual mutations.
+Requests are independent and accepted into the bridge's bounded local task window. They execute concurrently up to global/per-host runner limits; runner contention queues cancellably rather than returning an MCP capacity error. Only an exhausted local window returns `MCP task queue full`, and `remote_hosts` remains available as a control call. There is no mutation lock and no ordering guarantee for simultaneous writes to the same path. Atomic replace and expected-hash checks remain the protection for individual mutations.
 
 Timeout and cancellation send a request-level `CANCEL` first. If the dispatcher does not produce an exit result within the grace period, the bridge terminates the whole session and reports `remote_process_may_continue: true`; never retry a mutation with unknown outcome.
 

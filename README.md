@@ -153,7 +153,7 @@ The default flow is bounded search/read → unified patch → remote verificatio
 
 `remote_run` accepts one command string plus `shell: bash|sh|login`; omission means `bash`. Prefer POSIX syntax. Bash is never silently changed to sh: if Bash is unavailable, the model receives a capability error and may explicitly retry with `shell:"sh"`. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
 
-Operational requests are multiplexed over one persistent SSH session per alias and can run concurrently up to configured capacity. Each request has an independent process group and cancellation; mutations are not implicitly serialized, so concurrent same-path calls have no ordering guarantee. If cancellation cannot be confirmed, the session is closed and the result is explicitly marked unknown rather than retried.
+Operational requests are multiplexed over one persistent SSH session per alias. Remote execution runs concurrently up to the configured global/per-host capacity; additional accepted calls wait cancellably inside the runner instead of becoming MCP errors. The local MCP task window is bounded at `global_concurrency + 8`; only a full window returns `MCP task queue full`, while `remote_hosts` remains available as a control lane. Each request has an independent process group and cancellation; mutations are not implicitly serialized, so concurrent same-path calls have no ordering guarantee. If cancellation cannot be confirmed, the session is closed and the result is explicitly marked unknown rather than retried.
 
 ## Human direct CLI
 

@@ -40,7 +40,7 @@ Prefer POSIX command syntax. Omit `shell` (or set `shell:"bash"`) for Bash; set 
 
 Commands that use Bash-only syntax must request Bash explicitly (or rely on the omitted Bash default); the bridge never labels a POSIX `sh` execution as an implicit Bash fallback.
 
-Requests on one host are concurrent up to configured capacity; mutations are not implicitly serialized. Do not rely on ordering between concurrent calls. A timeout or cancellation targets only its request first; if the dispatcher cannot confirm termination, the session is closed and the result marks the remote outcome as unknown. The configured root is a lexical routing boundary, not an inode pin: remote symlink retargeting follows ordinary server filesystem semantics.
+Requests on one host are accepted into a bounded local task window and execute concurrently up to configured global/per-host runner capacity. Calls waiting for a runner slot remain cancellable; `MCP task queue full` means only that the local task window is full, and `remote_hosts` remains available as a control lane. Mutations are not implicitly serialized. Do not rely on ordering between concurrent calls. A timeout or cancellation targets only its request first; if the dispatcher cannot confirm termination, the session is closed and the result marks the remote outcome as unknown. The configured root is a lexical routing boundary, not an inode pin: remote symlink retargeting follows ordinary server filesystem semantics.
 
 The account/forced login shell must be able to start the POSIX dispatcher. A failed dispatcher handshake is a hard error; never ask the bridge to silently fall back to a one-shot SSH command.
 
