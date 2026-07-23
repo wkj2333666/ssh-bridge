@@ -128,6 +128,23 @@ fn release_workflow_builds_and_packages_all_static_helper_targets() {
 }
 
 #[test]
+fn ci_and_release_workflows_restore_pinned_rust_build_caches() {
+    const CACHE_ACTION: &str = "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830";
+
+    let ci = read_text(".github/workflows/ci.yml");
+    assert_eq!(ci.matches(CACHE_ACTION).count(), 2);
+    assert!(ci.contains("~/.cargo/registry"));
+    assert!(ci.contains("~/.cargo/git"));
+    assert!(ci.contains("target"));
+    assert!(ci.contains("hashFiles('Cargo.lock')"));
+
+    let release = read_text(".github/workflows/release.yml");
+    assert_eq!(release.matches(CACHE_ACTION).count(), 2);
+    assert!(release.contains("bridge-${{ matrix.target }}"));
+    assert!(release.contains("helper-${{ matrix.target }}"));
+}
+
+#[test]
 fn installed_chain_has_no_python_runtime_or_legacy_module_references() {
     let root = repository_root();
     let mut files = Vec::new();

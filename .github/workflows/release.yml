@@ -33,6 +33,17 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
 
+      - name: Restore bridge target cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-bridge-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-bridge-${{ matrix.target }}-
+
       - name: Install pinned cross compiler
         run: cargo +"$RUST_TOOLCHAIN" install cross --version "$CROSS_VERSION" --locked
 
@@ -85,6 +96,17 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Restore helper target cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-helper-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-helper-${{ matrix.target }}-
 
       - name: Install pinned cross compiler
         run: cargo +"$RUST_TOOLCHAIN" install cross --version "$CROSS_VERSION" --locked
