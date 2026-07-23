@@ -319,4 +319,3 @@ Run `cargo fmt --all -- --check`, `cargo test --all-targets --all-features`, `ca
 git add tests/performance_acceptance.rs tests/real_ssh.rs docs/performance.md
 git commit -m "test: compare helper and shell cold warm latency"
 ```
-
