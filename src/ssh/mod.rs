@@ -6,6 +6,7 @@
 mod argv;
 mod dispatcher;
 mod frame;
+mod helper;
 mod process;
 mod session;
 

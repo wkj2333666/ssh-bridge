@@ -16,8 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::dispatcher::dispatcher_command;
 use super::frame::{Frame, FrameKind, read_frame, write_frame};
+use super::helper::{HelperArtifact, helper_artifact, helper_bytes, helper_command};
 use super::{SshPolicy, build_ssh_argv};
-use crate::capability::{ShellKind, ShellSelection};
+use crate::capability::{Capability, ShellKind, ShellSelection};
 use crate::config::EffectiveLimits;
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 
@@ -121,12 +122,83 @@ impl HostSession {
         environment: std::collections::BTreeMap<OsString, OsString>,
         cancel: CancellationToken,
     ) -> BridgeResult<Self> {
+        Self::connect_with_mode(policy, host, limits, executable, environment, cancel, None).await
+    }
+
+    pub(crate) async fn connect_with_capability(
+        policy: SshPolicy,
+        host: String,
+        limits: EffectiveLimits,
+        executable: OsString,
+        environment: std::collections::BTreeMap<OsString, OsString>,
+        capability: &Capability,
+        cancel: CancellationToken,
+    ) -> BridgeResult<Self> {
+        let helper = helper_artifact(capability)
+            .and_then(|artifact| helper_bytes(&artifact).ok().map(|bytes| (artifact, bytes)));
+        let Some((artifact, bytes)) = helper else {
+            return Self::connect_with_mode(
+                policy,
+                host,
+                limits,
+                executable,
+                environment,
+                cancel,
+                None,
+            )
+            .await;
+        };
+        let fallback_policy = policy.clone();
+        let fallback_host = host.clone();
+        let fallback_executable = executable.clone();
+        let fallback_environment = environment.clone();
+        match Self::connect_with_mode(
+            policy,
+            host,
+            limits,
+            executable,
+            environment,
+            cancel.clone(),
+            Some((artifact, bytes)),
+        )
+        .await
+        {
+            Ok(session) => Ok(session),
+            Err(error) if helper_startup_fallback_allowed(&error, &cancel) => {
+                Self::connect_with_mode(
+                    fallback_policy,
+                    fallback_host,
+                    limits,
+                    fallback_executable,
+                    fallback_environment,
+                    cancel,
+                    None,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn connect_with_mode(
+        policy: SshPolicy,
+        host: String,
+        limits: EffectiveLimits,
+        executable: OsString,
+        environment: std::collections::BTreeMap<OsString, OsString>,
+        cancel: CancellationToken,
+        helper: Option<(HelperArtifact, Vec<u8>)>,
+    ) -> BridgeResult<Self> {
         if limits.max_frame_bytes == 0 {
             return Err(BridgeError::invalid_argument(
                 "SSH session frame limit must be positive",
             ));
         }
-        let command = dispatcher_command(limits.max_frame_bytes)?;
+        let helper_arch = helper.as_ref().map(|(artifact, _)| artifact.arch);
+        let command = match helper.as_ref() {
+            Some((_, bytes)) => helper_command(limits.max_frame_bytes, bytes.len())?,
+            None => dispatcher_command(limits.max_frame_bytes)?,
+        };
         let argv = build_ssh_argv(&policy, &host, &command);
         let mut child_command = Command::new(executable);
         child_command
@@ -162,6 +234,22 @@ impl HostSession {
             .take()
             .ok_or_else(|| BridgeError::io("SSH session stderr pipe is missing"))?;
         tokio::spawn(drain_stderr(stderr));
+        if let Some((_, bytes)) = helper {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| BridgeError::io("SSH session stdin pipe is missing"))?;
+            if let Err(error) = stdin.write_all(&bytes).await {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(startup_error(&host, &error.to_string()));
+            }
+            if let Err(error) = stdin.flush().await {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(startup_error(&host, &error.to_string()));
+            }
+        }
         let mut output = BufReader::new(stdout);
         let hello = tokio::select! {
             biased;
@@ -175,7 +263,7 @@ impl HostSession {
                     Ok(Ok(Some(frame))) => frame,
                     Ok(Ok(None)) => {
                         let _ = child.wait().await;
-                        return Err(startup_error(&host, "SSH dispatcher closed before handshake"));
+                        return Err(startup_error(&host, "SSH session closed before handshake"));
                     }
                     Ok(Err(error)) => {
                         let _ = child.kill().await;
@@ -204,9 +292,7 @@ impl HostSession {
         }
         if hello.kind != FrameKind::HelloAck
             || hello.request_id != 0
-            || !String::from_utf8_lossy(&hello.payload)
-                .split(';')
-                .any(|field| field == "protocol=codex-ssh-dispatcher/1")
+            || !valid_handshake(&hello.payload, helper_arch)
         {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -740,6 +826,30 @@ fn startup_error(host: &str, message: &str) -> BridgeError {
     error
 }
 
+fn helper_startup_fallback_allowed(error: &BridgeError, cancel: &CancellationToken) -> bool {
+    !cancel.is_cancelled()
+        && !matches!(
+            error.code,
+            ErrorCode::Cancelled | ErrorCode::InvalidArgument | ErrorCode::RemoteCapabilityMissing
+        )
+}
+
+fn valid_handshake(payload: &[u8], helper_arch: Option<&str>) -> bool {
+    let payload = String::from_utf8_lossy(payload);
+    let fields: HashMap<&str, &str> = payload
+        .split(';')
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    match helper_arch {
+        Some(expected_arch) => {
+            fields.get("protocol") == Some(&"codex-ssh-helper/1")
+                && fields.get("version") == Some(&"1")
+                && fields.get("arch") == Some(&expected_arch)
+        }
+        None => fields.get("protocol") == Some(&"codex-ssh-dispatcher/1"),
+    }
+}
+
 fn protocol_error(host: &str, message: &str) -> BridgeError {
     let mut error = BridgeError::new(
         ErrorCode::ProtocolError,
@@ -803,7 +913,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
-    use super::{HostSession, SessionRequest, parse_exit};
+    use super::{HostSession, SessionRequest, parse_exit, valid_handshake};
     use crate::capability::{ShellKind, ShellSelection};
     use crate::config::EffectiveLimits;
     use crate::ssh::SshPolicy;
@@ -813,6 +923,26 @@ mod tests {
         assert_eq!(parse_exit(b"7\n0\n1\n"), Ok((7, false, true)));
         assert!(parse_exit(b"7\n0\n").is_err());
         assert!(parse_exit(b"7\n0\n1\nextra\n").is_err());
+    }
+
+    #[test]
+    fn helper_and_shell_handshakes_are_checked_against_the_selected_transport() {
+        assert!(valid_handshake(
+            b"protocol=codex-ssh-helper/1;version=1;arch=x86_64;",
+            Some("x86_64")
+        ));
+        assert!(!valid_handshake(
+            b"protocol=codex-ssh-helper/1;version=1;arch=aarch64;",
+            Some("x86_64")
+        ));
+        assert!(!valid_handshake(
+            b"protocol=codex-ssh-dispatcher/1;shell=sh;",
+            Some("x86_64")
+        ));
+        assert!(valid_handshake(
+            b"protocol=codex-ssh-dispatcher/1;shell=sh;",
+            None
+        ));
     }
 
     fn limits() -> EffectiveLimits {
