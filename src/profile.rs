@@ -77,10 +77,10 @@ impl<'a> ProfileSpan<'a> {
     pub fn new(event: ProfileEvent<'a>) -> Self {
         #[cfg(feature = "profile")]
         {
-            return Self {
+            Self {
                 event,
                 started: std::time::Instant::now(),
-            };
+            }
         }
         #[cfg(not(feature = "profile"))]
         {

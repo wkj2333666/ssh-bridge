@@ -504,8 +504,6 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                     request.stdout_seen.saturating_add(request.stderr_seen) as usize;
                 let remaining = request
                     .stdout_limit
-                    .try_into()
-                    .unwrap_or(usize::MAX)
                     .saturating_sub(request.stdout_seen as usize)
                     .min(request.aggregate_limit.saturating_sub(aggregate_used));
                 if frame.payload.len() > remaining {
@@ -530,8 +528,6 @@ async fn dispatch_frame(inner: &Arc<SessionInner>, frame: Frame) -> BridgeResult
                     request.stdout_seen.saturating_add(request.stderr_seen) as usize;
                 let remaining = request
                     .stderr_limit
-                    .try_into()
-                    .unwrap_or(usize::MAX)
                     .saturating_sub(request.stderr_seen as usize)
                     .min(request.aggregate_limit.saturating_sub(aggregate_used));
                 if frame.payload.len() > remaining {
