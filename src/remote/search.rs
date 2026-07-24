@@ -307,14 +307,21 @@ pub(super) async fn search(
         .config()
         .host(&request.host)
         .map_err(&attach_candidates)?;
-    let operation_root = if request.absolute_path
-        && RemotePath::resolve(&configured.profile.root, request.path.absolute()).is_err()
-    {
+    let path_is_within_configured_root =
+        RemotePath::resolve(&configured.profile.root, request.path.absolute()).is_ok();
+    let operation_root = if request.absolute_path && !path_is_within_configured_root {
         crate::REMOTE_OPERATION_ROOT
     } else {
         configured.profile.root.as_str()
     };
-    let search_root = request.path.absolute().as_bytes();
+    // Keep the long-standing relative-path contract when an absolute search
+    // path is still beneath the configured root.  If it is outside that
+    // legacy root, use the requested directory as the display boundary.
+    let display_root = if path_is_within_configured_root {
+        configured.profile.root.as_bytes()
+    } else {
+        request.path.absolute().as_bytes()
+    };
     let mut candidates = Vec::with_capacity(10_001);
     let mut candidate_count = 0usize;
     loop {
@@ -337,7 +344,7 @@ pub(super) async fn search(
         }
         let actual = logical_from_pinned(operation_root.as_bytes(), &pinned_path)
             .map_err(&attach_candidates)?;
-        let relative = relative(search_root, &actual).map_err(&attach_candidates)?;
+        let relative = relative(display_root, &actual).map_err(&attach_candidates)?;
         candidate_count = candidate_count
             .checked_add(1)
             .ok_or_else(|| protocol_error("search candidate count overflowed"))
@@ -478,7 +485,7 @@ pub(super) async fn search(
         parse_rg(
             &mut cursor,
             operation_root.as_bytes(),
-            search_root,
+            display_root,
             content_capped,
             request.max_results.saturating_add(1),
             limits.max_frame_bytes,
@@ -489,7 +496,7 @@ pub(super) async fn search(
         parse_grep(
             &mut cursor,
             operation_root.as_bytes(),
-            search_root,
+            display_root,
             request.query.as_bytes(),
             content_capped,
             request.max_results.saturating_add(1),
@@ -524,7 +531,7 @@ pub(super) async fn search(
 async fn parse_rg(
     cursor: &mut SpoolCursor<'_>,
     operation_root: &[u8],
-    search_root: &[u8],
+    display_root: &[u8],
     capped: bool,
     retain: usize,
     record_limit: usize,
@@ -559,7 +566,7 @@ async fn parse_rg(
                 .ok_or_else(|| protocol_error("rg match has no path"))?,
         )?;
         let actual = logical_from_pinned(operation_root, &pinned_path)?;
-        let relative = relative(search_root, &actual)?;
+        let relative = relative(display_root, &actual)?;
         let mut content = json_bytes(
             data.get("lines")
                 .ok_or_else(|| protocol_error("rg match has no lines"))?,
@@ -612,7 +619,7 @@ fn json_bytes(value: &serde_json::Value) -> BridgeResult<Vec<u8>> {
 async fn parse_grep(
     cursor: &mut SpoolCursor<'_>,
     operation_root: &[u8],
-    search_root: &[u8],
+    display_root: &[u8],
     query: &[u8],
     capped: bool,
     retain: usize,
@@ -656,7 +663,7 @@ async fn parse_grep(
         if matches.len() < retain {
             matches.push(SearchMatch {
                 actual_path: encode_bytes(&actual),
-                relative_path: encode_bytes(relative(search_root, &actual)?),
+                relative_path: encode_bytes(relative(display_root, &actual)?),
                 line,
                 column,
                 content: encode_bytes(content),
