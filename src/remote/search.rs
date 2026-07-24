@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{InternalSpoolOwner, StreamKind};
+use crate::path::RemotePath;
 use crate::ssh::{FixedOperationKind, FixedRunRequest, RootedPathInputs};
 
 use super::protocol::{SpoolCursor, context, encode_bytes, protocol_error, read_small_stream};
@@ -306,11 +307,14 @@ pub(super) async fn search(
         .config()
         .host(&request.host)
         .map_err(&attach_candidates)?;
-    let configured_root = if request.absolute_path {
-        request.path.absolute().as_bytes()
+    let operation_root = if request.absolute_path
+        && RemotePath::resolve(&configured.profile.root, request.path.absolute()).is_err()
+    {
+        crate::REMOTE_OPERATION_ROOT
     } else {
-        configured.profile.root.as_bytes()
+        configured.profile.root.as_str()
     };
+    let search_root = request.path.absolute().as_bytes();
     let mut candidates = Vec::with_capacity(10_001);
     let mut candidate_count = 0usize;
     loop {
@@ -331,7 +335,9 @@ pub(super) async fn search(
                 "search candidate path is empty",
             )));
         }
-        let relative = pinned_relative(&pinned_path).map_err(&attach_candidates)?;
+        let actual = logical_from_pinned(operation_root.as_bytes(), &pinned_path)
+            .map_err(&attach_candidates)?;
+        let relative = relative(search_root, &actual).map_err(&attach_candidates)?;
         candidate_count = candidate_count
             .checked_add(1)
             .ok_or_else(|| protocol_error("search candidate count overflowed"))
@@ -471,7 +477,8 @@ pub(super) async fn search(
     let (mut matches, result_lookahead) = if rg {
         parse_rg(
             &mut cursor,
-            configured_root,
+            operation_root.as_bytes(),
+            search_root,
             content_capped,
             request.max_results.saturating_add(1),
             limits.max_frame_bytes,
@@ -481,7 +488,8 @@ pub(super) async fn search(
     } else {
         parse_grep(
             &mut cursor,
-            configured_root,
+            operation_root.as_bytes(),
+            search_root,
             request.query.as_bytes(),
             content_capped,
             request.max_results.saturating_add(1),
@@ -515,7 +523,8 @@ pub(super) async fn search(
 
 async fn parse_rg(
     cursor: &mut SpoolCursor<'_>,
-    root: &[u8],
+    operation_root: &[u8],
+    search_root: &[u8],
     capped: bool,
     retain: usize,
     record_limit: usize,
@@ -549,8 +558,8 @@ async fn parse_rg(
             data.get("path")
                 .ok_or_else(|| protocol_error("rg match has no path"))?,
         )?;
-        let actual = logical_from_pinned(root, &pinned_path)?;
-        let relative = relative(root, &actual)?;
+        let actual = logical_from_pinned(operation_root, &pinned_path)?;
+        let relative = relative(search_root, &actual)?;
         let mut content = json_bytes(
             data.get("lines")
                 .ok_or_else(|| protocol_error("rg match has no lines"))?,
@@ -602,7 +611,8 @@ fn json_bytes(value: &serde_json::Value) -> BridgeResult<Vec<u8>> {
 
 async fn parse_grep(
     cursor: &mut SpoolCursor<'_>,
-    root: &[u8],
+    operation_root: &[u8],
+    search_root: &[u8],
     query: &[u8],
     capped: bool,
     retain: usize,
@@ -618,7 +628,7 @@ async fn parse_grep(
             cursor.next_field(record_limit).await?
         };
         let Some(pinned_path) = actual else { break };
-        let actual = logical_from_pinned(root, &pinned_path)?;
+        let actual = logical_from_pinned(operation_root, &pinned_path)?;
         let record = if capped {
             cursor.next_line_capped(record_limit).await?
         } else {
@@ -646,7 +656,7 @@ async fn parse_grep(
         if matches.len() < retain {
             matches.push(SearchMatch {
                 actual_path: encode_bytes(&actual),
-                relative_path: encode_bytes(relative(root, &actual)?),
+                relative_path: encode_bytes(relative(search_root, &actual)?),
                 line,
                 column,
                 content: encode_bytes(content),
