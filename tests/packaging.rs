@@ -167,20 +167,42 @@ fn release_workflow_builds_and_packages_all_common_targets() {
 }
 
 #[test]
-fn ci_and_release_workflows_restore_pinned_rust_build_caches() {
+fn ci_and_release_workflows_use_split_caches() {
     const CACHE_ACTION: &str = "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830";
 
     let ci = read_text(".github/workflows/ci.yml");
-    assert_eq!(ci.matches(CACHE_ACTION).count(), 2);
+    assert_eq!(ci.matches(CACHE_ACTION).count(), 6);
+    assert_eq!(ci.matches("Restore pinned Rust toolchain cache").count(), 2);
+    assert_eq!(ci.matches("Restore shared Cargo dependency cache").count(), 2);
+    assert_eq!(ci.matches("Restore CI target cache").count(), 2);
+    assert!(ci.contains("~/.rustup/toolchains/${{ env.RUST_TOOLCHAIN }}-*"));
     assert!(ci.contains("~/.cargo/registry"));
     assert!(ci.contains("~/.cargo/git"));
     assert!(ci.contains("target"));
     assert!(ci.contains("hashFiles('Cargo.lock')"));
+    assert!(!ci.contains("Restore Rust build cache"));
 
     let release = read_text(".github/workflows/release.yml");
-    assert_eq!(release.matches(CACHE_ACTION).count(), 2);
+    assert_eq!(release.matches(CACHE_ACTION).count(), 8);
+    assert_eq!(
+        release
+            .matches("Restore pinned Rust toolchain cache")
+            .count(),
+        2
+    );
+    assert_eq!(
+        release
+            .matches("Restore shared Cargo dependency cache")
+            .count(),
+        2
+    );
+    assert_eq!(release.matches("Restore cross binary cache").count(), 2);
+    assert_eq!(release.matches("Verify cross compiler").count(), 2);
+    assert!(release.contains("~/.rustup/toolchains/${{ env.RUST_TOOLCHAIN }}-*"));
     assert!(release.contains("bridge-${{ matrix.target }}"));
     assert!(release.contains("helper-${{ matrix.target }}"));
+    assert!(release.contains("path: target"));
+    assert!(release.contains("steps.cross-cache.outputs.cache-hit != 'true'"));
 }
 
 #[test]
