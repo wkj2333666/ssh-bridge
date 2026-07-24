@@ -6,7 +6,6 @@ use tokio_util::sync::CancellationToken;
 use crate::capability::{ShellKind, ShellRequest};
 use crate::error::{BridgeError, BridgeResult, ErrorCode};
 use crate::output::{CapturedOutput, OutputPreview};
-use crate::path::RemotePath;
 
 use super::{
     EncodedOutputPreview, POSIX_SH_WARNING, RemoteBridge, RemoteRunRequest, RemoteRunResult,
