@@ -209,10 +209,7 @@ impl SshRunner {
             bytes: None,
         });
         let host = self.config.host(&request.host)?;
-        let root = operation_root(
-            &host.profile.root,
-            request.cwd.starts_with(crate::REMOTE_OPERATION_ROOT),
-        );
+        let root = operation_root_for_path(&host.profile.root, &request.cwd);
         let limits = host.limits;
         validate_request(&request, limits)?;
 
@@ -637,7 +634,7 @@ impl SshRunner {
     ) -> BridgeResult<FixedRunResult> {
         let host = self.config.host(&request.host)?;
         let limits = host.limits;
-        let absolute_paths = fixed_request_uses_absolute_paths(&request);
+        let absolute_paths = fixed_request_uses_absolute_paths(&request, &host.profile.root);
         let root = operation_root(&host.profile.root, absolute_paths);
         if request.timeout.is_zero()
             || request.timeout > Duration::from_millis(limits.command_timeout_ms)
@@ -1761,17 +1758,43 @@ fn operation_root(configured_root: &str, absolute_paths: bool) -> String {
     }
 }
 
-fn fixed_request_uses_absolute_paths(request: &FixedRunRequest) -> bool {
-    request.rooted_paths.argument_indices.iter().any(|index| {
-        request
+fn operation_root_for_path(configured_root: &str, requested: &str) -> String {
+    if requested.starts_with('/') && !RemotePath::resolve(configured_root, requested).is_ok() {
+        crate::REMOTE_OPERATION_ROOT.to_owned()
+    } else {
+        configured_root.to_owned()
+    }
+}
+
+fn fixed_request_uses_absolute_paths(request: &FixedRunRequest, configured_root: &str) -> bool {
+    let mut saw_absolute = false;
+    for index in request.rooted_paths.argument_indices {
+        if let Some(path) = request
             .args
             .get(*index)
-            .is_some_and(|path| path.starts_with('/'))
-    }) || request.stdin.as_deref().is_some_and(|stdin| {
-        stdin
+            .filter(|path| path.starts_with('/'))
+        {
+            saw_absolute = true;
+            if RemotePath::resolve(configured_root, path).is_err() {
+                return true;
+            }
+        }
+    }
+    if let Some(stdin) = request.stdin.as_deref() {
+        for path in stdin
             .split(|byte| *byte == 0)
-            .any(|path| path.starts_with(b"/"))
-    })
+            .filter(|path| path.starts_with(b"/"))
+        {
+            saw_absolute = true;
+            if std::str::from_utf8(path)
+                .ok()
+                .is_none_or(|path| RemotePath::resolve(configured_root, path).is_err())
+            {
+                return true;
+            }
+        }
+    }
+    saw_absolute && configured_root == crate::REMOTE_OPERATION_ROOT
 }
 
 fn root_relative_bytes(configured_root: &[u8], path: &[u8]) -> BridgeResult<Vec<u8>> {
