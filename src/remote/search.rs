@@ -306,7 +306,11 @@ pub(super) async fn search(
         .config()
         .host(&request.host)
         .map_err(&attach_candidates)?;
-    let configured_root = configured.profile.root.as_bytes();
+    let configured_root = if request.absolute_path {
+        request.path.absolute().as_bytes()
+    } else {
+        configured.profile.root.as_bytes()
+    };
     let mut candidates = Vec::with_capacity(10_001);
     let mut candidate_count = 0usize;
     loop {
@@ -392,6 +396,11 @@ pub(super) async fn search(
     }
     let mut stdin = Vec::new();
     for candidate in &candidates {
+        // Keep absolute candidates on the wire.  The fixed-operation runner
+        // pins them against `/` before changing cwd, so an explicit legacy
+        // profile cannot accidentally reinterpret `/tmp/x` as
+        // `<configured-root>/tmp/x` on the second search request.
+        let candidate = candidate.clone();
         if stdin
             .len()
             .checked_add(candidate.len() + 1)
@@ -400,7 +409,7 @@ pub(super) async fn search(
             truncated = true;
             break;
         }
-        stdin.extend_from_slice(candidate);
+        stdin.extend_from_slice(&candidate);
         stdin.push(0);
     }
     if stdin.is_empty() {
@@ -428,7 +437,7 @@ pub(super) async fn search(
                 stdin: Some(stdin),
                 rooted_paths: RootedPathInputs {
                     argument_indices: &[],
-                    stdin_nul_paths: false,
+                    stdin_nul_paths: request.absolute_path,
                 },
                 required_capabilities: required,
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,

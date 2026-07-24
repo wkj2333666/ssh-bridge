@@ -12,7 +12,7 @@
 
 ## Local setup
 
-Define each concrete server alias in local `~/.ssh/config`, then verify its host key and key-based login outside Codex:
+Define each server alias in local `~/.ssh/config`, then verify its host key and key-based login outside Codex. The bridge discovers aliases from that file, including supported `Include` files; an explicit bridge profile remains an optional compatibility override:
 
 ```sshconfig
 Host devbox
@@ -24,33 +24,32 @@ Host devbox
 
 ```bash
 ssh devbox
-./target/release/codex-ssh-bridge hosts add devbox --root /srv/project
 ./target/release/codex-ssh-bridge doctor devbox
 ```
 
-Add future servers the same way. The bridge accepts concrete OpenSSH aliases and stores no credentials. The default bridge config is `~/.config/codex-ssh-bridge/config.toml`; set `CODEX_SSH_BRIDGE_CONFIG` only as trusted local execution-authority input.
+Add future servers to local OpenSSH config the same way. The bridge accepts concrete aliases and stores no credentials. The default bridge config is `~/.config/codex-ssh-bridge/config.toml`; set `CODEX_SSH_BRIDGE_CONFIG` only as trusted local execution-authority input.
 
-The first operation performs local SSH identity checks and a bounded capability probe. User commands and fixed read/write operations then reuse one persistent SSH session per alias; warm requests send one framed request without another `ssh -G` or root observation. The remote dispatcher is streamed over that SSH connection and is never installed on disk. No remote bridge helper or Codex installation is used. The configured root is a lexical routing boundary; remote filesystem retargeting follows ordinary server semantics.
+The first operation performs local SSH identity checks and a bounded capability probe. User commands and fixed read/write operations then reuse one persistent SSH session per alias; warm requests send one framed request without another `ssh -G` or root observation. The remote dispatcher is streamed over that SSH connection and is never installed on disk. No remote bridge helper or Codex installation is used. The bridge does not bind a task to a hidden remote workspace: every MCP path and command cwd is absolute and supplied by the caller.
 
 ## MCP tool shapes
 
-All objects reject unknown fields. Paths are relative to the configured remote root unless an allowed absolute path is supplied.
+All objects reject unknown fields. MCP paths are absolute remote paths. The bridge never infers a path from the current task, SSH home, a previous call, or an implicit workspace.
 
 | Tool | Required input | Optional input |
 |---|---|---|
 | `remote_hosts` | none; pass `{}` | none |
-| `remote_list` | `host` | `path`, `depth`, `include_hidden`, `max_entries` |
+| `remote_list` | `host`, absolute `path` | `depth`, `include_hidden`, `max_entries` |
 | `remote_stat` | `host`, `paths` array | none |
-| `remote_search` | `host`, `query` | `path`, `globs`, `max_results`, `binary` |
+| `remote_search` | `host`, `query`, absolute `path` | `globs`, `max_results`, `binary` |
 | `remote_read` | `host`, `paths` array | `start_line`, `max_lines`, `max_bytes` |
 | `remote_output_read` | `output_ref`, `stream` | `offset`, `max_bytes` |
 | `remote_apply_patch` | `host`, unified `patch` | none |
 | `remote_write` | `host`, `path`, `content`, `encoding`, `mode` | `mode.expected_sha256` for replacement |
-| `remote_run` | `host`, `command` string | `cwd`, `shell`, `timeout_ms`, encoded `stdin` |
+| `remote_run` | `host`, `command` string, absolute `cwd` | `shell`, `timeout_ms`, encoded `stdin` |
 
 `remote_write.mode` is `{"kind":"create"}` or `{"kind":"replace","expected_sha256":"..."}`. `expected_sha256` is nested inside `mode`, never at the request root. UTF-8 and base64 encodings are supported. Prefer `remote_apply_patch` for model-driven edits because it snapshots every base before the first mutation and reports confirmed, unchanged, and outcome-unknown paths.
 
-Search queries are case-sensitive fixed strings, not regular expressions. Unified patch `a/...` and `b/...` paths are relative to the configured remote root. `remote_run.stdin` is `{"encoding":"utf8"|"base64","value":"..."}`.
+Search queries are case-sensitive fixed strings, not regular expressions. Unified patch headers must name the same absolute path (or `/dev/null` for create/delete); the bridge accepts conventional `a//absolute/path` and `b//absolute/path` forms as well as direct absolute headers. `remote_run.stdin` is `{"encoding":"utf8"|"base64","value":"..."}`.
 
 ## Shell behavior
 

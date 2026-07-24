@@ -71,6 +71,7 @@ const fn stable_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::AuthRequired => "AUTH_REQUIRED",
         ErrorCode::ConnectTimeout => "CONNECT_TIMEOUT",
         ErrorCode::RemoteCapabilityMissing => "REMOTE_CAPABILITY_MISSING",
+        ErrorCode::RemoteAbsolutePathRequired => "REMOTE_ABSOLUTE_PATH_REQUIRED",
         ErrorCode::PathOutsideRoot => "PATH_OUTSIDE_ROOT",
         ErrorCode::ReadOnlyHost => "READ_ONLY_HOST",
         ErrorCode::WriteConflict => "WRITE_CONFLICT",

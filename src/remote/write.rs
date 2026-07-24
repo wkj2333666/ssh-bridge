@@ -1314,8 +1314,9 @@ fn prepare_mutation_path(
         ));
     }
     validate_write_path(requested)?;
-    let path = RemotePath::resolve(&resolved_host.profile.root, requested)?;
-    if path.relative().is_empty() {
+    let path = super::resolve_path(&resolved_host.profile.root, requested)?;
+    let configured_root = RemotePath::resolve(&resolved_host.profile.root, ".")?;
+    if path.absolute() == configured_root.absolute() {
         let message = match target {
             MutationTarget::Write => "write target must not be the configured root",
             MutationTarget::Delete => "delete target must not be the configured root",

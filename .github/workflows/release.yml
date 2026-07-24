@@ -170,6 +170,9 @@ jobs:
           - powerpc64le-unknown-linux-gnu
           - s390x-unknown-linux-gnu
     steps:
+      - name: Check out tagged source for package resources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Download bridge artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -193,8 +196,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           name="codex-ssh-bridge-${version}-${TARGET}"
           root="dist/$name"
-          mkdir -p "$root/remote-helpers"
-          install -m 0755 "staging/main-$TARGET/codex-ssh-bridge" "$root/codex-ssh-bridge"
+          mkdir -p "$root/bin" "$root/remote-helpers"
+          install -m 0755 "staging/main-$TARGET/codex-ssh-bridge" "$root/bin/codex-ssh-bridge"
           for helper in \
             x86_64-unknown-linux-musl \
             aarch64-unknown-linux-musl \
@@ -204,6 +207,21 @@ jobs:
             s390x-unknown-linux-gnu; do
             install -m 0755 "staging/helper-$helper/$helper" "$root/remote-helpers/$helper"
           done
+          for resource in \
+            .codex-plugin \
+            skills \
+            docs \
+            README.md \
+            LICENSE \
+            config.example.toml \
+            .mcp.json.example; do
+            cp -a "$resource" "$root/"
+          done
+          test -x "$root/bin/codex-ssh-bridge"
+          test -x "$root/remote-helpers/aarch64-unknown-linux-musl"
+          test -f "$root/.codex-plugin/plugin.json"
+          test -f "$root/skills/remote-ssh-ops/SKILL.md"
+          test -f "$root/.mcp.json.example"
           tar -C "dist" -czf "dist/$name.tar.gz" "$name"
           sha256sum "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
 

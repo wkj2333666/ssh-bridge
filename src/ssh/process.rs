@@ -209,7 +209,10 @@ impl SshRunner {
             bytes: None,
         });
         let host = self.config.host(&request.host)?;
-        let root = host.profile.root.clone();
+        let root = operation_root(
+            &host.profile.root,
+            request.cwd.starts_with(crate::REMOTE_OPERATION_ROOT),
+        );
         let limits = host.limits;
         validate_request(&request, limits)?;
 
@@ -634,7 +637,8 @@ impl SshRunner {
     ) -> BridgeResult<FixedRunResult> {
         let host = self.config.host(&request.host)?;
         let limits = host.limits;
-        let root = host.profile.root.clone();
+        let absolute_paths = fixed_request_uses_absolute_paths(&request);
+        let root = operation_root(&host.profile.root, absolute_paths);
         if request.timeout.is_zero()
             || request.timeout > Duration::from_millis(limits.command_timeout_ms)
         {
@@ -1747,6 +1751,27 @@ fn root_relative_one(configured_root: &str, path: &str) -> BridgeResult<String> 
         path.as_bytes(),
     )?)
     .map_err(|_| rooted_path_error())
+}
+
+fn operation_root(configured_root: &str, absolute_paths: bool) -> String {
+    if absolute_paths {
+        crate::REMOTE_OPERATION_ROOT.to_owned()
+    } else {
+        configured_root.to_owned()
+    }
+}
+
+fn fixed_request_uses_absolute_paths(request: &FixedRunRequest) -> bool {
+    request.rooted_paths.argument_indices.iter().any(|index| {
+        request
+            .args
+            .get(*index)
+            .is_some_and(|path| path.starts_with('/'))
+    }) || request.stdin.as_deref().is_some_and(|stdin| {
+        stdin
+            .split(|byte| *byte == 0)
+            .any(|path| path.starts_with(b"/"))
+    })
 }
 
 fn root_relative_bytes(configured_root: &[u8], path: &[u8]) -> BridgeResult<Vec<u8>> {

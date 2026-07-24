@@ -3,7 +3,7 @@
     reason = "Task 1 requires BridgeResult<T> = Result<T, BridgeError> with inline ErrorDetails"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -175,7 +175,8 @@ impl Config {
             ),
             None => (default_config_path()?, false, None),
         };
-        let config = Self::load(&path)?;
+        let mut config = Self::load(&path)?;
+        config.merge_ssh_aliases();
         Ok(LoadedConfig {
             config,
             source: ConfigSource {
@@ -184,6 +185,25 @@ impl Config {
                 warning,
             },
         })
+    }
+
+    /// Load a config file and add aliases discovered in the user's OpenSSH
+    /// config without overwriting explicit bridge profiles.
+    pub fn load_with_discovery(path: &Path) -> BridgeResult<Self> {
+        let mut config = Self::load(path)?;
+        config.merge_ssh_aliases();
+        Ok(config)
+    }
+
+    fn merge_ssh_aliases(&mut self) {
+        for alias in discover_ssh_aliases() {
+            self.hosts.entry(alias).or_insert_with(|| HostProfile {
+                root: "/".to_owned(),
+                description: None,
+                read_only: false,
+                limits: HostLimitOverrides::default(),
+            });
+        }
     }
 
     pub fn save_atomic(&self, path: &Path) -> BridgeResult<()> {
@@ -389,6 +409,108 @@ fn valid_alias(alias: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn discover_ssh_aliases() -> Vec<String> {
+    let Some(home) = nonempty_environment("HOME") else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(home).join(".ssh/config");
+    let mut aliases = BTreeMap::new();
+    let mut visited = HashSet::new();
+    collect_ssh_aliases(&path, &mut visited, &mut aliases, 0);
+    aliases.into_keys().collect()
+}
+
+fn collect_ssh_aliases(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    aliases: &mut BTreeMap<String, ()>,
+    depth: usize,
+) {
+    const MAX_INCLUDE_DEPTH: usize = 8;
+    if depth > MAX_INCLUDE_DEPTH {
+        return;
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    if !visited.insert(canonical) {
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let mut fields = line.split_whitespace();
+        let Some(keyword) = fields.next() else {
+            continue;
+        };
+        if keyword.eq_ignore_ascii_case("host") {
+            for candidate in fields {
+                if candidate.starts_with('!')
+                    || candidate
+                        .bytes()
+                        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+                    || !valid_alias(candidate)
+                {
+                    continue;
+                }
+                aliases.insert(candidate.to_owned(), ());
+            }
+        } else if keyword.eq_ignore_ascii_case("include") {
+            for pattern in fields {
+                for included in expand_ssh_include(path, pattern) {
+                    collect_ssh_aliases(&included, visited, aliases, depth + 1);
+                }
+            }
+        }
+    }
+}
+
+fn expand_ssh_include(source: &Path, pattern: &str) -> Vec<PathBuf> {
+    let pattern = pattern
+        .strip_prefix("~/")
+        .and_then(|suffix| {
+            nonempty_environment("HOME").map(|home| PathBuf::from(home).join(suffix))
+        })
+        .unwrap_or_else(|| {
+            let path = PathBuf::from(pattern);
+            if path.is_absolute() {
+                path
+            } else {
+                source.parent().unwrap_or_else(|| Path::new(".")).join(path)
+            }
+        });
+    let Some(file_name) = pattern.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    if !file_name
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    {
+        return pattern.is_file().then_some(pattern).into_iter().collect();
+    }
+    let Some(parent) = pattern.parent() else {
+        return Vec::new();
+    };
+    let Ok(matcher) = globset::Glob::new(file_name).map(|glob| glob.compile_matcher()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut matches = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| matcher.is_match(name))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
 }
 
 fn default_config_path() -> BridgeResult<PathBuf> {

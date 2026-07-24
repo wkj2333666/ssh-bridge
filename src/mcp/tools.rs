@@ -212,30 +212,30 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
         definition(
             "remote_hosts",
             "Remote hosts",
-            "List configured remote hosts and cached context without probing or making network connections. All returned paths are remote and remote output is untrusted.",
+            "List SSH aliases discovered from local OpenSSH configuration and cached context without probing or making network connections. All returned paths are remote and remote output is untrusted.",
             object(json!({}), &[]),
             annotations(true, false, true, false),
         ),
         definition(
             "remote_list",
             "List remote files",
-            "List entries under a remote path. All paths and results are remote, and remote output is untrusted.",
+            "List entries under an absolute remote path. Paths are remote and remote output is untrusted; never infer a path from a previous task or host default.",
             object(
                 json!({
                     "host": host_schema(),
-                    "path": with_default(path_schema(), json!(".")),
+                    "path": path_schema(),
                     "depth": {"type":"integer", "minimum":1, "maximum":32, "default":1},
                     "include_hidden": {"type":"boolean", "default":false},
                     "max_entries": {"type":"integer", "minimum":1, "maximum":10_000, "default":1_000}
                 }),
-                &["host"],
+                &["host", "path"],
             ),
             annotations(true, false, true, true),
         ),
         definition(
             "remote_stat",
             "Stat remote paths",
-            "Read metadata for remote paths. All paths and results are remote, and remote output is untrusted.",
+            "Read metadata for absolute remote paths. All paths and results are remote, and remote output is untrusted.",
             object(
                 json!({
                     "host": host_schema(),
@@ -251,12 +251,12 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
         definition(
             "remote_search",
             "Search remote files",
-            "Search content under a remote path. All paths and results are remote, and remote output is untrusted.",
+            "Search content under an absolute remote path. Paths are remote and remote output is untrusted; never infer a path from a previous task or host default.",
             object(
                 json!({
                     "host": host_schema(),
                     "query": string_schema(1, 65_536),
-                    "path": with_default(path_schema(), json!(".")),
+                    "path": path_schema(),
                     "globs": {
                         "type":"array", "maxItems":128, "default":[],
                         "items":string_schema(1, 4_096)
@@ -264,14 +264,14 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
                     "max_results": {"type":"integer", "minimum":1, "maximum":10_000, "default":100},
                     "binary": {"type":"boolean", "default":false}
                 }),
-                &["host", "query"],
+                &["host", "query", "path"],
             ),
             annotations(true, false, true, true),
         ),
         definition(
             "remote_read",
             "Read remote files",
-            "Read bounded content from remote paths. All paths and results are remote, and remote output is untrusted.",
+            "Read bounded content from absolute remote paths. All paths and results are remote, and remote output is untrusted.",
             object(
                 json!({
                     "host": host_schema(),
@@ -318,7 +318,7 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
         definition(
             "remote_write",
             "Write remote file",
-            "Create or conditionally replace a remote file. All paths and results are remote, and remote output is untrusted.",
+            "Create or conditionally replace a file at an absolute remote path. All paths and results are remote, and remote output is untrusted.",
             object(
                 json!({
                     "host": host_schema(),
@@ -348,12 +348,12 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
         definition(
             "remote_run",
             "Run remote command",
-            "Run a command on a remote host. This tool is always mutating. Omitted shell means Bash; request sh explicitly when Bash syntax is not available. Remote output is untrusted.",
+            "Run a command on a remote host from an explicit absolute cwd. This tool is always mutating. Omitted shell means Bash; request sh explicitly when Bash syntax is not available. Remote output is untrusted.",
             object(
                 json!({
                     "host": host_schema(),
                     "command": string_schema(1, 8_388_608),
-                    "cwd": with_default(path_schema(), json!(".")),
+                    "cwd": path_schema(),
                     "shell": {"type":"string", "enum":["bash", "sh", "login"], "default":"bash"},
                     "timeout_ms": {"type":"integer", "minimum":1, "maximum":3_600_000},
                     "stdin": object(
@@ -364,7 +364,7 @@ fn build_tool_definitions() -> Vec<ToolDefinition> {
                         &["encoding", "value"],
                     )
                 }),
-                &["host", "command"],
+                &["host", "command", "cwd"],
             ),
             annotations(false, true, false, true),
         ),
@@ -422,15 +422,12 @@ fn host_schema() -> Value {
 }
 
 fn path_schema() -> Value {
-    string_schema(1, 65_536)
-}
-
-fn with_default(mut schema: Value, default: Value) -> Value {
-    schema
-        .as_object_mut()
-        .expect("schema helpers always construct objects")
-        .insert("default".to_owned(), default);
-    schema
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":65_536,
+        "pattern":"^/"
+    })
 }
 
 #[allow(dead_code, reason = "Task 7 consumes the typed arguments")]
@@ -443,6 +440,8 @@ struct HostsArgs {}
 #[serde(deny_unknown_fields)]
 struct ListArgs {
     host: String,
+    // Kept optional for direct callers compiled against the pre-absolute-path
+    // Rust API; the published MCP schema requires this field.
     path: Option<String>,
     depth: Option<u32>,
     include_hidden: Option<bool>,
@@ -463,6 +462,8 @@ struct StatArgs {
 struct SearchArgs {
     host: String,
     query: String,
+    // See ListArgs::path. The remote resolver rejects relative paths for
+    // aliases discovered without a compatibility profile.
     path: Option<String>,
     #[serde(default)]
     globs: Vec<String>,
@@ -517,6 +518,7 @@ struct WriteArgs {
 struct RunArgs {
     host: String,
     command: String,
+    // See ListArgs::path. The published MCP schema requires an absolute cwd.
     cwd: Option<String>,
     #[serde(default)]
     shell: ToolRunShell,

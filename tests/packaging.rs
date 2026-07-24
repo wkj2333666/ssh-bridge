@@ -141,6 +141,26 @@ fn release_workflow_builds_and_packages_all_common_targets() {
     }
     assert!(workflow.contains("name: helper-${{ matrix.target }}"));
     assert!(workflow.contains("remote-helpers/$helper"));
+    assert!(workflow.contains("Check out tagged source for package resources"));
+    assert!(workflow.contains("mkdir -p \"$root/bin\" \"$root/remote-helpers\""));
+    assert!(workflow.contains(
+        "install -m 0755 \"staging/main-$TARGET/codex-ssh-bridge\" \"$root/bin/codex-ssh-bridge\""
+    ));
+    for resource in [
+        ".codex-plugin",
+        "skills",
+        "docs",
+        "README.md",
+        "LICENSE",
+        "config.example.toml",
+        ".mcp.json.example",
+    ] {
+        assert!(
+            workflow.contains(&format!("            {resource}")),
+            "release package omits {resource}"
+        );
+    }
+    assert!(workflow.contains("test -f \"$root/.codex-plugin/plugin.json\""));
     assert!(workflow.contains("--bin codex-ssh-bridge-helper"));
     assert!(workflow.contains("statically linked|musl"));
     assert!(workflow.contains("find release-assets -maxdepth 1 -type f"));
@@ -293,7 +313,7 @@ fn skill_closes_search_stdin_and_patch_schema_ambiguities() {
         "stdin is an object",
         "encoding",
         "value",
-        "relative to the configured remote root",
+        "absolute remote path",
     ] {
         assert!(
             skill.contains(required),

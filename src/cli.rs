@@ -782,7 +782,7 @@ async fn run_remote_command(path: PathBuf, arguments: RunArgs) -> BridgeResult<(
 }
 
 fn build_remote_bridge(path: &Path) -> BridgeResult<(Arc<SshRunner>, Arc<RemoteBridge>)> {
-    let config = Config::load(path)?;
+    let config = Config::load_with_discovery(path)?;
     let spool_quota = config.limits.global_spool_quota_bytes;
     let retention_jobs = config.limits.retention_serialization_jobs;
     let runtime = RuntimePaths::discover()?;
@@ -851,7 +851,7 @@ fn run_hosts(path: PathBuf, arguments: HostsArgs) -> BridgeResult<()> {
         HostsCommand::Add(arguments) => add_host(&path, arguments),
         HostsCommand::Remove(arguments) => remove_host(&path, &arguments.alias),
         HostsCommand::List => {
-            let config = Config::load(&path)?;
+            let config = Config::load_with_discovery(&path)?;
             let hosts: Vec<_> = config
                 .hosts
                 .iter()
@@ -860,7 +860,7 @@ fn run_hosts(path: PathBuf, arguments: HostsArgs) -> BridgeResult<()> {
             print_json(&json!({ "hosts": hosts }))
         }
         HostsCommand::Show(arguments) => {
-            let config = Config::load(&path)?;
+            let config = Config::load_with_discovery(&path)?;
             let host = config.host(&arguments.alias)?;
             print_json(&host_json(host.alias, host.profile))
         }

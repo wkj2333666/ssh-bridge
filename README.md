@@ -1,6 +1,6 @@
 # Codex SSH Bridge
 
-Use Codex on this local machine to inspect, edit, and run commands on allowlisted SSH servers without installing or signing in to Codex on those servers.
+Use Codex on this local machine to inspect, edit, and run commands on SSH aliases from the local OpenSSH configuration without installing or signing in to Codex on those servers.
 
 ```text
 local Codex
@@ -28,7 +28,7 @@ binary, API key, plugin, daemon, or service is installed remotely.
 |---|---|---|---|
 | Raw `ssh` | Universal and minimal | Leaves target selection, quoting, limits, shell detection, cancellation, and output handling to the Agent | Transport below the bridge |
 | SSHFS | Convenient human browsing | Makes remote files look local while commands still run locally; adds FUSE/SFTP latency and reconnect semantics | Explicit optional CLI only |
-| Native local MCP | Closed schemas, allowlisted hosts, bounded I/O, shared policy, explicit Bash/sh choice | Non-interactive by design | Default Agent interface |
+| Native local MCP | Closed schemas, local SSH aliases, bounded I/O, shared policy, explicit Bash/sh choice | Non-interactive by design | Default Agent interface |
 
 The bridge is Rust rather than a Bash program because strict MCP framing, bounded parsing, async concurrency, process-group cancellation, and spool quotas need one auditable state machine. Bash and POSIX sh remain supported as the *remote command shells*; the result always reports which shell actually ran.
 
@@ -75,9 +75,10 @@ The release workflow publishes Linux binaries and SHA-256 files for:
 - `powerpc64le-unknown-linux-gnu`
 - `s390x-unknown-linux-gnu`
 
-Each archive also contains `remote-helpers/` with helpers for all six
-supported Linux architectures: static musl helpers for `x86_64`, `aarch64`,
-and `armv7l`, plus GNU-target helpers for `riscv64`, `ppc64le`, and `s390x`.
+Each archive contains `bin/codex-ssh-bridge`, the Skill and configuration
+templates, and `remote-helpers/` with helpers for all six supported Linux
+architectures: static musl helpers for `x86_64`, `aarch64`, and `armv7l`, plus
+GNU-target helpers for `riscv64`, `ppc64le`, and `s390x`.
 When a GNU helper cannot run because the remote loader or libc is incompatible,
 the bridge reports the startup fallback and uses the POSIX dispatcher.
 Keep that directory beside the bridge binary. The bridge probes `uname -s` and
@@ -101,14 +102,14 @@ ssh ALIAS -- 'find ~/.local/share/codex-ssh-bridge/helpers -mindepth 1 -maxdepth
 This deletes every bridge helper version for that account. Verify `ALIAS`
 before running it; do not paste an unverified host name into the command.
 
-Download the archive matching the local Codex host, extract the binary to a
-private path, and put that absolute path in `.mcp.json.example` before
-registering the MCP server. Windows and macOS assets are not produced because
-the bridge currently requires Linux OpenSSH and Linux SSHFS tooling.
+Download the archive matching the local Codex host, extract it to a private
+path, and use its `bin/codex-ssh-bridge` executable in `.mcp.json.example`
+before registering the MCP server. Windows and macOS assets are not produced
+because the bridge currently requires Linux OpenSSH and Linux SSHFS tooling.
 
 ## Configure hosts
 
-Define and manually verify a concrete alias in local `~/.ssh/config`:
+Define and manually verify aliases in local `~/.ssh/config`:
 
 ```sshconfig
 Host devbox
@@ -120,17 +121,15 @@ Host devbox
 
 ```bash
 ssh devbox
-./target/release/codex-ssh-bridge hosts add devbox \
-  --root /srv/my-project \
-  --description "development server"
 ./target/release/codex-ssh-bridge doctor devbox
 ```
 
-Add future servers with another concrete alias and `hosts add`. Use
-`--read-only` for inspection-only profiles. The default local config is
+Future aliases are discovered automatically from `~/.ssh/config` and its
+supported `Include` files. `hosts add` remains available for compatibility
+profiles, but MCP operations do not use a configured root to infer paths. The default local config is
 `~/.config/codex-ssh-bridge/config.toml`; [config.example.toml](config.example.toml)
 documents limits. It accepts exactly configuration `version = 1` and contains
-aliases, roots, descriptions, and limits—never credentials.
+optional compatibility profiles and limits—never credentials.
 
 On first use, the bridge validates the local SSH configuration and probes the
 remote shell and utility capabilities. It reuses the connection for later
@@ -188,7 +187,7 @@ The nine MCP tools are:
 
 The default flow is bounded search/read → unified patch → remote verification. Calls are synchronous. Oversized detail is retained under an opaque `output_ref` and paged with `remote_output_read`, so the Agent never needs to reconstruct transport logic.
 
-`remote_run` accepts one command string plus `shell: bash|sh|login`; omission means `bash`. Prefer POSIX syntax. Bash is never silently changed to sh: if Bash is unavailable, the model receives a capability error and may explicitly retry with `shell:"sh"`. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
+All MCP file paths and `remote_run.cwd` are absolute remote paths. The bridge never derives them from a Codex task ID, SSH home, configured root, or previous request. `remote_apply_patch` headers must use absolute paths (or `/dev/null` for create/delete). `remote_run` accepts one command string plus `shell: bash|sh|login`; omission means `bash`. Prefer POSIX syntax. Bash is never silently changed to sh: if Bash is unavailable, the model receives a capability error and may explicitly retry with `shell:"sh"`. `login` resolves the account shell from NSS or `/etc/passwd`, never from `$SHELL`, and fails closed when it cannot do so safely. Always inspect the returned actual shell, fallback flag, warnings, exit status, truncation, and process-continuation uncertainty.
 
 Operational requests use one persistent SSH session per alias and are bounded
 by the configured concurrency and output limits. Requests are cancellable;

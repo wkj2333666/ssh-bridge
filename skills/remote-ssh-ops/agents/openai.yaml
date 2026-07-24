@@ -6,5 +6,5 @@ dependencies:
   tools:
     - type: "mcp"
       value: "ssh-bridge"
-      description: "Local native bridge to allowlisted OpenSSH hosts"
+      description: "Local native bridge to aliases from OpenSSH config"
       transport: "stdio"

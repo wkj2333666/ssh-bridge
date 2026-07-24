@@ -428,6 +428,7 @@ struct ResolvedSearch {
     host: String,
     query: String,
     path: RemotePath,
+    absolute_path: bool,
     globs: Vec<String>,
     max_results: usize,
     binary: bool,
@@ -437,7 +438,7 @@ fn resolve_list(config: &Config, request: ListRequest) -> BridgeResult<ResolvedL
     let host = config.host(&request.host)?;
     let requested = request.path.as_deref().unwrap_or(".");
     validate_path(requested)?;
-    let path = RemotePath::resolve(&host.profile.root, requested)?;
+    let path = resolve_path(host.profile.root.as_str(), requested)?;
     let depth = request.depth.unwrap_or(DEFAULT_LIST_DEPTH);
     if !(1..=MAX_LIST_DEPTH).contains(&depth) {
         return Err(BridgeError::invalid_argument(
@@ -543,7 +544,7 @@ fn resolve_search(config: &Config, request: SearchRequest) -> BridgeResult<Resol
     }
     let requested = request.path.as_deref().unwrap_or(".");
     validate_path(requested)?;
-    let path = RemotePath::resolve(&host.profile.root, requested)?;
+    let path = resolve_path(host.profile.root.as_str(), requested)?;
     let max_results = request.max_results.unwrap_or(DEFAULT_SEARCH_RESULTS);
     if !(1..=MAX_SEARCH_RESULTS).contains(&max_results) {
         return Err(BridgeError::invalid_argument(
@@ -560,6 +561,7 @@ fn resolve_search(config: &Config, request: SearchRequest) -> BridgeResult<Resol
         host: request.host,
         query: request.query,
         path,
+        absolute_path: requested.starts_with('/'),
         globs: request.globs,
         max_results,
         binary: request.binary.unwrap_or(false),
@@ -571,9 +573,30 @@ fn resolve_paths(root: &str, values: &[String]) -> BridgeResult<Vec<RemotePath>>
         .iter()
         .map(|value| {
             validate_path(value)?;
-            RemotePath::resolve(root, value)
+            resolve_path(root, value)
         })
         .collect()
+}
+
+fn resolve_path(configured_root: &str, requested: &str) -> BridgeResult<RemotePath> {
+    if requested.starts_with('/') {
+        // Absolute MCP paths are authoritative.  They are deliberately
+        // resolved against the transport root rather than a hidden per-host
+        // workspace, so a task never inherits another task's path context.
+        RemotePath::resolve(crate::REMOTE_OPERATION_ROOT, requested)
+    } else {
+        if configured_root == crate::REMOTE_OPERATION_ROOT {
+            return Err(BridgeError::new(
+                ErrorCode::RemoteAbsolutePathRequired,
+                "remote MCP paths must be absolute; provide an absolute path or cwd",
+                false,
+            ));
+        }
+        // Keep the direct Rust/CLI API backwards compatible for now.  The MCP
+        // schemas require absolute paths; this branch is only a compatibility
+        // path for existing human callers and fixtures.
+        RemotePath::resolve(configured_root, requested)
+    }
 }
 
 fn validate_path(path: &str) -> BridgeResult<()> {

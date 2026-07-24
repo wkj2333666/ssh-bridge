@@ -388,6 +388,7 @@ pub(crate) enum HunkLineKind {
 enum HeaderPath {
     Null,
     Relative(String),
+    Absolute(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,11 +582,20 @@ fn parse_header_path(
     if value == "/dev/null" {
         return Ok(HeaderPath::Null);
     }
-    let relative = value
-        .strip_prefix(path_prefix)
-        .ok_or_else(|| invalid_patch(message))?;
-    validate_patch_path(relative)?;
-    Ok(HeaderPath::Relative(relative.to_owned()))
+    let path = if let Some(path) = value.strip_prefix(path_prefix) {
+        path
+    } else if value.starts_with('/') {
+        value
+    } else {
+        return Err(invalid_patch(message));
+    };
+    if path.starts_with('/') {
+        validate_absolute_patch_path(path)?;
+        Ok(HeaderPath::Absolute(path.to_owned()))
+    } else {
+        validate_patch_path(path)?;
+        Ok(HeaderPath::Relative(path.to_owned()))
+    }
 }
 
 fn validate_patch_path(path: &str) -> BridgeResult<()> {
@@ -612,6 +622,25 @@ fn validate_patch_path(path: &str) -> BridgeResult<()> {
     Ok(())
 }
 
+fn validate_absolute_patch_path(path: &str) -> BridgeResult<()> {
+    if path.len() < 2 || !path.starts_with('/') {
+        return Err(invalid_patch("patch path is not canonical"));
+    }
+    for component in path[1..].split('/') {
+        if component == ".." {
+            return Err(BridgeError::new(
+                ErrorCode::PathOutsideRoot,
+                "patch path contains traversal",
+                false,
+            ));
+        }
+        if component.is_empty() || component == "." {
+            return Err(invalid_patch("patch path is not canonical"));
+        }
+    }
+    Ok(())
+}
+
 fn classify_headers(
     old: HeaderPath,
     new: HeaderPath,
@@ -620,8 +649,13 @@ fn classify_headers(
         (HeaderPath::Relative(old), HeaderPath::Relative(new)) if old == new => {
             Ok((old, FilePatchOperation::Update))
         }
+        (HeaderPath::Absolute(old), HeaderPath::Absolute(new)) if old == new => {
+            Ok((old, FilePatchOperation::Update))
+        }
         (HeaderPath::Null, HeaderPath::Relative(new)) => Ok((new, FilePatchOperation::Create)),
+        (HeaderPath::Null, HeaderPath::Absolute(new)) => Ok((new, FilePatchOperation::Create)),
         (HeaderPath::Relative(old), HeaderPath::Null) => Ok((old, FilePatchOperation::Delete)),
+        (HeaderPath::Absolute(old), HeaderPath::Null) => Ok((old, FilePatchOperation::Delete)),
         _ => Err(invalid_patch(
             "patch file headers do not name one operation",
         )),

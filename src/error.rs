@@ -11,6 +11,7 @@ pub enum ErrorCode {
     AuthRequired,
     ConnectTimeout,
     RemoteCapabilityMissing,
+    RemoteAbsolutePathRequired,
     PathOutsideRoot,
     ReadOnlyHost,
     WriteConflict,

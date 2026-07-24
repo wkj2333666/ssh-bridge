@@ -1030,9 +1030,9 @@ fn assert_integer_range(schema: &Value, minimum: u64, maximum: u64) {
 fn task8_schema_has_exact_required_fields_and_advisory_bounds() {
     let expected_required = [
         ("remote_hosts", json!([])),
-        ("remote_list", json!(["host"])),
+        ("remote_list", json!(["host", "path"])),
         ("remote_stat", json!(["host", "paths"])),
-        ("remote_search", json!(["host", "query"])),
+        ("remote_search", json!(["host", "query", "path"])),
         ("remote_read", json!(["host", "paths"])),
         ("remote_output_read", json!(["output_ref", "stream"])),
         ("remote_apply_patch", json!(["host", "patch"])),
@@ -1040,7 +1040,7 @@ fn task8_schema_has_exact_required_fields_and_advisory_bounds() {
             "remote_write",
             json!(["host", "path", "content", "encoding", "mode"]),
         ),
-        ("remote_run", json!(["host", "command"])),
+        ("remote_run", json!(["host", "command", "cwd"])),
     ];
     for (name, required) in expected_required {
         assert_eq!(tool(name).input_schema["required"], required, "{name}");
@@ -1065,9 +1065,11 @@ fn task8_schema_has_exact_required_fields_and_advisory_bounds() {
         ("remote_run", "cwd"),
     ] {
         assert_string_bounds(property(tool(name), field), 65_536);
+        assert_eq!(property(tool(name), field)["pattern"], "^/");
     }
     for name in ["remote_stat", "remote_read"] {
         assert_string_bounds(&property(tool(name), "paths")["items"], 65_536);
+        assert_eq!(property(tool(name), "paths")["items"]["pattern"], "^/");
     }
 
     assert_integer_range(property(tool("remote_list"), "depth"), 1, 32);
@@ -1124,7 +1126,6 @@ fn task8_schema_has_exact_required_fields_and_advisory_bounds() {
 
 #[test]
 fn task8_schema_defaults_and_closed_write_mode_are_exact() {
-    assert_eq!(property(tool("remote_list"), "path")["default"], ".");
     assert_eq!(property(tool("remote_list"), "depth")["default"], 1);
     assert_eq!(
         property(tool("remote_list"), "include_hidden")["default"],
@@ -1134,7 +1135,6 @@ fn task8_schema_defaults_and_closed_write_mode_are_exact() {
         property(tool("remote_list"), "max_entries")["default"],
         1_000
     );
-    assert_eq!(property(tool("remote_search"), "path")["default"], ".");
     assert_eq!(
         property(tool("remote_search"), "globs")["default"],
         json!([])
@@ -1151,7 +1151,6 @@ fn task8_schema_defaults_and_closed_write_mode_are_exact() {
         property(tool("remote_output_read"), "max_bytes")["default"],
         262_144
     );
-    assert_eq!(property(tool("remote_run"), "cwd")["default"], ".");
     assert_eq!(property(tool("remote_run"), "shell")["default"], "bash");
 
     let alternatives = property(tool("remote_write"), "mode")["oneOf"]
