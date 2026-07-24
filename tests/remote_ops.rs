@@ -7939,7 +7939,9 @@ async fn search_real_engine_failure_is_fixed_and_redacted() {
 
 #[tokio::test]
 async fn list_from_configured_filesystem_root_uses_single_separator() {
-    let (_runtime, _runner, bridge) = fixture(std::path::Path::new("/"), true);
+    let remote = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(remote.path().join("etc")).unwrap();
+    let (_runtime, _runner, bridge) = fixture(remote.path(), true);
     let result = bridge
         .list(
             ListRequest {
@@ -7958,7 +7960,10 @@ async fn list_from_configured_filesystem_root_uses_single_separator() {
         .iter()
         .find(|entry| entry.relative_path.value == "etc")
         .expect("the filesystem root should contain /etc");
-    assert_eq!(etc.actual_path, value("/etc"));
+    assert_eq!(
+        etc.actual_path,
+        value(remote.path().join("etc").to_str().unwrap())
+    );
     assert!(
         result
             .entries
@@ -7972,7 +7977,7 @@ async fn search_from_configured_filesystem_root_derives_relative_paths() {
     let remote = tempfile::TempDir::new().unwrap();
     let file = remote.path().join("a");
     std::fs::write(&file, b"needle\n").unwrap();
-    let (_runtime, _runner, bridge) = fixture(std::path::Path::new("/"), false);
+    let (_runtime, _runner, bridge) = fixture(remote.path(), false);
     let result = bridge
         .search(
             SearchRequest {
@@ -7989,10 +7994,7 @@ async fn search_from_configured_filesystem_root_derives_relative_paths() {
         .unwrap();
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].actual_path.value, file.to_str().unwrap());
-    assert_eq!(
-        result.matches[0].relative_path.value,
-        file.strip_prefix("/").unwrap().to_str().unwrap()
-    );
+    assert_eq!(result.matches[0].relative_path.value, "a");
 }
 
 #[tokio::test]
