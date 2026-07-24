@@ -437,7 +437,10 @@ pub(super) async fn search(
                 stdin: Some(stdin),
                 rooted_paths: RootedPathInputs {
                     argument_indices: &[],
-                    stdin_nul_paths: request.absolute_path,
+                    // Candidate paths are already normalized relative to the
+                    // session root by the first fixed operation.  They must
+                    // not be pinned a second time.
+                    stdin_nul_paths: false,
                 },
                 required_capabilities: required,
                 stdout_limit: (limits.max_frame_bytes + 1) as u64,

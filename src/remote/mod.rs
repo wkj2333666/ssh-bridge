@@ -585,7 +585,11 @@ fn resolve_path(configured_root: &str, requested: &str) -> BridgeResult<RemotePa
         // workspace, so a task never inherits another task's path context.
         RemotePath::resolve(crate::REMOTE_OPERATION_ROOT, requested)
     } else {
-        if configured_root == crate::REMOTE_OPERATION_ROOT {
+        // A missing path defaults to the configured root.  Keep that
+        // compatibility behavior even for the transport-root profile; an
+        // explicitly supplied relative path still requires an absolute MCP
+        // path in that profile.
+        if configured_root == crate::REMOTE_OPERATION_ROOT && requested != "." {
             return Err(BridgeError::new(
                 ErrorCode::RemoteAbsolutePathRequired,
                 "remote MCP paths must be absolute; provide an absolute path or cwd",
