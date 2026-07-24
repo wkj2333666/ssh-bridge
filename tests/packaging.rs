@@ -173,7 +173,10 @@ fn ci_and_release_workflows_use_split_caches() {
     let ci = read_text(".github/workflows/ci.yml");
     assert_eq!(ci.matches(CACHE_ACTION).count(), 6);
     assert_eq!(ci.matches("Restore pinned Rust toolchain cache").count(), 2);
-    assert_eq!(ci.matches("Restore shared Cargo dependency cache").count(), 2);
+    assert_eq!(
+        ci.matches("Restore shared Cargo dependency cache").count(),
+        2
+    );
     assert_eq!(ci.matches("Restore CI target cache").count(), 2);
     assert!(ci.contains("~/.rustup/toolchains/${{ env.RUST_TOOLCHAIN }}-*"));
     assert!(ci.contains("~/.cargo/registry"));
