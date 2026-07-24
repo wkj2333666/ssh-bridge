@@ -1759,7 +1759,7 @@ fn operation_root(configured_root: &str, absolute_paths: bool) -> String {
 }
 
 fn operation_root_for_path(configured_root: &str, requested: &str) -> String {
-    if requested.starts_with('/') && !RemotePath::resolve(configured_root, requested).is_ok() {
+    if requested.starts_with('/') && RemotePath::resolve(configured_root, requested).is_err() {
         crate::REMOTE_OPERATION_ROOT.to_owned()
     } else {
         configured_root.to_owned()
